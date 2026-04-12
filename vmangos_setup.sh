@@ -568,22 +568,44 @@ phase_config_setup() {
     cp "$INSTALLROOT/run/etc/mangosd.conf.dist" "$INSTALLROOT/run/etc/mangosd.conf"
     cp "$INSTALLROOT/run/etc/realmd.conf.dist" "$INSTALLROOT/run/etc/realmd.conf"
     
-    # Update database connections
-    sed -i "s|127.0.0.1;3306;mangos;mangos;realmd|$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$AUTHDB|g" "$INSTALLROOT/run/etc/realmd.conf"
-    sed -i "s|BindIP = \"0.0.0.0\"|BindIP = \"$SERVERIP\"|g" "$INSTALLROOT/run/etc/realmd.conf"
+    log_info "Configuring realmd.conf..."
     
-    # Update World server config
-    sed -i "s|127.0.0.1;3306;mangos;mangos;realmd|$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$AUTHDB|g" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|127.0.0.1;3306;mangos;mangos;mangos|$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$WORLDDB|g" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|127.0.0.1;3306;mangos;mangos;characters|$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$CHARACTERDB|g" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|127.0.0.1;3306;mangos;mangos;logs|$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$LOGSDB|g" "$INSTALLROOT/run/etc/mangosd.conf"
+    # Update realmd.conf database connection
+    # The config format is: LoginDatabaseInfo = "host;port;user;pass;db"
+    sed -i "s|LoginDatabaseInfo = \"127.0.0.1;3306;mangos;mangos;realmd\"|LoginDatabaseInfo = \"$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$AUTHDB\"|" "$INSTALLROOT/run/etc/realmd.conf"
+    sed -i "s|LoginDatabaseInfo = \"127.0.0.1;3306;mangos;;realmd\"|LoginDatabaseInfo = \"$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$AUTHDB\"|" "$INSTALLROOT/run/etc/realmd.conf"
+    sed -i "s|BindIP = \"0.0.0.0\"|BindIP = \"$SERVERIP\"|" "$INSTALLROOT/run/etc/realmd.conf"
+    
+    log_info "Configuring mangosd.conf..."
+    
+    # Update World server config - handle both old and new format
+    # New format uses dots: LoginDatabase.Info, WorldDatabase.Info, etc.
+    sed -i "s|LoginDatabase.Info = \"127.0.0.1;3306;mangos;mangos;realmd\"|LoginDatabase.Info = \"$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$AUTHDB\"|" "$INSTALLROOT/run/etc/mangosd.conf"
+    sed -i "s|WorldDatabase.Info = \"127.0.0.1;3306;mangos;mangos;world\"|WorldDatabase.Info = \"$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$WORLDDB\"|" "$INSTALLROOT/run/etc/mangosd.conf"
+    sed -i "s|CharacterDatabase.Info = \"127.0.0.1;3306;mangos;mangos;characters\"|CharacterDatabase.Info = \"$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$CHARACTERDB\"|" "$INSTALLROOT/run/etc/mangosd.conf"
+    sed -i "s|LogsDatabase.Info = \"127.0.0.1;3306;mangos;mangos;logs\"|LogsDatabase.Info = \"$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$LOGSDB\"|" "$INSTALLROOT/run/etc/mangosd.conf"
+    
+    # Update DataDir to point to installation root
+    sed -i "s|DataDir = \"\.\"|DataDir = \"$INSTALLROOT\"|" "$INSTALLROOT/run/etc/mangosd.conf"
     
     # Update log directories
-    sed -i "s|LogsDir = \"\"|LogsDir = \"$INSTALLROOT/logs/mangosd/\"|g" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|HonorDir = \"\"|HonorDir = \"$INSTALLROOT/logs/honor/\"|g" "$INSTALLROOT/run/etc/mangosd.conf"
+    sed -i "s|LogsDir = \"\"|LogsDir = \"$INSTALLROOT/logs/mangosd/\"|" "$INSTALLROOT/run/etc/mangosd.conf"
+    sed -i "s|HonorDir = \"\"|HonorDir = \"$INSTALLROOT/logs/honor/\"|" "$INSTALLROOT/run/etc/mangosd.conf"
     
-    # Update realmlist
-    mysql "$AUTHDB" -e "UPDATE \`realmlist\` SET \`address\` = '$SERVERIP', \`localaddress\` = '127.0.0.1' WHERE \`id\` = '1';" || true
+    # Update BindIP for world server
+    sed -i "s|BindIP = \"0.0.0.0\"|BindIP = \"$SERVERIP\"|" "$INSTALLROOT/run/etc/mangosd.conf"
+    
+    # Disable VMaps by default (they're optional and extraction takes hours)
+    sed -i "s|vmap.enableLOS = 1|vmap.enableLOS = 0|" "$INSTALLROOT/run/etc/mangosd.conf"
+    sed -i "s|vmap.enableHeight = 1|vmap.enableHeight = 0|" "$INSTALLROOT/run/etc/mangosd.conf"
+    sed -i "s|vmap.enableIndoorCheck = 1|vmap.enableIndoorCheck = 0|" "$INSTALLROOT/run/etc/mangosd.conf"
+    
+    # Create realmlist entry if it doesn't exist
+    log_info "Configuring realmlist..."
+    mysql -u root -e "INSERT INTO \`$AUTHDB\`.\`realmlist\` (\`id\`, \`name\`, \`address\`, \`localAddress\`, \`localSubnetMask\`, \`port\`, \`icon\`, \`realmflags\`, \`timezone\`, \`allowedSecurityLevel\`, \`population\`, \`gamebuild_min\`, \`gamebuild_max\`, \`flag\`, \`realmbuilds\`) 
+        VALUES (1, 'VMaNGOS', '$SERVERIP', '127.0.0.1', '255.255.255.0', 8085, 0, 0, 1, 0, 0, 5875, 5875, 0, '') 
+        ON DUPLICATE KEY UPDATE \`address\` = '$SERVERIP', \`localAddress\` = '127.0.0.1', \`port\` = 8085;" 2>/dev/null || \
+        mysql -u root "$AUTHDB" -e "UPDATE \`realmlist\` SET \`address\` = '$SERVERIP', \`localaddress\` = '127.0.0.1', \`port\` = 8085 WHERE \`id\` = '1';" || true
     
     set_checkpoint "CONFIG_DONE"
 }
@@ -783,6 +805,32 @@ phase_data_extraction() {
         log_warn ""
     else
         log_info "All data extraction steps completed successfully!"
+        
+        # Create versioned directory structure (e.g., 5875 for WoW 1.12.1)
+        log_info "Creating versioned data directory structure..."
+        mkdir -p "$INSTALLROOT/5875"
+        
+        # Create symlinks for dbc and maps in the versioned directory
+        if [ -d "$INSTALLROOT/dbc" ]; then
+            ln -sf "$INSTALLROOT/dbc" "$INSTALLROOT/5875/dbc" 2>/dev/null || true
+            log_info "  Created 5875/dbc symlink"
+        fi
+        if [ -d "$INSTALLROOT/maps" ]; then
+            ln -sf "$INSTALLROOT/maps" "$INSTALLROOT/5875/maps" 2>/dev/null || true
+            log_info "  Created 5875/maps symlink"
+        fi
+        if [ -d "$INSTALLROOT/vmaps" ]; then
+            ln -sf "$INSTALLROOT/vmaps" "$INSTALLROOT/5875/vmaps" 2>/dev/null || true
+            log_info "  Created 5875/vmaps symlink"
+        fi
+        if [ -d "$INSTALLROOT/mmaps" ]; then
+            ln -sf "$INSTALLROOT/mmaps" "$INSTALLROOT/5875/mmaps" 2>/dev/null || true
+            log_info "  Created 5875/mmaps symlink"
+        fi
+        
+        # Set ownership
+        chown -R "$MANGOSOSUSER:$MANGOSOSUSER" "$INSTALLROOT/5875" 2>/dev/null || true
+        log_info "Versioned directory structure created."
     fi
     
     set_checkpoint "DATA_DONE"
@@ -961,6 +1009,38 @@ EOF
     # Fix permissions
     chown -R "$MANGOSOSUSER:$MANGOSOSUSER" "$INSTALLROOT"
     
+    # Start services
+    log_info "Starting auth service..."
+    systemctl start auth.service
+    sleep 3
+    
+    log_info "Starting world service (this may take 30-60 seconds to fully load)..."
+    systemctl start world.service
+    sleep 15
+    
+    # Verify services are running
+    log_info "Verifying services..."
+    AUTH_STATUS=$(systemctl is-active auth.service 2>&1)
+    WORLD_STATUS=$(systemctl is-active world.service 2>&1)
+    
+    if [ "$AUTH_STATUS" = "active" ]; then
+        log_info "✓ Auth service is running on $SERVERIP:3724"
+    else
+        log_error "✗ Auth service failed to start (status: $AUTH_STATUS)"
+        log_info "Check logs: journalctl -u auth -n 50"
+    fi
+    
+    if [ "$WORLD_STATUS" = "active" ]; then
+        log_info "✓ World service is running on $SERVERIP:8085"
+        # Show memory usage
+        WORLD_MEM=$(ps aux | grep mangosd | grep -v grep | awk '{print $6/1024}' | head -1)
+        log_info "  World server memory usage: ${WORLD_MEM:-unknown} MB"
+    else
+        log_error "✗ World service failed to start (status: $WORLD_STATUS)"
+        log_info "Check logs: journalctl -u world -n 50"
+        log_info "Or: tail -50 $INSTALLROOT/logs/mangosd/Server.log"
+    fi
+    
     set_checkpoint "SERVICES_DONE"
 }
 
@@ -1010,12 +1090,34 @@ main() {
             ;&
         SERVICES_DONE)
             log_section "Installation Complete!"
-            log_info "To start the servers:"
-            log_info "  sudo systemctl start auth"
-            log_info "  sudo systemctl start world"
             log_info ""
-            log_info "Update your WoW client's realmlist.wtf:"
+            log_info "========================================"
+            log_info "VMANGOS SERVER READY"
+            log_info "========================================"
+            log_info ""
+            log_info "Server Address: $SERVERIP"
+            log_info "Auth Server:    $SERVERIP:3724"
+            log_info "World Server:   $SERVERIP:8085"
+            log_info ""
+            log_info "--- Client Configuration ---"
+            log_info "Edit your WoW client's realmlist.wtf:"
             log_info "  set realmlist $SERVERIP"
+            log_info ""
+            log_info "--- Test Account ---"
+            log_info "Username: tony"
+            log_info "Password: REDACTED"
+            log_info ""
+            log_info "--- Service Commands ---"
+            log_info "Start:   sudo systemctl start auth world"
+            log_info "Stop:    sudo systemctl stop auth world"
+            log_info "Status:  sudo systemctl status auth world"
+            log_info "Logs:    sudo journalctl -u world -f"
+            log_info ""
+            log_info "--- Installation Directory ---"
+            log_info "$INSTALLROOT"
+            log_info ""
+            log_info "Enjoy your Vanilla WoW server!"
+            log_info "========================================"
             clear_checkpoint
             ;;
         *)
