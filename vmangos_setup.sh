@@ -817,15 +817,47 @@ phase_database_import() {
                     7z x "$DB_FILENAME" -aoa 2>&1 | tee -a "$INSTALL_LOG"
                 fi
                 
-                # Find the SQL file
-                WORLD_SQL=$(find . -name "*.sql" -type f | grep -E "(world|db-)" | head -n1)
-                if [ -n "$WORLD_SQL" ]; then
-                    log_info "Importing world database from $WORLD_SQL (this may take a while)..."
-                    mysql "$WORLDDB" < "$WORLD_SQL"
-                    log_info "World database imported successfully"
+                # Check for mysql-dump directory structure (from vmangos releases)
+                if [ -d "mysql-dump" ]; then
+                    log_info "Found mysql-dump directory, importing all database files..."
+                    
+                    # Import in correct order: logon -> characters -> logs -> mangos (world)
+                    if [ -f "mysql-dump/logon.sql" ]; then
+                        log_info "Importing auth database (logon.sql)..."
+                        mysql "$AUTHDB" < "mysql-dump/logon.sql"
+                    fi
+                    
+                    if [ -f "mysql-dump/characters.sql" ]; then
+                        log_info "Importing characters database..."
+                        mysql "$CHARACTERDB" < "mysql-dump/characters.sql"
+                    fi
+                    
+                    if [ -f "mysql-dump/logs.sql" ]; then
+                        log_info "Importing logs database..."
+                        mysql "$LOGSDB" < "mysql-dump/logs.sql"
+                    fi
+                    
+                    if [ -f "mysql-dump/mangos.sql" ]; then
+                        log_info "Importing world database (this may take a while)..."
+                        mysql "$WORLDDB" < "mysql-dump/mangos.sql"
+                        log_info "World database imported successfully"
+                    fi
+                    
                     WORLD_DB_DOWNLOADED=true
+                    
+                    # Clean up extracted files
+                    rm -rf mysql-dump
                 else
-                    log_warn "No SQL file found after extraction"
+                    # Legacy: find SQL files in current directory
+                    WORLD_SQL=$(find . -name "*.sql" -type f | grep -E "(world|mangos)" | head -n1)
+                    if [ -n "$WORLD_SQL" ]; then
+                        log_info "Importing world database from $WORLD_SQL (this may take a while)..."
+                        mysql "$WORLDDB" < "$WORLD_SQL"
+                        log_info "World database imported successfully"
+                        WORLD_DB_DOWNLOADED=true
+                    else
+                        log_warn "No SQL file found after extraction"
+                    fi
                 fi
                 
                 rm -f "$DB_FILENAME"
@@ -841,28 +873,38 @@ phase_database_import() {
         log_warn "Failed to download world database from all sources"
         log_warn "You will need to import the world database manually"
         log_warn "Visit: https://github.com/vmangos/core/releases/tag/db_latest"
+        
+        # Import base schemas from source as fallback
+        log_info "Creating base database structures from source..."
+        if [ -f "$INSTALLROOT/source/sql/logon.sql" ]; then
+            mysql "$AUTHDB" < "$INSTALLROOT/source/sql/logon.sql" || log_warn "Auth schema import issue"
+        fi
+        if [ -f "$INSTALLROOT/source/sql/characters.sql" ]; then
+            mysql "$CHARACTERDB" < "$INSTALLROOT/source/sql/characters.sql" || log_warn "Characters schema import issue"
+        fi
+        if [ -f "$INSTALLROOT/source/sql/logs.sql" ]; then
+            mysql "$LOGSDB" < "$INSTALLROOT/source/sql/logs.sql" || log_warn "Logs schema import issue"
+        fi
     fi
     
-    # Import base schemas
-    log_info "Creating characters database structure..."
-    mysql "$CHARACTERDB" < "$INSTALLROOT/source/sql/characters.sql" || log_warn "Characters schema import issue"
-    
-    log_info "Creating logs database structure..."
-    mysql "$LOGSDB" < "$INSTALLROOT/source/sql/logs.sql" || log_warn "Logs schema import issue"
-    
-    log_info "Creating auth database structure..."
-    mysql "$AUTHDB" < "$INSTALLROOT/source/sql/logon.sql" || log_warn "Auth schema import issue"
-    
-    # Apply migrations
-    log_info "Running database migrations..."
+    # Apply migrations only if the migrations table exists
+    # (This handles the case where we're using source SQL instead of downloaded DB)
+    log_info "Checking for database migrations..."
     if [ -d "$INSTALLROOT/source/sql/migrations" ]; then
-        cd "$INSTALLROOT/source/sql/migrations"
-        [ -f "merge.sh" ] && chmod +x merge.sh && ./merge.sh 2>&1 | tee -a "$INSTALL_LOG" || true
+        MIGRATIONS_EXIST=$(mysql "$WORLDDB" -e "SHOW TABLES LIKE 'migrations';" 2>/dev/null | grep -c "migrations" || echo "0")
         
-        [ -f "world_db_updates.sql" ] && mysql "$WORLDDB" < world_db_updates.sql || true
-        [ -f "logs_db_updates.sql" ] && mysql "$LOGSDB" < logs_db_updates.sql || true
-        [ -f "characters_db_updates.sql" ] && mysql "$CHARACTERDB" < characters_db_updates.sql || true
-        [ -f "logon_db_updates.sql" ] && mysql "$AUTHDB" < logon_db_updates.sql || true
+        if [ "$MIGRATIONS_EXIST" -gt 0 ] && [ "$WORLD_DB_DOWNLOADED" != "true" ]; then
+            log_info "Running database migrations..."
+            cd "$INSTALLROOT/source/sql/migrations"
+            [ -f "merge.sh" ] && chmod +x merge.sh && ./merge.sh 2>&1 | tee -a "$INSTALL_LOG" || true
+            
+            [ -f "world_db_updates.sql" ] && mysql "$WORLDDB" < world_db_updates.sql || true
+            [ -f "logs_db_updates.sql" ] && mysql "$LOGSDB" < logs_db_updates.sql || true
+            [ -f "characters_db_updates.sql" ] && mysql "$CHARACTERDB" < characters_db_updates.sql || true
+            [ -f "logon_db_updates.sql" ] && mysql "$AUTHDB" < logon_db_updates.sql || true
+        else
+            log_info "Skipping migrations (using pre-built database or no migrations table)"
+        fi
     fi
     
     set_checkpoint "DB_IMPORT_DONE"
