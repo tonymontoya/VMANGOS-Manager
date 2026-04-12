@@ -382,6 +382,20 @@ check_client_data() {
     fi
     
     log_info "Using client data from: $CLIENT_DATA"
+    
+    # The extractor expects {path}/Data/ structure
+    # If user provided the Data folder directly, create a Data/Data symlink
+    CLIENT_DATA_EXTRACT_ROOT="$CLIENT_DATA"
+    if [ -f "$CLIENT_DATA/dbc.MPQ" ] && [ -f "$CLIENT_DATA/terrain.MPQ" ]; then
+        # User provided the Data folder directly
+        # Create a symlink Data/Data pointing to itself for extractor compatibility
+        if [ ! -e "$CLIENT_DATA/Data" ]; then
+            log_info "Creating Data/Data symlink for extractor compatibility..."
+            ln -sf . "$CLIENT_DATA/Data" 2>/dev/null || true
+        fi
+        # The extractor will use the path as-is, it expects Data/ subdirectory
+        CLIENT_DATA_EXTRACT_ROOT="$CLIENT_DATA"
+    fi
 }
 
 # =============================================================================
