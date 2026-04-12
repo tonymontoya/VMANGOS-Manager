@@ -385,6 +385,7 @@ phase_build() {
     log_info "Step 1/3: Configuring build with cmake..."
     cmake ../source -DCMAKE_INSTALL_PREFIX="$INSTALLROOT/run" \
         -DCONF_DIR="$INSTALLROOT/run/etc" \
+        -DBUILD_EXTRACTORS=1 \
         -DDEBUG=0 2>&1 | tee -a "$INSTALL_LOG"
     log_info "CMake configuration complete."
     
@@ -599,22 +600,53 @@ phase_database_import() {
     cd "$INSTALLROOT"
     
     # Download and import world database
-    WORLD_DB_URL="https://github.com/brotalnia/database/releases/download/latest/world_full_14_june_2021.7z"
-    log_info "Downloading world database..."
+    # Try multiple sources in order of preference
+    WORLD_DB_URLS=(
+        "https://github.com/vmangos/core/releases/download/db_latest/db-7ff0a39.zip"
+        "https://github.com/brotalnia/database/releases/download/latest/world_full_14_june_2021.7z"
+    )
     
-    if download_with_retry "$WORLD_DB_URL" "world_full.7z"; then
-        log_info "Extracting world database..."
-        7z x world_full.7z -aoa 2>&1 | tee -a "$INSTALL_LOG"
+    WORLD_DB_DOWNLOADED=false
+    for DB_URL in "${WORLD_DB_URLS[@]}"; do
+        DB_FILENAME=$(basename "$DB_URL")
+        log_info "Attempting to download world database from: $DB_URL"
         
-        WORLD_SQL=$(find . -name "world_full*.sql" -type f | head -n1)
-        if [ -n "$WORLD_SQL" ]; then
-            log_info "Importing world database (this may take a while)..."
-            mysql "$WORLDDB" < "$WORLD_SQL"
-            log_info "World database imported successfully"
+        if download_with_retry "$DB_URL" "$DB_FILENAME"; then
+            # Check if file is valid (non-zero size)
+            if [ -s "$DB_FILENAME" ]; then
+                log_info "Extracting world database..."
+                
+                # Extract based on file extension
+                if [[ "$DB_FILENAME" == *.zip ]]; then
+                    unzip -o "$DB_FILENAME" 2>&1 | tee -a "$INSTALL_LOG"
+                elif [[ "$DB_FILENAME" == *.7z ]]; then
+                    7z x "$DB_FILENAME" -aoa 2>&1 | tee -a "$INSTALL_LOG"
+                fi
+                
+                # Find the SQL file
+                WORLD_SQL=$(find . -name "*.sql" -type f | grep -E "(world|db-)" | head -n1)
+                if [ -n "$WORLD_SQL" ]; then
+                    log_info "Importing world database from $WORLD_SQL (this may take a while)..."
+                    mysql "$WORLDDB" < "$WORLD_SQL"
+                    log_info "World database imported successfully"
+                    WORLD_DB_DOWNLOADED=true
+                else
+                    log_warn "No SQL file found after extraction"
+                fi
+                
+                rm -f "$DB_FILENAME"
+                break
+            else
+                log_warn "Downloaded file is empty, trying next source..."
+                rm -f "$DB_FILENAME"
+            fi
         fi
-        rm -f world_full.7z
-    else
-        log_warn "Failed to download world database - you may need to import manually"
+    done
+    
+    if [ "$WORLD_DB_DOWNLOADED" != "true" ]; then
+        log_warn "Failed to download world database from all sources"
+        log_warn "You will need to import the world database manually"
+        log_warn "Visit: https://github.com/vmangos/core/releases/tag/db_latest"
     fi
     
     # Import base schemas
