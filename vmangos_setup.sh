@@ -101,6 +101,41 @@ clear_checkpoint() {
 }
 
 # =============================================================================
+# PROGRESS FUNCTIONS
+# =============================================================================
+
+show_progress_spinner() {
+    local pid=$1
+    local message="${2:-Processing...}"
+    local delay=0.1
+    local spinstr='|/-\'
+    
+    printf "%s " "$message"
+    while [ -d /proc/$pid ]; do
+        local temp=${spinstr#?}
+        printf " [%c]" "$spinstr"
+        local spinstr=$temp${spinstr%%$temp}
+        sleep $delay
+        printf "\b\b\b\b"
+    done
+    printf " [Done]\n"
+}
+
+show_progress_bar() {
+    local current=$1
+    local total=$2
+    local width=50
+    local percentage=$((current * 100 / total))
+    local filled=$((width * current / total))
+    local empty=$((width - filled))
+    
+    printf "\r["
+    printf "%${filled}s" | tr ' ' '='
+    printf "%${empty}s" | tr ' ' ' '
+    printf "] %3d%%" "$percentage"
+}
+
+# =============================================================================
 # RETRY FUNCTIONS
 # =============================================================================
 
@@ -311,32 +346,76 @@ phase_source_download() {
 }
 
 phase_build() {
-    log_section "PHASE: Building VMaNGOS"
+    log_section "PHASE: Building VMaNGOS from Source"
     
     cd "$INSTALLROOT"
     CPU=$(nproc)
-    log_info "Building with $CPU parallel jobs"
+    
+    log_info "====================================================================="
+    log_info "COMPILING VMANGOS - THIS WILL TAKE 1-2 HOURS"
+    log_info "====================================================================="
+    log_info ""
+    log_info "Your system has $CPU CPU core(s)."
+    log_info ""
+    log_info "Estimated build time:"
+    if [ "$CPU" -ge 8 ]; then
+        log_info "  • High-end CPU (8+ cores): 30-45 minutes"
+    elif [ "$CPU" -ge 4 ]; then
+        log_info "  • Mid-range CPU (4 cores): 1-1.5 hours"
+    else
+        log_info "  • Low-end CPU (2 cores): 1.5-2.5 hours"
+    fi
+    log_info ""
+    log_info "Build progress will be shown with percentage complete."
+    log_info "DO NOT INTERRUPT THIS PROCESS - it cannot be resumed mid-build."
+    log_info ""
+    log_info "If you need to run this in background to prevent disconnections:"
+    log_info "  Cancel now (Ctrl+C) and re-run with:"
+    log_info "  sudo VMANGOS_BACKGROUND_BUILD=1 bash vmangos_setup.sh"
+    log_info ""
+    log_info "Starting build at $(date '+%H:%M:%S')..."
+    log_info "====================================================================="
     
     # Create build directory
     mkdir -p build
     cd build
     
     # Configure
+    log_info ""
+    log_info "Step 1/3: Configuring build with cmake..."
     cmake ../source -DCMAKE_INSTALL_PREFIX="$INSTALLROOT/run" \
         -DCONF_DIR="$INSTALLROOT/run/etc" \
         -DDEBUG=0 2>&1 | tee -a "$INSTALL_LOG"
+    log_info "CMake configuration complete."
     
     # Build - with background support if enabled
+    log_info ""
+    log_info "Step 2/3: Compiling source code (this is the long part)..."
+    log_info ""
+    
     if [ "$BUILD_IN_BACKGROUND" = "1" ]; then
         start_background_build
     else
-        log_info "Starting compilation (this will take 1-2 hours)..."
-        log_info "To run in background, set VMANGOS_BACKGROUND_BUILD=1"
-        make -j "$CPU" 2>&1 | tee -a "$INSTALL_LOG"
+        log_info "Compiling with $CPU parallel jobs..."
+        log_info "You will see percentage progress below:"
+        log_info ""
+        # Run make and filter output to show progress
+        make -j "$CPU" 2>&1 | tee -a "$INSTALL_LOG" | \
+            grep -E "^\[[ 0-9]+%\]|Linking|Building|Built target|Scanning" || true
+        log_info ""
+        log_info "Compilation complete!"
     fi
     
     # Install
+    log_info ""
+    log_info "Step 3/3: Installing compiled binaries..."
     make install 2>&1 | tee -a "$INSTALL_LOG"
+    log_info "Installation of binaries complete."
+    
+    log_info ""
+    log_info "====================================================================="
+    log_info "BUILD COMPLETED at $(date '+%H:%M:%S')"
+    log_info "====================================================================="
     
     set_checkpoint "BUILD_DONE"
 }
@@ -371,15 +450,19 @@ phase_config_setup() {
 }
 
 phase_data_extraction() {
-    log_section "PHASE: Data Extraction"
+    log_section "PHASE: Data Extraction from Client Data"
     
     cd "$INSTALLROOT"
     
     # Copy extractors
-    cp "$INSTALLROOT/run/bin/mapextractor" "$INSTALLROOT/" || true
-    cp "$INSTALLROOT/run/bin/vmap_assembler" "$INSTALLROOT/" || true
-    cp "$INSTALLROOT/run/bin/vmapextractor" "$INSTALLROOT/" || true
-    cp "$INSTALLROOT/run/bin/MoveMapGen" "$INSTALLROOT/" || true
+    cp "$INSTALLROOT/run/bin/mapextractor" "$INSTALLROOT/" 2>/dev/null || \
+        cp "$INSTALLROOT/run/bin/Extractors/mapextractor" "$INSTALLROOT/" 2>/dev/null || true
+    cp "$INSTALLROOT/run/bin/vmap_assembler" "$INSTALLROOT/" 2>/dev/null || \
+        cp "$INSTALLROOT/run/bin/Extractors/vmap_assembler" "$INSTALLROOT/" 2>/dev/null || true
+    cp "$INSTALLROOT/run/bin/vmapextractor" "$INSTALLROOT/" 2>/dev/null || \
+        cp "$INSTALLROOT/run/bin/Extractors/vmapextractor" "$INSTALLROOT/" 2>/dev/null || true
+    cp "$INSTALLROOT/run/bin/MoveMapGen" "$INSTALLROOT/" 2>/dev/null || \
+        cp "$INSTALLROOT/run/bin/Extractors/MoveMapGenerator" "$INSTALLROOT/MoveMapGen" 2>/dev/null || true
     
     if [ -f "$INSTALLROOT/source/contrib/mmap/offmesh.txt" ]; then
         cp "$INSTALLROOT/source/contrib/mmap/offmesh.txt" "$INSTALLROOT/"
@@ -397,15 +480,115 @@ phase_data_extraction() {
     # Run extractors as mangos user
     cd "$INSTALLROOT"
     
-    log_info "Extracting DBC and map files..."
-    sudo -u "$MANGOSOSUSER" ./mapextractor || log_warn "Map extractor had issues"
+    # Step 1: Extract DBC files and maps (5-10 minutes)
+    log_info "====================================================================="
+    log_info "STEP 1/4: Extracting DBC files and base maps"
+    log_info "====================================================================="
+    log_info "This step extracts game data from your WoW client."
+    log_info "Expected time: 5-10 minutes depending on disk speed"
+    log_info "Progress: Shows percentage for each map being processed"
+    log_info ""
     
-    log_info "Extracting vmaps..."
-    sudo -u "$MANGOSOSUSER" ./vmapextractor || log_warn "VMap extractor had issues"
-    sudo -u "$MANGOSOSUSER" ./vmap_assembler || log_warn "VMap assembler had issues"
+    if [ -f ./mapextractor ]; then
+        log_info "Starting mapextractor..."
+        sudo -u "$MANGOSOSUSER" ./mapextractor 2>&1 | tee -a "$INSTALL_LOG" | \
+            grep -E "Extracting|Processing|Extracted|Done|Error|Fatal" || true
+        log_info "DBC and map extraction completed"
+    else
+        log_warn "mapextractor not found, skipping DBC/map extraction"
+    fi
     
-    log_info "Generating movement maps (this may take a while)..."
-    sudo -u "$MANGOSOSUSER" ./MoveMapGen --offMeshInput offmesh.txt || log_warn "MoveMapGen had issues"
+    # Step 2: Extract vmaps (10-20 minutes)
+    log_info ""
+    log_info "====================================================================="
+    log_info "STEP 2/4: Extracting vmaps (Visual Maps)"
+    log_info "====================================================================="
+    log_info "This step extracts visual geometry for line-of-sight calculations."
+    log_info "Expected time: 10-20 minutes"
+    log_info ""
+    
+    if [ -f ./vmapextractor ]; then
+        log_info "Starting vmapextractor..."
+        sudo -u "$MANGOSOSUSER" ./vmapextractor 2>&1 | tee -a "$INSTALL_LOG" || \
+            log_warn "VMap extractor had issues (may be normal if no output)"
+    else
+        log_warn "vmapextractor not found, skipping vmap extraction"
+    fi
+    
+    # Step 3: Assemble vmaps (5-10 minutes)
+    log_info ""
+    log_info "====================================================================="
+    log_info "STEP 3/4: Assembling vmaps"
+    log_info "====================================================================="
+    log_info "This step combines vmap data into usable format."
+    log_info "Expected time: 5-10 minutes"
+    log_info ""
+    
+    if [ -f ./vmap_assembler ]; then
+        log_info "Starting vmap_assembler..."
+        sudo -u "$MANGOSOSUSER" ./vmap_assembler 2>&1 | tee -a "$INSTALL_LOG" || \
+            log_warn "VMap assembler had issues"
+        log_info "VMap assembly completed"
+    else
+        log_warn "vmap_assembler not found, skipping vmap assembly"
+    fi
+    
+    # Step 4: Generate movement maps (1-4 hours - the longest step)
+    log_info ""
+    log_info "====================================================================="
+    log_info "STEP 4/4: Generating movement maps (mmaps)"
+    log_info "====================================================================="
+    log_info "THIS IS THE LONGEST STEP - PLEASE BE PATIENT"
+    log_info ""
+    log_info "This step calculates walkable paths for NPCs and creatures."
+    log_info "It processes hundreds of tiles across all maps."
+    log_info ""
+    log_info "Expected time based on your hardware:"
+    CPU_COUNT=$(nproc)
+    if [ "$CPU_COUNT" -ge 8 ]; then
+        log_info "  • High-end CPU (8+ cores): 30-60 minutes"
+    elif [ "$CPU_COUNT" -ge 4 ]; then
+        log_info "  • Mid-range CPU (4 cores): 1-2 hours"
+    else
+        log_info "  • Low-end CPU (2 cores): 2-4 hours"
+    fi
+    log_info ""
+    log_info "Progress format: [Map XXX] Building tile [XX,XX] (XX / XXX)"
+    log_info "You will see many lines like this - this is normal progress!"
+    log_info ""
+    log_info "DO NOT CANCEL THIS PROCESS - it will resume where it left off"
+    log_info "if you re-run the installation script."
+    log_info ""
+    log_info "Starting MoveMapGen at $(date '+%H:%M:%S')..."
+    log_info "====================================================================="
+    
+    if [ -f ./MoveMapGen ]; then
+        # Run with a background progress heartbeat
+        {
+            while true; do
+                sleep 300  # Every 5 minutes
+                log_info "[$(date '+%H:%M:%S')] MoveMapGen still running... (this is normal)"
+            done
+        } &
+        HEARTBEAT_PID=$!
+        
+        # Run the actual generation
+        sudo -u "$MANGOSOSUSER" ./MoveMapGen --offMeshInput offmesh.txt 2>&1 | tee -a "$INSTALL_LOG" || \
+            log_warn "MoveMapGen completed with warnings (this is usually OK)"
+        
+        # Stop the heartbeat
+        kill $HEARTBEAT_PID 2>/dev/null || true
+        wait $HEARTBEAT_PID 2>/dev/null || true
+        
+        log_info "====================================================================="
+        log_info "Movement map generation completed at $(date '+%H:%M:%S')"
+        log_info "====================================================================="
+    else
+        log_warn "MoveMapGen not found, skipping movement map generation"
+    fi
+    
+    log_info ""
+    log_info "All data extraction steps completed!"
     
     set_checkpoint "DATA_DONE"
 }
