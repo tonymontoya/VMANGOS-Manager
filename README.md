@@ -23,6 +23,8 @@ VMaNGOS is an independent continuation of the Elysium/LightsHope codebases, focu
 2. **Static IP address** configured
 3. **Root/sudo access**
 4. **WoW 1.12.1.5875 client** - You need a copy of the game client's `/Data` folder
+   - **Legal Sources:** Internet Archive (preservation copies), original CD/DVD media
+   - The installer will display legal acquisition options if client data is not found
 5. **Minimum 2 CPU cores and 4GB RAM** (more RAM recommended for faster compilation)
 
 ### Automated Installation (Recommended)
@@ -66,6 +68,9 @@ set realmlist YOUR_SERVER_IP
 - **Non-Interactive Mode** - Full automation via environment variables
 - **Installation Logging** - Complete logs at `/var/log/vmangos-install.log`
 - **Secure Password Storage** - Credentials stored with mode 600 permissions
+- **Client Data Auto-Handling** - Automatically copies client data to accessible location if needed
+- **Data/Data Path Fix** - Handles the extractor's expected directory structure automatically
+- **Checkpoint/Resume** - Can resume interrupted installations from where they left off
 
 ---
 
@@ -343,6 +348,17 @@ sudo grep -E "DatabaseInfo" /opt/mangos/run/etc/mangosd.conf
 - Check firewall: ports 3724 (auth) and 8085 (world) must be open
 - Verify realmlist table: `mysql auth -e "SELECT * FROM realmlist;"`
 
+#### Data Extraction Issues
+If you see "Invalid Map.dbc file format" errors:
+- Ensure you're using WoW 1.12.1 build 5875 (check login screen lower-left corner)
+- The script auto-creates a `Data/Data` symlink for extractor compatibility
+- If client data is in a protected location, the script will auto-copy it to `/opt/mangos/client-data`
+
+#### Database Import Errors
+If migrations fail with "Table doesn't exist":
+- The installer now imports databases in correct order (logon → characters → logs → mangos)
+- Source migrations are skipped when using pre-built database (avoids conflicts)
+
 ---
 
 ## Security Considerations
@@ -361,6 +377,9 @@ sudo grep -E "DatabaseInfo" /opt/mangos/run/etc/mangosd.conf
 - ✅ Management CLI with JSON output
 - ✅ Service control (start/stop/restart/status)
 - ✅ Comprehensive unit tests
+- ✅ Checkpoint/resume for interrupted installations
+- ✅ Client data validation and legal acquisition instructions
+- ✅ Auto-handling of client data permissions and path structure
 
 ### Release B (Backup & Monitoring)
 - 🔄 Database backup/restore
