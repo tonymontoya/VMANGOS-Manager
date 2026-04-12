@@ -543,10 +543,11 @@ sed -i "s|127.0.0.1;3306;mangos;mangos;realmd|$SERVERIP;3306;$MANGOSDBUSER;$MANG
 sed -i "s|BindIP = \"0.0.0.0\"|BindIP = \"$SERVERIP\"|g" "$INSTALLROOT/run/etc/realmd.conf"
 
 # Update the World server configuration file
+# Format: host;port;user;password;database
+sed -i "s|127.0.0.1;3306;mangos;mangos;realmd|$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$AUTHDB|g" "$INSTALLROOT/run/etc/mangosd.conf"
 sed -i "s|127.0.0.1;3306;mangos;mangos;mangos|$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$WORLDDB|g" "$INSTALLROOT/run/etc/mangosd.conf"
-sed -i "s|127.0.0.1;3306;mangos;mangos;mangos_auth|$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$AUTHDB|g" "$INSTALLROOT/run/etc/mangosd.conf"
-sed -i "s|127.0.0.1;3306;mangos;mangos;mangos_world|$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$WORLDDB|g" "$INSTALLROOT/run/etc/mangosd.conf"
-sed -i "s|127.0.0.1;3306;mangos;mangos;mangos_characters|$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$CHARACTERDB|g" "$INSTALLROOT/run/etc/mangosd.conf"
+sed -i "s|127.0.0.1;3306;mangos;mangos;characters|$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$CHARACTERDB|g" "$INSTALLROOT/run/etc/mangosd.conf"
+sed -i "s|127.0.0.1;3306;mangos;mangos;logs|$SERVERIP;3306;$MANGOSDBUSER;$MANGOSDBPASS;$LOGSDB|g" "$INSTALLROOT/run/etc/mangosd.conf"
 
 # Update the log & honor directory setting in the World Server config file
 sed -i "s|LogsDir = \"\"|LogsDir = \"$INSTALLROOT/logs/mangosd/\"|g" "$INSTALLROOT/run/etc/mangosd.conf"
