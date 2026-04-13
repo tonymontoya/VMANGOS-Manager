@@ -23,6 +23,8 @@ export CONFIG_SERVER_WORLD_SERVICE=""
 export CONFIG_SERVER_INSTALL_ROOT=""
 
 export CONFIG_BACKUP_ENABLED=""
+export CONFIG_BACKUP_DIR=""
+export CONFIG_BACKUP_RETENTION_DAYS=""
 
 # ============================================================================
 # INI PARSING
@@ -103,6 +105,8 @@ config_load() {
     CONFIG_SERVER_INSTALL_ROOT=$(ini_read "$config_file" "server" "install_root" "/opt/mangos")
     
     CONFIG_BACKUP_ENABLED=$(ini_read "$config_file" "backup" "enabled" "true")
+    CONFIG_BACKUP_DIR=$(ini_read "$config_file" "backup" "backup_dir" "/opt/mangos/backups")
+    CONFIG_BACKUP_RETENTION_DAYS=$(ini_read "$config_file" "backup" "retention_days" "30")
     
     log_debug "Configuration loaded from $config_file"
     return 0
