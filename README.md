@@ -76,7 +76,7 @@ set realmlist YOUR_SERVER_IP
 
 ## Part 2: Management CLI
 
-The `vmangos-manager` command-line tool provides Release A administration for server control, account management, backups, and update checks.
+The `vmangos-manager` command-line tool provides administration for server control, account management, backups, config adoption, and update handling.
 
 Detailed operator references live in:
 
@@ -158,13 +158,21 @@ vmangos-manager account password <username> [--password-file PATH|--password-env
 ```bash
 vmangos-manager update check
 vmangos-manager --format json update check
+vmangos-manager update inspect
+vmangos-manager --format json update inspect
 vmangos-manager update plan
+vmangos-manager --format json update plan --include-db
 vmangos-manager update apply --backup-first
+vmangos-manager update apply --backup-first --include-db
 ```
 
 `update check` is read-only. On an installed host with a configured VMANGOS core checkout under `<install_root>/source`, it inspects that source tree and reports whether the core is behind its tracked remote. If no installed source tree is available, it falls back to the Release A Manager-checkout behavior and compares the current `VMANGOS-Manager` git checkout to its tracked remote ref.
 
-`update plan` and `update apply` operate on the configured VMANGOS core tree under `<install_root>/source`. The workflow is intentionally non-atomic: it stops services, fast-forwards the existing source tree, rebuilds in the existing build directory, reinstalls into the existing run directory, and starts services again. `update apply` rejects dirty or divergent source trees and requires either `--backup-first` or explicit confirmation that a verified backup already exists. `update apply` is text-only; `update check` and `update plan` support JSON output.
+`update inspect` is the read-only DB-aware view. It inspects tracked upstream SQL changes under `sql/migrations`, compares them to the configured `auth`, `world`, and `logs` databases, and reports whether Manager can safely automate the pending DB work.
+
+`update plan` and `update apply` operate on the configured VMANGOS core tree under `<install_root>/source`. The workflow is intentionally non-atomic: it stops services, fast-forwards the existing source tree, rebuilds in the existing build directory, reinstalls into the existing run directory, and starts services again. `update apply` rejects dirty or divergent source trees and requires either `--backup-first` or explicit confirmation that a verified backup already exists.
+
+With `--include-db`, Manager only automates timestamped files under `sql/migrations/<timestamp>_{world|logon|logs}.sql`. Any other SQL path, deleted migration, modified migration, or renamed migration is treated as manual review and blocks DB mutation. `update apply` remains text-only; `update check`, `update inspect`, and `update plan` support JSON output.
 
 #### Config
 
@@ -229,7 +237,7 @@ VMANGOS-Manager/
 │   ├── lib/config.sh            # INI parser and config management
 │   ├── lib/server.sh            # Service control and status
 │   ├── lib/account.sh           # Account management and validation
-│   ├── lib/update.sh            # Git-based update checks
+│   ├── lib/update.sh            # Git- and DB-aware update assistant
 │   ├── lib/backup.sh            # Backup, verify, restore, schedule
 │   ├── tests/run_tests.sh       # Shell test runner
 │   ├── Makefile                 # lint/test/install/uninstall

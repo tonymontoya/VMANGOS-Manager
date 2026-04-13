@@ -115,22 +115,31 @@ Behavior:
 ```bash
 vmangos-manager update check
 vmangos-manager --format json update check
+vmangos-manager update inspect
+vmangos-manager --format json update inspect
 vmangos-manager update plan
+vmangos-manager --format json update plan --include-db
 vmangos-manager update apply --backup-first
+vmangos-manager update apply --backup-first --include-db
 ```
 
 Behavior:
 
 - `update check` prefers the configured VMANGOS core source tree under `<install_root>/source`
 - if no installed source tree is available, `update check` falls back to the current `VMANGOS-Manager` checkout
+- `update inspect` performs a read-only DB assessment against the configured `auth`, `world`, and `logs` databases
 - `update plan` prints the non-atomic update steps for the configured VMANGOS core tree
+- `update plan --include-db` adds DB migration assessment and fails closed when SQL changes need manual review
 - `update apply` performs the non-atomic core update workflow in place
+- `update apply --include-db` applies only supported timestamped files under `sql/migrations`
 
 Important:
 
 - `update apply` is non-atomic and does not promise rollback
 - `update apply` requires either `--backup-first` or explicit confirmation that a verified backup already exists
 - `update apply` rejects dirty or divergent VMANGOS source trees
+- `update apply --include-db` refuses to mutate the DB if upstream SQL changes fall outside `sql/migrations/<timestamp>_{world|logon|logs}.sql`
+- modified, deleted, or renamed SQL files require manual review before running a DB-aware update
 - `update apply` does not support JSON output
 - if no installed source tree is available, run Manager checkout comparisons from a source checkout or set `VMANGOS_MANAGER_REPO=/path/to/VMANGOS-Manager`
 
