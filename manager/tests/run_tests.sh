@@ -445,12 +445,17 @@ EOF
 
 test_config_detect_reports_multiple_candidates() {
     local all_passed=0
-    local temp_dir root_one root_two output compact_output
+    local temp_dir mock_dir show_dir units_file root_one root_two output compact_output
     temp_dir=$(mktemp -d)
+    mock_dir="$temp_dir/mockbin"
+    show_dir="$temp_dir/systemctl-show"
+    units_file="$temp_dir/units.txt"
     root_one="$temp_dir/alpha"
     root_two="$temp_dir/bravo"
 
-    mkdir -p "$root_one/run/etc" "$root_two/run/etc"
+    mkdir -p "$mock_dir" "$show_dir" "$root_one/run/etc" "$root_two/run/etc"
+    setup_config_detect_mock_bin "$mock_dir"
+    : > "$units_file"
 
     cat > "$root_one/run/etc/realmd.conf" << 'EOF'
 LoginDatabaseInfo = "127.0.0.1;3306;mangos;secret;auth"
@@ -470,7 +475,11 @@ CharacterDatabase.Info = "127.0.0.1;3306;mangos;secret;characters"
 LogsDatabase.Info = "127.0.0.1;3306;mangos;secret;logs"
 EOF
 
-    output=$(VMANGOS_DETECT_SEARCH_ROOTS="$temp_dir" bash "$MANAGER_DIR/bin/vmangos-manager" config detect --format json 2>/dev/null)
+    output=$(PATH="$mock_dir:$PATH" \
+        VMANGOS_DETECT_SEARCH_ROOTS="$temp_dir" \
+        VMANGOS_DETECT_SYSTEMCTL_UNITS_FILE="$units_file" \
+        VMANGOS_DETECT_SYSTEMCTL_SHOW_DIR="$show_dir" \
+        bash "$MANAGER_DIR/bin/vmangos-manager" config detect --format json 2>/dev/null)
     compact_output=$(printf '%s' "$output" | tr -d '[:space:]')
 
     assert_true "[[ \$compact_output == *'\"candidate_count\":2'* ]]" "config detect json reports multiple candidates" || all_passed=1
