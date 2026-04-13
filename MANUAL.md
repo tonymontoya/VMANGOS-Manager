@@ -65,6 +65,23 @@ Notes:
 - default watch interval is `2` seconds
 - status includes service state, process details, DB connectivity, disk space, and player count
 
+## Schedule Commands
+
+```bash
+vmangos-manager schedule honor --time 06:00 --daily [--timezone UTC]
+vmangos-manager schedule restart --time 04:00 --weekly Sun [--timezone UTC] [--announce "Weekly maintenance"] [--warnings 30,15,5,1]
+vmangos-manager schedule list [--format text|json]
+vmangos-manager schedule simulate <job-id>
+vmangos-manager schedule cancel <job-id>
+```
+
+Notes:
+
+- schedules are stored under the Manager root and rendered into `systemd` timer/service units
+- `schedule restart` uses journal-only warnings unless `maintenance.announce_command` is configured
+- `schedule honor` requires `maintenance.honor_command` in `manager.conf`
+- `restart_warnings` defaults to `30,15,5,1`
+
 ## Account Commands
 
 ```bash
@@ -109,6 +126,7 @@ Behavior:
 - `config detect` attempts to match auth/world service names from `systemd`
 - `config detect` prints a proposed `manager.conf` and reports confidence, assumptions, and ambiguity
 - `config detect` is read-only; it does not overwrite `manager.conf`
+- `config create` includes a `[maintenance]` section for scheduler timezone, honor backend, warning backend, and default restart warnings
 
 ## Update Check
 

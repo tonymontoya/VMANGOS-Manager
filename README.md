@@ -176,6 +176,18 @@ vmangos-manager update apply --backup-first --include-db
 
 With `--include-db`, Manager only automates timestamped files under `sql/migrations/<timestamp>_{world|logon|logs}.sql`. Any other SQL path, deleted migration, modified migration, or renamed migration is treated as manual review and blocks DB mutation. `update apply` remains text-only; `update check`, `update inspect`, and `update plan` support JSON output.
 
+#### Schedule
+
+```bash
+vmangos-manager schedule honor --time 06:00 --daily [--timezone UTC]
+vmangos-manager schedule restart --time 04:00 --weekly Sun [--timezone UTC] [--announce "Weekly maintenance"] [--warnings 30,15,5,1]
+vmangos-manager schedule list [--format text|json]
+vmangos-manager schedule simulate <job-id>
+vmangos-manager schedule cancel <job-id>
+```
+
+Maintenance schedules are persisted under the Manager root and materialized as `systemd` timer/service units. `schedule restart` always works with a journal-only warning fallback, and will use `maintenance.announce_command` when configured. `schedule honor` requires `maintenance.honor_command` in `manager.conf` so Manager has a real backend to execute instead of pretending honor distribution is built in.
+
 #### Config
 
 ```bash
@@ -186,6 +198,12 @@ vmangos-manager config show [--format text|json]
 ```
 
 `config detect` is an explicit adoption helper for existing VMANGOS hosts. It inspects likely install roots, looks for `mangosd.conf` and `realmd.conf`, matches auth/world service names from `systemd` when possible, and emits a reviewable proposed `manager.conf`. It does not silently change runtime behavior or overwrite your existing config.
+
+`config create` now includes a `[maintenance]` section for optional scheduler backends:
+- `timezone`
+- `honor_command`
+- `announce_command`
+- `restart_warnings`
 
 #### Backup
 

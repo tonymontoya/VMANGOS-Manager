@@ -48,6 +48,7 @@ COMMANDS:
       status options: [--format text|json] [--watch] [--interval SECONDS]
     account [create|list|setgm|ban|unban|password] [OPTIONS]
     update [check|inspect|plan|apply] [OPTIONS]
+    schedule [honor|restart|list|cancel|simulate] [OPTIONS]
     config [create|validate|show|detect] [OPTIONS]
     backup [now|list|verify|restore|clean|schedule] [OPTIONS]
 EOF
@@ -123,6 +124,8 @@ source "$LIB_DIR/server.sh"
 source "$LIB_DIR/account.sh"
 # shellcheck source=lib/update.sh
 source "$LIB_DIR/update.sh"
+# shellcheck source=lib/schedule.sh
+source "$LIB_DIR/schedule.sh"
 # shellcheck source=lib/backup.sh
 source "$LIB_DIR/backup.sh"
 
@@ -253,6 +256,202 @@ cmd_server() {
         *)
             echo "Error: Unknown server subcommand: $subcmd" >&2
             echo "Valid subcommands: start, stop, restart, status" >&2
+            exit 2
+            ;;
+    esac
+}
+
+cmd_schedule() {
+    local subcmd="${1:-}"
+    shift || true
+
+    case "$subcmd" in
+        honor)
+            local time_value=""
+            local schedule_type=""
+            local schedule_day=""
+            local timezone=""
+
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --time)
+                        time_value="${2:-}"
+                        shift 2
+                        ;;
+                    --daily)
+                        schedule_type="daily"
+                        shift
+                        ;;
+                    --weekly)
+                        schedule_type="weekly"
+                        schedule_day="${2:-}"
+                        shift 2
+                        ;;
+                    --timezone)
+                        timezone="${2:-}"
+                        shift 2
+                        ;;
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        echo "Unknown option: $1" >&2
+                        exit 2
+                        ;;
+                    *)
+                        echo "Error: schedule honor does not accept positional arguments" >&2
+                        exit 2
+                        ;;
+                esac
+            done
+
+            if [[ -z "$time_value" || -z "$schedule_type" ]]; then
+                echo "Error: schedule honor requires --time and one of --daily or --weekly DAY" >&2
+                exit 2
+            fi
+
+            if [[ "$schedule_type" == "weekly" ]]; then
+                schedule_honor "$schedule_type" "$schedule_day $time_value" "$timezone"
+            else
+                schedule_honor "$schedule_type" "$time_value" "$timezone"
+            fi
+            ;;
+
+        restart)
+            local time_value=""
+            local schedule_type=""
+            local schedule_day=""
+            local timezone=""
+            local warnings=""
+            local announce_message=""
+
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --time)
+                        time_value="${2:-}"
+                        shift 2
+                        ;;
+                    --daily)
+                        schedule_type="daily"
+                        shift
+                        ;;
+                    --weekly)
+                        schedule_type="weekly"
+                        schedule_day="${2:-}"
+                        shift 2
+                        ;;
+                    --timezone)
+                        timezone="${2:-}"
+                        shift 2
+                        ;;
+                    --warnings)
+                        warnings="${2:-}"
+                        shift 2
+                        ;;
+                    --announce)
+                        announce_message="${2:-}"
+                        shift 2
+                        ;;
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        echo "Unknown option: $1" >&2
+                        exit 2
+                        ;;
+                    *)
+                        echo "Error: schedule restart does not accept positional arguments" >&2
+                        exit 2
+                        ;;
+                esac
+            done
+
+            if [[ -z "$time_value" || -z "$schedule_type" ]]; then
+                echo "Error: schedule restart requires --time and one of --daily or --weekly DAY" >&2
+                exit 2
+            fi
+
+            schedule_load_config >/dev/null 2>&1 || true
+            [[ -n "$warnings" ]] || warnings="${SCHEDULE_RESTART_WARNINGS:-30,15,5,1}"
+
+            if [[ "$schedule_type" == "weekly" ]]; then
+                schedule_restart_create "$schedule_type" "$schedule_day $time_value" "$timezone" "$warnings" "$announce_message"
+            else
+                schedule_restart_create "$schedule_type" "$time_value" "$timezone" "$warnings" "$announce_message"
+            fi
+            ;;
+
+        list)
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        echo "Unknown option: $1" >&2
+                        exit 2
+                        ;;
+                    *)
+                        echo "Error: schedule list does not accept positional arguments" >&2
+                        exit 2
+                        ;;
+                esac
+            done
+            schedule_list
+            ;;
+
+        cancel)
+            local job_id="${1:-}"
+            if [[ -z "$job_id" ]]; then
+                echo "Error: schedule cancel requires a job id" >&2
+                exit 2
+            fi
+            schedule_cancel "$job_id"
+            ;;
+
+        simulate)
+            local job_id="${1:-}"
+            if [[ -z "$job_id" ]]; then
+                echo "Error: schedule simulate requires a job id" >&2
+                exit 2
+            fi
+            schedule_simulate "$job_id"
+            ;;
+
+        run-honor)
+            local job_id="${1:-}"
+            if [[ -z "$job_id" ]]; then
+                echo "Error: schedule run-honor requires a job id" >&2
+                exit 2
+            fi
+            schedule_run_honor "$job_id"
+            ;;
+
+        run-restart)
+            local job_id="${1:-}"
+            if [[ -z "$job_id" ]]; then
+                echo "Error: schedule run-restart requires a job id" >&2
+                exit 2
+            fi
+            schedule_run_restart "$job_id"
+            ;;
+
+        run-warning)
+            local job_id="${1:-}"
+            local warning_minutes="${2:-}"
+            if [[ -z "$job_id" || -z "$warning_minutes" ]]; then
+                echo "Error: schedule run-warning requires a job id and warning minutes" >&2
+                exit 2
+            fi
+            schedule_run_warning "$job_id" "$warning_minutes"
+            ;;
+
+        *)
+            echo "Error: Unknown schedule subcommand: $subcmd" >&2
+            echo "Valid subcommands: honor, restart, list, cancel, simulate" >&2
             exit 2
             ;;
     esac
@@ -835,6 +1034,9 @@ main() {
             ;;
         update)
             cmd_update "$@"
+            ;;
+        schedule)
+            cmd_schedule "$@"
             ;;
         config)
             cmd_config "$@"
