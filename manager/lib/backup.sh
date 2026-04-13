@@ -13,11 +13,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 # CONFIGURATION
 # ============================================================================
 
-BACKUP_CONFIG_LOADED=""
-BACKUP_DIR=""
-BACKUP_RETENTION_DAYS=""
+export BACKUP_CONFIG_LOADED=""
+export BACKUP_DIR=""
+export BACKUP_RETENTION_DAYS=""
 export BACKUP_VERIFY_AFTER=""
-BACKUP_LOCK_FILE="/var/run/vmangos-manager/backup.lock"
+
+export BACKUP_LOCK_FILE="/var/run/vmangos-manager/backup.lock"
 
 # Exit codes
 export E_BACKUP_NOSPACE=10
@@ -31,7 +32,7 @@ export E_RESTORE_PARTIAL=17
 export E_SCHEDULE_INVALID=18
 
 # Required databases for backup
-BACKUP_DATABASES=("auth" "characters" "world" "logs")
+# Database list populated from config in backup_load_config()
 
 # Required tables for Level 2 verification
 BACKUP_REQUIRED_TABLES=(
@@ -63,6 +64,9 @@ backup_load_config() {
     BACKUP_DIR="${CONFIG_BACKUP_DIR:-/opt/mangos/backups}"
     BACKUP_RETENTION_DAYS="${CONFIG_BACKUP_RETENTION_DAYS:-30}"
     BACKUP_VERIFY_AFTER="${CONFIG_BACKUP_VERIFY_AFTER:-true}"
+
+    # Load database names from config
+    BACKUP_DATABASES=("$AUTH_DB" "${CONFIG_DATABASE_CHARACTERS_DB:-characters}" "${CONFIG_DATABASE_WORLD_DB:-mangos}" "${CONFIG_DATABASE_LOGS_DB:-logs}")
     
     BACKUP_CONFIG_LOADED="1"
     log_debug "Backup configuration loaded: dir=$BACKUP_DIR"
@@ -505,56 +509,69 @@ backup_restore() {
     }
     
     # Restore databases
-    local failed_dbs=()
     
-    for db in "${BACKUP_DATABASES[@]}"; do
-        log_info "Restoring database: $db"
-        
-        if ! backup_restore_database "$backup_file"; then
-            log_error "Failed to restore database: $db"
-            failed_dbs+=("$db")
-        fi
-    done
+    # Restore from backup (single import of full dump)
+    log_info "Restoring from backup: $backup_file"
+    log_info "This will restore all databases: ${BACKUP_DATABASES[*]}"
     
-    # Check for partial failure
-    if [[ ${#failed_dbs[@]} -gt 0 ]]; then
-        echo ""
+    if ! backup_restore_full "$backup_file"; then
         log_error "═══════════════════════════════════════════════════"
-        log_error "  PARTIAL RESTORE FAILURE"
+        log_error "  RESTORE FAILED"
         log_error "═══════════════════════════════════════════════════"
         log_error ""
-        log_error "Failed databases:"
-        for db in "${failed_dbs[@]}"; do
-            log_error "  ✗ $db"
-        done
-        log_error ""
-        log_error "Successfully restored databases may be INCONSISTENT"
-        log_error "Manual intervention required"
+        log_error "The database restore operation failed."
+        log_error "Your databases may be in an INCONSISTENT state."
+        log_error "Manual intervention is required."
         log_error ""
         
-        json_output false "null" "RESTORE_PARTIAL" "Partial restore failure: ${failed_dbs[*]}" "Some databases failed to restore. System may be in inconsistent state."
+        # Try to restart services anyway so the server is not left down
+        log_warn "Attempting to restart services..."
+        server_start false || true
+        
+        json_output false "null" "RESTORE_PARTIAL" "Database restore failed" "Databases may be in an inconsistent state. Manual intervention required."
         return "$E_RESTORE_PARTIAL"
     fi
     
-    # Start services (auth first, then world)
-    log_info "Starting VMANGOS services..."
-    server_start false || {
-        log_error "Failed to start services after restore"
-        return "$E_SERVICE_ERROR"
-    }
+    log_info "✓ Database restore complete"
     
     log_info "✓ Restore complete"
     json_output true "{\"restored_from\": \"$backup_file\", \"databases\": [$(printf '"%s",' "${BACKUP_DATABASES[@]}" | sed 's/,$//')]}"
     return 0
 }
 
-backup_restore_database() {
+backup_restore_full() {
     local backup_file="$1"
     
-    # Extract and restore database: $db_name (note: full backup file restore)
-    # mysqldump with --databases includes CREATE DATABASE and USE statements
-    gunzip -c "$backup_file" 2>/dev/null | \
-        mysql -h "$DB_HOST" -P "$DB_PORT" -u root -p"${MYSQL_ROOT_PASSWORD:-}" 2>/dev/null
+    # Check for root credentials
+    if [[ -z "${MYSQL_ROOT_PASSWORD:-}" ]]; then
+        log_error "Root database password not provided"
+        log_info "Set MYSQL_ROOT_PASSWORD environment variable"
+        return "$E_RESTORE_PRIVS"
+    fi
+    
+    # Create temporary MySQL options file (avoids password in process list)
+    local mysql_defaults
+    mysql_defaults=$(mktemp -t vmangos_restore.XXXXXX)
+    chmod 600 "$mysql_defaults"
+    
+    cat > "$mysql_defaults" << EOF
+[client]
+host = $DB_HOST
+port = $DB_PORT
+user = root
+password = $MYSQL_ROOT_PASSWORD
+EOF
+    
+    # Restore from backup using defaults file
+    local restore_result=0
+    if ! gunzip -c "$backup_file" 2>/dev/null | mysql --defaults-file="$mysql_defaults" 2>/dev/null; then
+        restore_result=1
+    fi
+    
+    # Clean up temporary file
+    rm -f "$mysql_defaults"
+    
+    return "$restore_result"
 }
 
 backup_restore_dry_run() {
@@ -683,7 +700,7 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/mangos/manager/bin/vmangos-manager backup now --verify
+ExecStart='$MANAGER_BIN' backup now --verify
 User=root
 StandardOutput=journal
 StandardError=journal
@@ -742,7 +759,7 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/mangos/manager/bin/vmangos-manager backup now --verify
+ExecStart='$MANAGER_BIN' backup now --verify
 User=root
 StandardOutput=journal
 StandardError=journal
