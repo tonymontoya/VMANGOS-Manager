@@ -500,6 +500,7 @@ test_cli_parsing() {
     assert_true "[[ \$output == *'server'* ]]" "CLI --help lists server command" || all_passed=1
     assert_true "[[ \$output == *'account'* ]]" "CLI --help lists account command" || all_passed=1
     assert_true "[[ \$output == *'update'* ]]" "CLI --help lists update command" || all_passed=1
+    assert_true "[[ \$output == *'update [check|inspect|plan|apply]'* ]]" "CLI --help lists update inspect command" || all_passed=1
     assert_true "[[ \$output == *'config [create|validate|show|detect]'* ]]" "CLI --help lists config detect command" || all_passed=1
     return $all_passed
 }
@@ -986,6 +987,42 @@ test_update_check_requires_git_repo() {
     return $all_passed
 }
 
+test_update_check_reports_unsafe_source_repo() {
+    # shellcheck source=../lib/update.sh
+    source "$LIB_DIR/update.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local output compact_output
+
+    OUTPUT_FORMAT="json"
+    config_load() {
+        CONFIG_SERVER_INSTALL_ROOT="/opt/mangos"
+        return 0
+    }
+    update_git() {
+        local args="$*"
+        case "$args" in
+            *"/opt/mangos/source rev-parse --show-toplevel"*)
+                printf "fatal: detected dubious ownership in repository at '/opt/mangos/source'\n" >&2
+                return 128
+                ;;
+            *)
+                echo "unexpected git args: $args" >&2
+                return 1
+                ;;
+        esac
+    }
+
+    output=$(update_check 2>/dev/null || true)
+    compact_output=$(printf '%s' "$output" | tr -d '[:space:]')
+    assert_true "[[ \$compact_output == *'\"code\":\"SOURCE_REPO_UNSAFE\"'* ]]" "update_check reports Git safe.directory protection explicitly" || all_passed=1
+    assert_true "[[ \$compact_output == *'safe.directory'* && \$compact_output == *'/opt/mangos/source'* ]]" "update_check suggests safe.directory remediation" || all_passed=1
+
+    OUTPUT_FORMAT="text"
+    return $all_passed
+}
+
 test_update_plan_text_output() {
     # shellcheck source=../lib/update.sh
     source "$LIB_DIR/update.sh"
@@ -1187,6 +1224,240 @@ test_update_apply_rejects_dirty_source_tree() {
     assert_true "[[ ! -s \"$call_log_file\" ]]" "update_apply does not start backup when source tree is dirty" || all_passed=1
 
     rm -f "$call_log_file"
+    OUTPUT_FORMAT="text"
+    return $all_passed
+}
+
+test_update_inspect_reports_supported_db_migrations() {
+    # shellcheck source=../lib/update.sh
+    source "$LIB_DIR/update.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local output compact_output
+
+    OUTPUT_FORMAT="json"
+    config_load() {
+        CONFIG_SERVER_INSTALL_ROOT="/opt/mangos"
+        CONFIG_DATABASE_HOST="127.0.0.1"
+        CONFIG_DATABASE_PORT="3306"
+        CONFIG_DATABASE_USER="mangos"
+        CONFIG_DATABASE_PASSWORD="secret"
+        CONFIG_DATABASE_AUTH_DB="auth"
+        CONFIG_DATABASE_WORLD_DB="world"
+        CONFIG_DATABASE_LOGS_DB="logs"
+        return 0
+    }
+    update_list_current_migration_files() { return 0; }
+    update_mysql_query() {
+        local database="$1"
+        local query="$2"
+        if [[ "$query" == "SHOW TABLES LIKE 'migrations';" ]]; then
+            printf 'migrations\n'
+            return 0
+        fi
+        case "$database" in
+            auth) printf '20260410094340\n' ;;
+            world) printf '20260412145522\n' ;;
+            logs) printf '20221008210304\n' ;;
+        esac
+    }
+    update_git() {
+        local args="$*"
+        case "$args" in
+            *"/opt/mangos/source rev-parse --show-toplevel"*) printf '/opt/mangos/source\n' ;;
+            *"/opt/mangos/source rev-parse --abbrev-ref --symbolic-full-name @{upstream}"*) printf 'origin/development\n' ;;
+            *"/opt/mangos/source rev-parse --abbrev-ref HEAD"*) printf 'development\n' ;;
+            *"/opt/mangos/source fetch --quiet origin"*) return 0 ;;
+            *"/opt/mangos/source rev-parse origin/development^{commit}"*) printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' ;;
+            *"/opt/mangos/source rev-parse HEAD"*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' ;;
+            *"/opt/mangos/source rev-parse origin/development"*) printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' ;;
+            *"/opt/mangos/source rev-list --count HEAD..origin/development"*) printf '2\n' ;;
+            *"/opt/mangos/source rev-list --count origin/development..HEAD"*) printf '0\n' ;;
+            *"/opt/mangos/source status --porcelain"*) return 0 ;;
+            *"/opt/mangos/source diff --name-status --find-renames HEAD..origin/development -- sql"*)
+                printf 'A\tsql/migrations/20260420000000_world.sql\n'
+                printf 'A\tsql/migrations/20260420010000_logon.sql\n'
+                ;;
+            *)
+                echo "unexpected git args: $args" >&2
+                return 1
+                ;;
+        esac
+    }
+
+    output=$(update_inspect)
+    compact_output=$(printf '%s' "$output" | tr -d '[:space:]')
+    assert_true "[[ \$compact_output == *'\"db_assessment\":\"schema_migrations_pending\"'* ]]" "update_inspect reports pending supported DB migrations" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"db_automation_supported\":true'* ]]" "update_inspect marks supported DB automation" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"role\":\"world\"'* && \$compact_output == *'\"id\":\"20260420000000\"'* ]]" "update_inspect includes pending world migration" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"role\":\"auth\"'* && \$compact_output == *'\"id\":\"20260420010000\"'* ]]" "update_inspect includes pending auth migration" || all_passed=1
+
+    OUTPUT_FORMAT="text"
+    return $all_passed
+}
+
+test_update_plan_include_db_reports_manual_review() {
+    # shellcheck source=../lib/update.sh
+    source "$LIB_DIR/update.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local output compact_output
+
+    OUTPUT_FORMAT="json"
+    config_load() {
+        CONFIG_SERVER_INSTALL_ROOT="/opt/mangos"
+        CONFIG_DATABASE_HOST="127.0.0.1"
+        CONFIG_DATABASE_PORT="3306"
+        CONFIG_DATABASE_USER="mangos"
+        CONFIG_DATABASE_PASSWORD="secret"
+        CONFIG_DATABASE_AUTH_DB="auth"
+        CONFIG_DATABASE_WORLD_DB="world"
+        CONFIG_DATABASE_LOGS_DB="logs"
+        return 0
+    }
+    update_nproc() { printf '4\n'; }
+    update_list_current_migration_files() { return 0; }
+    update_mysql_query() {
+        local query="$2"
+        if [[ "$query" == "SHOW TABLES LIKE 'migrations';" ]]; then
+            printf 'migrations\n'
+        fi
+    }
+    update_git() {
+        local args="$*"
+        case "$args" in
+            *"/opt/mangos/source rev-parse --show-toplevel"*) printf '/opt/mangos/source\n' ;;
+            *"/opt/mangos/source rev-parse --abbrev-ref --symbolic-full-name @{upstream}"*) printf 'origin/development\n' ;;
+            *"/opt/mangos/source rev-parse --abbrev-ref HEAD"*) printf 'development\n' ;;
+            *"/opt/mangos/source fetch --quiet origin"*) return 0 ;;
+            *"/opt/mangos/source rev-parse origin/development^{commit}"*) printf 'dddddddddddddddddddddddddddddddddddddddd\n' ;;
+            *"/opt/mangos/source rev-parse HEAD"*) printf 'cccccccccccccccccccccccccccccccccccccccc\n' ;;
+            *"/opt/mangos/source rev-parse origin/development"*) printf 'dddddddddddddddddddddddddddddddddddddddd\n' ;;
+            *"/opt/mangos/source rev-list --count HEAD..origin/development"*) printf '1\n' ;;
+            *"/opt/mangos/source rev-list --count origin/development..HEAD"*) printf '0\n' ;;
+            *"/opt/mangos/source status --porcelain"*) return 0 ;;
+            *"/opt/mangos/source diff --name-status --find-renames HEAD..origin/development -- sql"*)
+                printf 'A\tsql/custom/repack/Custom-START_ON_GM_ISLAND.sql\n'
+                ;;
+            *)
+                echo "unexpected git args: $args" >&2
+                return 1
+                ;;
+        esac
+    }
+
+    output=$(update_plan true)
+    compact_output=$(printf '%s' "$output" | tr -d '[:space:]')
+    assert_true "[[ \$compact_output == *'\"db_assessment\":\"manual_review_required\"'* ]]" "update_plan --include-db reports manual review state" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"db_automation_supported\":false'* ]]" "update_plan --include-db marks manual DB automation unsupported" || all_passed=1
+    assert_true "[[ \$compact_output == *'Custom-START_ON_GM_ISLAND.sql'* ]]" "update_plan --include-db reports manual SQL path" || all_passed=1
+
+    OUTPUT_FORMAT="text"
+    return $all_passed
+}
+
+test_update_apply_include_db_runs_migrations() {
+    # shellcheck source=../lib/update.sh
+    source "$LIB_DIR/update.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local output call_log_file pulled=0 repo_root migration_path
+    call_log_file=$(mktemp)
+    repo_root=$(mktemp -d)
+    migration_path="$repo_root/sql/migrations/20260420000000_world.sql"
+    mkdir -p "$repo_root/sql/migrations"
+    printf '%s\n' '-- migration' > "$migration_path"
+
+    OUTPUT_FORMAT="text"
+    check_root() { :; }
+    config_load() {
+        CONFIG_SERVER_INSTALL_ROOT="/opt/mangos"
+        CONFIG_DATABASE_HOST="127.0.0.1"
+        CONFIG_DATABASE_PORT="3306"
+        CONFIG_DATABASE_USER="mangos"
+        CONFIG_DATABASE_PASSWORD="secret"
+        CONFIG_DATABASE_AUTH_DB="auth"
+        CONFIG_DATABASE_WORLD_DB="world"
+        CONFIG_DATABASE_LOGS_DB="logs"
+        return 0
+    }
+    acquire_lock() { printf 'lock|\n' >> "$call_log_file"; }
+    release_lock() { printf 'unlock|\n' >> "$call_log_file"; }
+    backup_now() { printf 'backup|\n' >> "$call_log_file"; }
+    server_stop() { printf 'stop|\n' >> "$call_log_file"; }
+    server_start() { printf 'start|\n' >> "$call_log_file"; }
+    update_run_cmake() { printf 'cmake|\n' >> "$call_log_file"; }
+    update_run_make_build() { printf 'makebuild|\n' >> "$call_log_file"; }
+    update_run_make_install() { printf 'makeinstall|\n' >> "$call_log_file"; }
+    update_post_apply_verify() { printf 'verify|\n' >> "$call_log_file"; }
+    server_status() { printf 'status|\n' >> "$call_log_file"; }
+    update_nproc() { printf '4\n'; }
+    update_list_current_migration_files() {
+        if [[ "$pulled" -eq 1 ]]; then
+            printf 'sql/migrations/20260420000000_world.sql\n'
+        fi
+    }
+    update_mysql_query() {
+        local database="$1"
+        local query="$2"
+        if [[ "$query" == "SHOW TABLES LIKE 'migrations';" ]]; then
+            printf 'migrations\n'
+            return 0
+        fi
+        case "$database" in
+            auth) printf '20260410094340\n' ;;
+            world) printf '20260412145522\n' ;;
+            logs) printf '20221008210304\n' ;;
+        esac
+    }
+    update_mysql_exec_file() {
+        local database="$1"
+        local sql_file="$2"
+        printf 'db:%s:%s|\n' "$database" "$(basename "$sql_file")" >> "$call_log_file"
+    }
+    update_git() {
+        local args="$*"
+        case "$args" in
+            *"$repo_root rev-parse --show-toplevel"*) printf '%s\n' "$repo_root" ;;
+            *"$repo_root rev-parse --abbrev-ref --symbolic-full-name @{upstream}"*) printf 'origin/development\n' ;;
+            *"$repo_root rev-parse --abbrev-ref HEAD"*) printf 'development\n' ;;
+            *"$repo_root fetch --quiet origin"*) return 0 ;;
+            *"$repo_root rev-parse origin/development^{commit}"*) printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' ;;
+            *"$repo_root rev-parse origin/development"*) printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' ;;
+            *"$repo_root rev-list --count HEAD..origin/development"*) printf '1\n' ;;
+            *"$repo_root rev-list --count origin/development..HEAD"*) printf '0\n' ;;
+            *"$repo_root status --porcelain"*) return 0 ;;
+            *"$repo_root diff --name-status --find-renames HEAD..origin/development -- sql"*)
+                printf 'A\tsql/migrations/20260420000000_world.sql\n'
+                ;;
+            *"$repo_root pull --ff-only origin development"*)
+                pulled=1
+                printf 'pull|\n' >> "$call_log_file"
+                return 0
+                ;;
+            *"$repo_root rev-parse HEAD"*)
+                if [[ "$pulled" -eq 1 ]]; then
+                    printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
+                else
+                    printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+                fi
+                ;;
+            *)
+                echo "unexpected git args: $args" >&2
+                return 1
+                ;;
+        esac
+    }
+
+    output=$(update_apply true true)
+    assert_true "[[ \$(tr -d '\\n' < \"$call_log_file\") == 'backup|lock|stop|pull|db:world:20260420000000_world.sql|cmake|makebuild|makeinstall|start|verify|unlock|status|' ]]" "update_apply --include-db runs migration before build/install" || all_passed=1
+    assert_true "[[ \$output == *'Applying world migration 20260420000000 to world'* ]]" "update_apply --include-db logs world migration application" || all_passed=1
+
+    rm -f "$call_log_file"
+    rm -rf "$repo_root"
     OUTPUT_FORMAT="text"
     return $all_passed
 }
@@ -1824,6 +2095,7 @@ main() {
     run_test "Update: JSON output" test_update_check_json_output
     run_test "Update: Source repo preferred" test_update_check_prefers_configured_source_repo
     run_test "Update: Missing repo" test_update_check_requires_git_repo
+    run_test "Update: Unsafe source repo" test_update_check_reports_unsafe_source_repo
     run_test "Update: Plan text output" test_update_plan_text_output
     run_test "Update: Plan JSON output" test_update_plan_json_output
     run_test "Update: Apply workflow" test_update_apply_runs_backup_and_rebuild_workflow

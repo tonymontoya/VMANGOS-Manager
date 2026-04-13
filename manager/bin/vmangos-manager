@@ -44,7 +44,7 @@ COMMANDS:
     server [start|stop|restart|status] [OPTIONS]
       status options: [--format text|json] [--watch] [--interval SECONDS]
     account [create|list|setgm|ban|unban|password] [OPTIONS]
-    update [check|plan|apply] [OPTIONS]
+    update [check|inspect|plan|apply] [OPTIONS]
     config [create|validate|show|detect] [OPTIONS]
     backup [now|list|verify|restore|clean|schedule] [OPTIONS]
 EOF
@@ -550,9 +550,34 @@ cmd_update() {
             update_check
             ;;
 
-        plan)
+        inspect)
             while [[ $# -gt 0 ]]; do
                 case "$1" in
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        echo "Unknown option: $1" >&2
+                        exit 2
+                        ;;
+                    *)
+                        echo "Error: update inspect does not accept positional arguments" >&2
+                        exit 2
+                        ;;
+                esac
+            done
+            update_inspect
+            ;;
+
+        plan)
+            local include_db=false
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --include-db)
+                        include_db=true
+                        shift
+                        ;;
                     --)
                         shift
                         break
@@ -567,15 +592,20 @@ cmd_update() {
                         ;;
                 esac
             done
-            update_plan
+            update_plan "$include_db"
             ;;
 
         apply)
             local backup_first=false
+            local include_db=false
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --backup-first)
                         backup_first=true
+                        shift
+                        ;;
+                    --include-db)
+                        include_db=true
                         shift
                         ;;
                     --)
@@ -592,12 +622,12 @@ cmd_update() {
                         ;;
                 esac
             done
-            update_apply "$backup_first"
+            update_apply "$backup_first" "$include_db"
             ;;
 
         *)
             echo "Error: Unknown update subcommand: $subcmd" >&2
-            echo "Valid subcommands: check, plan, apply" >&2
+            echo "Valid subcommands: check, inspect, plan, apply" >&2
             exit 2
             ;;
     esac
