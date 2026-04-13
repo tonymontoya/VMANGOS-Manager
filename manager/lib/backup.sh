@@ -35,19 +35,6 @@ export E_SCHEDULE_INVALID=18
 # Database list populated from config in backup_load_config()
 
 # Required tables for Level 2 verification
-BACKUP_REQUIRED_TABLES=(
-    "auth.account"
-    "auth.account_banned"
-    "auth.realmcharacters"
-    "characters.characters"
-    "characters.character_inventory"
-    "characters.character_homebind"
-    "world.creature"
-    "world.gameobject"
-    "world.item_template"
-    "world.quest_template"
-    "logs.logs"
-)
 
 # ============================================================================
 # CONFIG LOADING
@@ -66,6 +53,12 @@ backup_load_config() {
     BACKUP_VERIFY_AFTER="${CONFIG_BACKUP_VERIFY_AFTER:-true}"
 
     # Load database names from config
+    # Load server config first to get AUTH_DB
+    server_load_config || {
+        log_error "Failed to load server configuration"
+        return 1
+    }
+
     # Load server config first to get AUTH_DB
     server_load_config || {
         log_error "Failed to load server configuration"
@@ -428,7 +421,22 @@ verify_level_2() {
     # Check for required table structures
     local missing_tables=()
     
-    for table in "${BACKUP_REQUIRED_TABLES[@]}"; do
+    # Build required tables list from actual DB names
+    local required_tables=(
+        "$AUTH_DB.account"
+        "$AUTH_DB.account_banned"
+        "$AUTH_DB.realmcharacters"
+        "${CONFIG_DATABASE_CHARACTERS_DB:-characters}.characters"
+        "${CONFIG_DATABASE_CHARACTERS_DB:-characters}.character_inventory"
+        "${CONFIG_DATABASE_CHARACTERS_DB:-characters}.character_homebind"
+        "${CONFIG_DATABASE_WORLD_DB:-world}.creature"
+        "${CONFIG_DATABASE_WORLD_DB:-world}.gameobject"
+        "${CONFIG_DATABASE_WORLD_DB:-world}.item_template"
+        "${CONFIG_DATABASE_WORLD_DB:-world}.quest_template"
+        "${CONFIG_DATABASE_LOGS_DB:-logs}.logs"
+    )
+    
+    for table in "${required_tables[@]}"; do
         local tbl_name
         tbl_name="${table#*.}"
         
