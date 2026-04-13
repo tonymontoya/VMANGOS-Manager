@@ -1,21 +1,22 @@
 # VMANGOS Manager
 
-VMANGOS Manager turns a raw Ubuntu VMANGOS host into something that feels operated instead of babysat: automated installation, an opinionated live dashboard, and the CLI automation behind both.
+VMANGOS Manager gives VMaNGOS servers something they usually do not get: a real operator experience. It automates host installation, provisions the moving pieces around the realm, and puts a live terminal dashboard on top instead of expecting admins to live in scattered shell commands.
 
 ![VMANGOS Manager Textual dashboard](docs/assets/dashboard-overview.svg)
 
-## What It Sells
+This screenshot is a real, demo-backed dashboard export generated from the Manager TUI.
 
-- automated VMANGOS install and provisioning on Ubuntu 22.04
-- a Textual dashboard for live host and realm status
-- backups, scheduling, updates, accounts, and config adoption behind the scenes
-- pragmatic host-first automation instead of hand-maintained admin scripts
+## Why It Exists
 
-## The Two Main Features
+- VMaNGOS has powerful server software but a thin operator surface.
+- New hosts take real setup work, and existing hosts usually accrete fragile local scripts.
+- Manager makes installation, monitoring, and day-two operations feel like one product instead of a pile of disconnected chores.
 
-### 1. Install Automation
+## What You Get
 
-For a fresh host, the repo ships the installer flow that provisions VMANGOS, configures databases, lays out runtime paths, and can also provision Manager itself under `/opt/mangos/manager`.
+### Install Automation
+
+For a fresh Ubuntu 22.04 host, the repo ships an installer flow that provisions VMANGOS, configures databases, lays out runtime paths, and can provision Manager itself under `/opt/mangos/manager`.
 
 Automated install:
 
@@ -25,7 +26,7 @@ wget https://raw.githubusercontent.com/tonymontoya/VMANGOS-Manager/main/vmangos_
 sudo bash auto_install.sh
 ```
 
-Interactive install:
+Guided install:
 
 ```bash
 wget https://raw.githubusercontent.com/tonymontoya/VMANGOS-Manager/main/vmangos_setup.sh
@@ -41,9 +42,11 @@ The installer handles:
 - manager provisioning
 - dashboard prerequisites for fresh installs
 
-### 2. The Textual Dashboard
+If you want the fuller installer story, use the [install automation guide](docs/install-automation.md).
 
-The dashboard is the flagship operator experience. It is backed by the same Manager JSON status surfaces used by the CLI, so the TUI is not a separate monitoring stack.
+### The Dashboard
+
+The dashboard is the main selling point of Manager. It is a top-style operational view backed by the same Manager JSON status surfaces used by the CLI, so the TUI is not a disconnected monitoring toy.
 
 Bootstrap once on a host where Manager is already installed:
 
@@ -61,8 +64,31 @@ The dashboard surfaces:
 
 - auth/world service health, PID, uptime, and quick actions
 - host CPU, memory, disk, load, and disk I/O
-- online-player table plus player details
-- alerts, recent events, and log-rotation health
+- online player visibility plus per-player detail
+- alerts, recent events, and log rotation health
+
+## Two Good Starting Paths
+
+### Fresh Host
+
+Use the installer scripts and let Manager come in as part of the host provisioning flow.
+
+```bash
+sudo bash auto_install.sh
+```
+
+### Existing VMANGOS Host
+
+Install Manager, detect your config, then bootstrap the dashboard:
+
+```bash
+cd manager
+make test
+sudo make install PREFIX=/opt/mangos/manager
+sudo /opt/mangos/manager/bin/vmangos-manager config detect
+sudo /opt/mangos/manager/bin/vmangos-manager dashboard --bootstrap
+sudo /opt/mangos/manager/bin/vmangos-manager dashboard --refresh 2
+```
 
 ## Quick Start
 
@@ -88,16 +114,7 @@ sudo /opt/mangos/manager/bin/vmangos-manager dashboard --bootstrap
 sudo /opt/mangos/manager/bin/vmangos-manager dashboard --refresh 2
 ```
 
-## Documentation
-
-- [CLI reference](docs/cli-reference.md)
-- [Troubleshooting](docs/troubleshooting.md)
-- [Security notes](docs/security.md)
-- [Research notes](docs/research)
-
-## Under The Hood
-
-The CLI remains the operational backend for:
+## What Manager Covers Behind The UI
 
 - server control and richer status output
 - backup and restore workflows
@@ -106,7 +123,15 @@ The CLI remains the operational backend for:
 - account management
 - config detection for existing installs
 
-If you want the command-by-command details, use the CLI reference instead of the README.
+## Documentation
+
+- [Install automation](docs/install-automation.md)
+- [CLI reference](docs/cli-reference.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Security notes](docs/security.md)
+- [Research notes](docs/research)
+
+If you want command-by-command detail, use the CLI reference instead of the README.
 
 ## VMaNGOS Context
 
