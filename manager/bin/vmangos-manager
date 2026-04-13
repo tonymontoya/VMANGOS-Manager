@@ -46,6 +46,7 @@ COMMANDS:
       stop options: [--graceful|--force] [--timeout SECONDS]
       restart options: [--timeout SECONDS]
       status options: [--format text|json] [--watch] [--interval SECONDS]
+    logs [status|rotate|test-config] [OPTIONS]
     account [create|list|setgm|ban|unban|password] [OPTIONS]
     update [check|inspect|plan|apply] [OPTIONS]
     schedule [honor|restart|list|cancel|simulate] [OPTIONS]
@@ -128,6 +129,8 @@ source "$LIB_DIR/update.sh"
 source "$LIB_DIR/schedule.sh"
 # shellcheck source=lib/backup.sh
 source "$LIB_DIR/backup.sh"
+# shellcheck source=lib/logs.sh
+source "$LIB_DIR/logs.sh"
 
 # Export globals for library use
 export VERBOSE
@@ -256,6 +259,99 @@ cmd_server() {
         *)
             echo "Error: Unknown server subcommand: $subcmd" >&2
             echo "Valid subcommands: start, stop, restart, status" >&2
+            exit 2
+            ;;
+    esac
+}
+
+cmd_logs() {
+    local subcmd="${1:-}"
+    shift || true
+
+    case "$subcmd" in
+        status)
+            local fmt="$OUTPUT_FORMAT"
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --format)
+                        if [[ -n "${2:-}" ]]; then
+                            fmt="$2"
+                            shift 2
+                        else
+                            echo "Error: --format requires an argument" >&2
+                            exit 2
+                        fi
+                        ;;
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        echo "Unknown option: $1" >&2
+                        exit 2
+                        ;;
+                    *)
+                        echo "Error: logs status does not accept positional arguments" >&2
+                        exit 2
+                        ;;
+                esac
+            done
+
+            if [[ "$fmt" == "json" ]]; then
+                logs_status_json
+            else
+                logs_status_text
+            fi
+            ;;
+
+        rotate)
+            local force=false
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --force)
+                        force=true
+                        shift
+                        ;;
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        echo "Unknown option: $1" >&2
+                        exit 2
+                        ;;
+                    *)
+                        echo "Error: logs rotate does not accept positional arguments" >&2
+                        exit 2
+                        ;;
+                esac
+            done
+            logs_rotate "$force"
+            ;;
+
+        test-config)
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        echo "Unknown option: $1" >&2
+                        exit 2
+                        ;;
+                    *)
+                        echo "Error: logs test-config does not accept positional arguments" >&2
+                        exit 2
+                        ;;
+                esac
+            done
+            logs_test_config
+            ;;
+
+        *)
+            echo "Error: Unknown logs subcommand: $subcmd" >&2
+            echo "Valid subcommands: status, rotate, test-config" >&2
             exit 2
             ;;
     esac
@@ -1028,6 +1124,9 @@ main() {
     case "$cmd" in
         server)
             cmd_server "$@"
+            ;;
+        logs)
+            cmd_logs "$@"
             ;;
         account)
             cmd_account "$@"

@@ -74,7 +74,8 @@ run_test() {
 
 create_test_config() {
     local config_file="$1"
-    cat > "$config_file" << 'EOF'
+    local install_root="${2:-/opt/mangos}"
+    cat > "$config_file" << EOF
 [database]
 host = 127.0.0.1
 port = 3306
@@ -88,7 +89,7 @@ logs_db = logs
 [server]
 auth_service = auth
 world_service = world
-install_root = /opt/mangos
+install_root = $install_root
 
 [backup]
 enabled = true
@@ -268,6 +269,19 @@ done
 EOF
 
     chmod +x "$mock_dir/systemctl" "$mock_dir/ps" "$mock_dir/mysql" "$mock_dir/df" "$mock_dir/sleep" "$mock_dir/journalctl"
+}
+
+setup_logs_mock_bin() {
+    local mock_dir="$1"
+
+    cat > "$mock_dir/logrotate" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${LOGS_TEST_LOGROTATE_LOG:-/dev/null}"
+exit "${LOGS_TEST_LOGROTATE_EXIT:-0}"
+EOF
+
+    chmod +x "$mock_dir/logrotate"
 }
 
 setup_config_detect_mock_bin() {
@@ -532,6 +546,7 @@ test_cli_parsing() {
     output=$(bash "$MANAGER_DIR/bin/vmangos-manager" --help 2>&1) || true
     assert_true "[[ \$output == *'VMANGOS Manager'* ]]" "CLI --help shows app name" || all_passed=1
     assert_true "[[ \$output == *'server'* ]]" "CLI --help lists server command" || all_passed=1
+    assert_true "[[ \$output == *'logs [status|rotate|test-config]'* ]]" "CLI --help lists logs command" || all_passed=1
     assert_true "[[ \$output == *'account'* ]]" "CLI --help lists account command" || all_passed=1
     assert_true "[[ \$output == *'update'* ]]" "CLI --help lists update command" || all_passed=1
     assert_true "[[ \$output == *'schedule [honor|restart|list|cancel|simulate]'* ]]" "CLI --help lists schedule command" || all_passed=1
@@ -1819,6 +1834,173 @@ test_cli_status_watch_rejects_json() {
     return $all_passed
 }
 
+test_logs_render_config_includes_issue17_policy() {
+    # shellcheck source=../lib/logs.sh
+    source "$LIB_DIR/logs.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir config_file install_root output
+    temp_dir=$(mktemp -d)
+    install_root="$temp_dir/install"
+    config_file="$temp_dir/manager.conf"
+
+    create_test_config "$config_file" "$install_root"
+    CONFIG_FILE="$config_file"
+    LOGS_CONFIG_LOADED=""
+
+    output=$(logs_render_logrotate_config)
+    assert_true "[[ \$output == *'$install_root/logs/mangosd/Server.log'* && \$output == *'$install_root/logs/mangosd/Bg.log'* ]]" "logs config targets mangosd logs under configured install root" || all_passed=1
+    assert_true "[[ \$output == *'$install_root/logs/realmd/*.log'* && \$output == *'$install_root/logs/honor/*.log'* ]]" "logs config targets realmd and honor logs" || all_passed=1
+    assert_true "[[ \$output == *'copytruncate'* ]]" "logs config documents copytruncate strategy" || all_passed=1
+    assert_true "[[ \$output == *'rotate 30'* && \$output == *'rotate 90'* ]]" "logs config includes standard and sensitive retention policies" || all_passed=1
+    assert_true "[[ \$output == *'gm_critical.log'* && \$output == *'Anticheat.log'* ]]" "logs config includes sensitive log stanza" || all_passed=1
+    assert_equals "1" "$(printf '%s' "$output" | grep -c 'Anticheat.log')" "logs config avoids duplicate Anticheat entries" || all_passed=1
+    assert_equals "1" "$(printf '%s' "$output" | grep -c 'gm_critical.log')" "logs config avoids duplicate gm_critical entries" || all_passed=1
+    assert_true "[[ \$output == *'su mangos mangos'* ]]" "logs config uses expected ownership for logrotate" || all_passed=1
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_logs_status_json_reports_counts_and_permission_drift() {
+    # shellcheck source=../lib/logs.sh
+    source "$LIB_DIR/logs.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir config_file install_root output compact_output
+    temp_dir=$(mktemp -d)
+    install_root="$temp_dir/install"
+    config_file="$temp_dir/manager.conf"
+
+    create_test_config "$config_file" "$install_root"
+    mkdir -p "$install_root/logs/mangosd"
+    printf '%s\n' 'server' > "$install_root/logs/mangosd/Server.log"
+    printf '%s\n' 'anti' > "$install_root/logs/mangosd/Anticheat.log"
+    printf '%s\n' 'gm' > "$install_root/logs/mangosd/gm_critical.log"
+    printf '%s\n' 'rotated' > "$install_root/logs/mangosd/Server.log-20260413-1.gz"
+    chmod 644 "$install_root/logs/mangosd/Anticheat.log" "$install_root/logs/mangosd/gm_critical.log"
+
+    CONFIG_FILE="$config_file"
+    LOGS_ROTATE_CONFIG_PATH="$temp_dir/vmangos.logrotate"
+    LOGS_CONFIG_LOADED=""
+    logs_install_config >/dev/null
+
+    output=$(logs_status_json)
+    compact_output=$(printf '%s' "$output" | tr -d '[:space:]')
+    assert_true "[[ \$compact_output == *'\"success\":true'* ]]" "logs status json reports success" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"present\":true'* && \$compact_output == *'\"in_sync\":true'* ]]" "logs status json reports installed in-sync config" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"active_files\":3'* ]]" "logs status json counts active log files" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"rotated_files\":1'* ]]" "logs status json counts rotated log files" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"sensitive_permissions_ok\":false'* ]]" "logs status json reports sensitive permission drift" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"status\":\"degraded\"'* ]]" "logs status json degrades health when sensitive permissions are loose" || all_passed=1
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_logs_rotate_force_runs_logrotate_and_hardens_permissions() {
+    # shellcheck source=../lib/logs.sh
+    source "$LIB_DIR/logs.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir config_file install_root mock_dir command_log output perms
+    temp_dir=$(mktemp -d)
+    install_root="$temp_dir/install"
+    config_file="$temp_dir/manager.conf"
+    mock_dir="$temp_dir/mockbin"
+    command_log="$temp_dir/logrotate.log"
+
+    create_test_config "$config_file" "$install_root"
+    mkdir -p "$install_root/logs/mangosd"
+    printf '%s\n' 'anti' > "$install_root/logs/mangosd/Anticheat.log"
+    printf '%s\n' 'gm' > "$install_root/logs/mangosd/gm_critical.log"
+    chmod 644 "$install_root/logs/mangosd/Anticheat.log" "$install_root/logs/mangosd/gm_critical.log"
+    mkdir -p "$mock_dir"
+    setup_logs_mock_bin "$mock_dir"
+
+    CONFIG_FILE="$config_file"
+    LOGS_ROTATE_CONFIG_PATH="$temp_dir/vmangos.logrotate"
+    LOGS_ROTATE_STATE_PATH="$temp_dir/logrotate.state"
+    LOGS_CONFIG_LOADED=""
+
+    output=$(PATH="$mock_dir:$PATH" LOGROTATE_BIN="$mock_dir/logrotate" LOGS_TEST_LOGROTATE_LOG="$command_log" logs_rotate true 2>&1)
+    perms=$(get_file_permissions "$install_root/logs/mangosd/Anticheat.log")
+
+    assert_file_exists "$LOGS_ROTATE_CONFIG_PATH" "logs rotate installs logrotate config" || all_passed=1
+    assert_equals "600" "$perms" "logs rotate hardens sensitive log permissions before rotation" || all_passed=1
+    assert_true "[[ \$(cat \"$command_log\") == *'-f'* && \$(cat \"$command_log\") == *'-s $temp_dir/logrotate.state'* && \$(cat \"$command_log\") == *'$temp_dir/vmangos.logrotate'* ]]" "logs rotate invokes logrotate with force flag and configured state file" || all_passed=1
+    assert_true "[[ \$output == *'Log rotation completed using'* ]]" "logs rotate reports completion" || all_passed=1
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_logs_test_config_runs_debug_validation() {
+    # shellcheck source=../lib/logs.sh
+    source "$LIB_DIR/logs.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir config_file install_root mock_dir command_log output
+    temp_dir=$(mktemp -d)
+    install_root="$temp_dir/install"
+    config_file="$temp_dir/manager.conf"
+    mock_dir="$temp_dir/mockbin"
+    command_log="$temp_dir/logrotate.log"
+
+    create_test_config "$config_file" "$install_root"
+    mkdir -p "$install_root/logs/mangosd" "$mock_dir"
+    setup_logs_mock_bin "$mock_dir"
+
+    CONFIG_FILE="$config_file"
+    LOGS_ROTATE_CONFIG_PATH="$temp_dir/vmangos.logrotate"
+    LOGS_CONFIG_LOADED=""
+
+    output=$(PATH="$mock_dir:$PATH" LOGROTATE_BIN="$mock_dir/logrotate" LOGS_TEST_LOGROTATE_LOG="$command_log" logs_test_config 2>&1)
+
+    assert_true "[[ \$(cat \"$command_log\") == *'-d'* && \$(cat \"$command_log\") != *'-f'* ]]" "logs test-config runs logrotate in debug mode" || all_passed=1
+    assert_true "[[ \$output == *'Logrotate configuration is valid'* ]]" "logs test-config reports successful validation" || all_passed=1
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_cli_logs_status_json_with_generated_config() {
+    local all_passed=0
+    local temp_dir config_file install_root mock_dir output compact_output
+    temp_dir=$(mktemp -d)
+    install_root="$temp_dir/install"
+    config_file="$temp_dir/manager.conf"
+    mock_dir="$temp_dir/mockbin"
+
+    create_test_config "$config_file" "$install_root"
+    mkdir -p "$install_root/logs/mangosd" "$mock_dir"
+    printf '%s\n' 'server' > "$install_root/logs/mangosd/Server.log"
+    printf '%s\n' 'anti' > "$install_root/logs/mangosd/Anticheat.log"
+    chmod 600 "$install_root/logs/mangosd/Anticheat.log"
+    setup_logs_mock_bin "$mock_dir"
+
+    PATH="$mock_dir:$PATH" \
+    MANAGER_CONFIG="$config_file" \
+    VMANGOS_LOGROTATE_CONFIG_PATH="$temp_dir/vmangos.logrotate" \
+    LOGROTATE_BIN="$mock_dir/logrotate" \
+    bash "$MANAGER_DIR/bin/vmangos-manager" logs test-config >/dev/null 2>&1
+
+    output=$(PATH="$mock_dir:$PATH" MANAGER_CONFIG="$config_file" VMANGOS_LOGROTATE_CONFIG_PATH="$temp_dir/vmangos.logrotate" bash "$MANAGER_DIR/bin/vmangos-manager" logs status --format json 2>/dev/null)
+    compact_output=$(printf '%s' "$output" | tr -d '[:space:]')
+
+    assert_true "[[ \$compact_output == *'\"success\":true'* ]]" "CLI logs status json reports success" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"present\":true'* && \$compact_output == *'\"in_sync\":true'* ]]" "CLI logs status json reports generated config state" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"active_files\":2'* ]]" "CLI logs status json reports active log count" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"status\":\"healthy\"'* ]]" "CLI logs status json reports healthy status when config and permissions are correct" || all_passed=1
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
 test_schedule_honor_requires_backend_command() {
     # shellcheck source=../lib/schedule.sh
     source "$LIB_DIR/schedule.sh"
@@ -2509,6 +2691,11 @@ main() {
     run_test "CLI: Status JSON" test_cli_status_json_with_mocks
     run_test "CLI: Status watch" test_cli_status_watch_single_iteration
     run_test "CLI: Watch rejects JSON" test_cli_status_watch_rejects_json
+    run_test "Logs: Config rendering" test_logs_render_config_includes_issue17_policy
+    run_test "Logs: Status JSON" test_logs_status_json_reports_counts_and_permission_drift
+    run_test "Logs: Rotate force" test_logs_rotate_force_runs_logrotate_and_hardens_permissions
+    run_test "Logs: Test config" test_logs_test_config_runs_debug_validation
+    run_test "CLI: Logs status JSON" test_cli_logs_status_json_with_generated_config
     run_test "Schedule: Honor requires backend" test_schedule_honor_requires_backend_command
     run_test "Schedule: Honor create" test_schedule_honor_creates_timer_and_metadata
     run_test "Schedule: Restart warnings" test_schedule_restart_creates_warning_timers
