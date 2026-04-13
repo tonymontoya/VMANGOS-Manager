@@ -94,6 +94,12 @@ install_root = /opt/mangos
 enabled = true
 backup_dir = /tmp/vmangos-backups
 retention_days = 7
+
+[maintenance]
+timezone = UTC
+honor_command =
+announce_command =
+restart_warnings = 30,15,5,1
 EOF
     chmod 600 "$config_file"
 }
@@ -528,6 +534,7 @@ test_cli_parsing() {
     assert_true "[[ \$output == *'server'* ]]" "CLI --help lists server command" || all_passed=1
     assert_true "[[ \$output == *'account'* ]]" "CLI --help lists account command" || all_passed=1
     assert_true "[[ \$output == *'update'* ]]" "CLI --help lists update command" || all_passed=1
+    assert_true "[[ \$output == *'schedule [honor|restart|list|cancel|simulate]'* ]]" "CLI --help lists schedule command" || all_passed=1
     assert_true "[[ \$output == *'update [check|inspect|plan|apply]'* ]]" "CLI --help lists update inspect command" || all_passed=1
     assert_true "[[ \$output == *'config [create|validate|show|detect]'* ]]" "CLI --help lists config detect command" || all_passed=1
     return $all_passed
@@ -1812,6 +1819,249 @@ test_cli_status_watch_rejects_json() {
     return $all_passed
 }
 
+test_schedule_honor_requires_backend_command() {
+    # shellcheck source=../lib/schedule.sh
+    source "$LIB_DIR/schedule.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local output temp_root
+    temp_root=$(mktemp -d)
+
+    CONFIG_FILE="$temp_root/config/manager.conf"
+    check_root() { :; }
+    config_load() {
+        CONFIG_SERVER_INSTALL_ROOT="/opt/mangos"
+        CONFIG_MAINTENANCE_TIMEZONE="UTC"
+        CONFIG_MAINTENANCE_HONOR_COMMAND=""
+        CONFIG_MAINTENANCE_ANNOUNCE_COMMAND=""
+        CONFIG_MAINTENANCE_RESTART_WARNINGS="30,15,5,1"
+        return 0
+    }
+    server_load_config() { return 0; }
+    config_resolve_manager_root() { printf '%s/manager\n' "$temp_root"; }
+
+    output=$(schedule_honor daily "06:00" "UTC" 2>&1 || true)
+    assert_true "[[ \$output == *'Honor scheduling requires maintenance.honor_command'* ]]" "schedule honor fails closed without configured backend command" || all_passed=1
+
+    rm -rf "$temp_root"
+    return $all_passed
+}
+
+test_schedule_honor_creates_timer_and_metadata() {
+    # shellcheck source=../lib/schedule.sh
+    source "$LIB_DIR/schedule.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_root unit_root systemctl_log metadata_file service_file timer_file output
+    temp_root=$(mktemp -d)
+    unit_root="$temp_root/systemd"
+    systemctl_log="$temp_root/systemctl.log"
+    mkdir -p "$unit_root"
+
+    CONFIG_FILE="$temp_root/config/manager.conf"
+    SCHEDULE_UNIT_DIR="$unit_root"
+    check_root() { :; }
+    config_load() {
+        CONFIG_SERVER_INSTALL_ROOT="/opt/mangos"
+        CONFIG_MAINTENANCE_TIMEZONE="UTC"
+        CONFIG_MAINTENANCE_HONOR_COMMAND="/bin/true"
+        CONFIG_MAINTENANCE_ANNOUNCE_COMMAND=""
+        CONFIG_MAINTENANCE_RESTART_WARNINGS="30,15,5,1"
+        return 0
+    }
+    server_load_config() { return 0; }
+    config_resolve_manager_root() { printf '%s/manager\n' "$temp_root"; }
+    schedule_systemctl() {
+        printf '%s\n' "$*" >> "$systemctl_log"
+        return 0
+    }
+
+    output=$(schedule_honor daily "06:00" "UTC")
+    metadata_file=$(find "$temp_root/manager/state/schedules" -name '*.conf' | head -n 1)
+    service_file=$(find "$unit_root" -name 'vmangos-schedule-*.service' ! -name '*warning*' | head -n 1)
+    timer_file=$(find "$unit_root" -name 'vmangos-schedule-*.timer' ! -name '*warning*' | head -n 1)
+
+    assert_file_exists "$metadata_file" "schedule honor writes metadata file" || all_passed=1
+    assert_file_exists "$service_file" "schedule honor writes main service unit" || all_passed=1
+    assert_file_exists "$timer_file" "schedule honor writes main timer unit" || all_passed=1
+    assert_true "[[ \$(cat \"$timer_file\") == *'OnCalendar=*-*-* 06:00:00 UTC'* ]]" "schedule honor writes expected OnCalendar expression" || all_passed=1
+    assert_true "[[ \$(cat \"$metadata_file\") == *'job_type = honor'* ]]" "schedule honor metadata records job type" || all_passed=1
+    assert_true "[[ \$output == *'Scheduled honor job'* ]]" "schedule honor reports created job id" || all_passed=1
+
+    rm -rf "$temp_root"
+    return $all_passed
+}
+
+test_schedule_restart_creates_warning_timers() {
+    # shellcheck source=../lib/schedule.sh
+    source "$LIB_DIR/schedule.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_root unit_root warning_timer metadata_file
+    temp_root=$(mktemp -d)
+    unit_root="$temp_root/systemd"
+    mkdir -p "$unit_root"
+
+    CONFIG_FILE="$temp_root/config/manager.conf"
+    SCHEDULE_UNIT_DIR="$unit_root"
+    check_root() { :; }
+    config_load() {
+        CONFIG_SERVER_INSTALL_ROOT="/opt/mangos"
+        CONFIG_MAINTENANCE_TIMEZONE="UTC"
+        CONFIG_MAINTENANCE_HONOR_COMMAND="/bin/true"
+        CONFIG_MAINTENANCE_ANNOUNCE_COMMAND=""
+        CONFIG_MAINTENANCE_RESTART_WARNINGS="30,15,5,1"
+        return 0
+    }
+    server_load_config() { return 0; }
+    config_resolve_manager_root() { printf '%s/manager\n' "$temp_root"; }
+    schedule_systemctl() { return 0; }
+
+    schedule_restart_create weekly "Sun 04:00" "UTC" "30,15,5,1" "Weekly maintenance" >/dev/null
+
+    metadata_file=$(find "$temp_root/manager/state/schedules" -name '*.conf' | head -n 1)
+    warning_timer="$unit_root/$(basename "$(find "$unit_root" -name '*warning-30.timer' | head -n 1)")"
+
+    assert_file_exists "$metadata_file" "schedule restart writes metadata file" || all_passed=1
+    assert_equals "4" "$(find "$unit_root" -name '*warning-*.timer' | wc -l | awk '{print $1}')" "schedule restart creates one warning timer per configured warning" || all_passed=1
+    assert_true "[[ \$(cat \"$warning_timer\") == *'OnCalendar=Sun *-*-* 03:30:00 UTC'* ]]" "schedule restart warning timer uses shifted OnCalendar" || all_passed=1
+    assert_true "[[ \$(cat \"$metadata_file\") == *'warnings = 30,15,5,1'* ]]" "schedule restart metadata records warning intervals" || all_passed=1
+    assert_true "[[ \$(cat \"$metadata_file\") == *'announce_message = Weekly maintenance'* ]]" "schedule restart metadata records announcement message" || all_passed=1
+
+    rm -rf "$temp_root"
+    return $all_passed
+}
+
+test_schedule_list_json_includes_timezone() {
+    # shellcheck source=../lib/schedule.sh
+    source "$LIB_DIR/schedule.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_root unit_root output compact_output
+    temp_root=$(mktemp -d)
+    unit_root="$temp_root/systemd"
+    mkdir -p "$unit_root"
+
+    CONFIG_FILE="$temp_root/config/manager.conf"
+    SCHEDULE_UNIT_DIR="$unit_root"
+    OUTPUT_FORMAT="text"
+    check_root() { :; }
+    config_load() {
+        CONFIG_SERVER_INSTALL_ROOT="/opt/mangos"
+        CONFIG_MAINTENANCE_TIMEZONE="UTC"
+        CONFIG_MAINTENANCE_HONOR_COMMAND="/bin/true"
+        CONFIG_MAINTENANCE_ANNOUNCE_COMMAND=""
+        CONFIG_MAINTENANCE_RESTART_WARNINGS="30,15,5,1"
+        return 0
+    }
+    server_load_config() { return 0; }
+    config_resolve_manager_root() { printf '%s/manager\n' "$temp_root"; }
+    schedule_systemctl() {
+        case "$1" in
+            show)
+                printf 'NextElapseUSecRealtime=Sun 2026-04-19 04:00:00 UTC\n'
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    }
+
+    schedule_restart_create weekly "Sun 04:00" "UTC" "30,15,5,1" "Weekly maintenance" >/dev/null
+    OUTPUT_FORMAT="json"
+    output=$(schedule_list)
+    compact_output=$(printf '%s' "$output" | tr -d '[:space:]')
+    assert_true "[[ \$compact_output == *'\"job_type\":\"restart\"'* ]]" "schedule list json includes restart job type" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"timezone\":\"UTC\"'* ]]" "schedule list json includes timezone field" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"next_run\":\"Sun2026-04-1904:00:00UTC\"'* ]]" "schedule list json includes next-run timer metadata" || all_passed=1
+
+    rm -rf "$temp_root"
+    OUTPUT_FORMAT="text"
+    return $all_passed
+}
+
+test_schedule_cancel_removes_timer_and_metadata() {
+    # shellcheck source=../lib/schedule.sh
+    source "$LIB_DIR/schedule.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_root unit_root job_id metadata_file systemctl_log
+    temp_root=$(mktemp -d)
+    unit_root="$temp_root/systemd"
+    systemctl_log="$temp_root/systemctl.log"
+    mkdir -p "$unit_root"
+
+    CONFIG_FILE="$temp_root/config/manager.conf"
+    SCHEDULE_UNIT_DIR="$unit_root"
+    check_root() { :; }
+    config_load() {
+        CONFIG_SERVER_INSTALL_ROOT="/opt/mangos"
+        CONFIG_MAINTENANCE_TIMEZONE="UTC"
+        CONFIG_MAINTENANCE_HONOR_COMMAND="/bin/true"
+        CONFIG_MAINTENANCE_ANNOUNCE_COMMAND=""
+        CONFIG_MAINTENANCE_RESTART_WARNINGS="30,15,5,1"
+        return 0
+    }
+    server_load_config() { return 0; }
+    config_resolve_manager_root() { printf '%s/manager\n' "$temp_root"; }
+    schedule_systemctl() {
+        printf '%s\n' "$*" >> "$systemctl_log"
+        return 0
+    }
+
+    schedule_restart_create daily "04:00" "UTC" "15,5" "Daily restart" >/dev/null
+    metadata_file=$(find "$temp_root/manager/state/schedules" -name '*.conf' | head -n 1)
+    job_id=$(basename "$metadata_file" .conf)
+
+    schedule_cancel "$job_id" >/dev/null
+
+    assert_true "[[ ! -f \"$metadata_file\" ]]" "schedule cancel removes metadata file" || all_passed=1
+    assert_equals "0" "$(find "$unit_root" -type f | wc -l | awk '{print $1}')" "schedule cancel removes generated unit files" || all_passed=1
+    assert_true "[[ \$(cat \"$systemctl_log\") == *'disable vmangos-schedule-'* ]]" "schedule cancel disables timer units before removal" || all_passed=1
+
+    rm -rf "$temp_root"
+    return $all_passed
+}
+
+test_schedule_warns_on_overlap() {
+    # shellcheck source=../lib/schedule.sh
+    source "$LIB_DIR/schedule.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_root unit_root output
+    temp_root=$(mktemp -d)
+    unit_root="$temp_root/systemd"
+    mkdir -p "$unit_root"
+
+    CONFIG_FILE="$temp_root/config/manager.conf"
+    SCHEDULE_UNIT_DIR="$unit_root"
+    check_root() { :; }
+    config_load() {
+        CONFIG_SERVER_INSTALL_ROOT="/opt/mangos"
+        CONFIG_MAINTENANCE_TIMEZONE="UTC"
+        CONFIG_MAINTENANCE_HONOR_COMMAND="/bin/true"
+        CONFIG_MAINTENANCE_ANNOUNCE_COMMAND=""
+        CONFIG_MAINTENANCE_RESTART_WARNINGS="30,15,5,1"
+        return 0
+    }
+    server_load_config() { return 0; }
+    config_resolve_manager_root() { printf '%s/manager\n' "$temp_root"; }
+    schedule_systemctl() { return 0; }
+
+    schedule_restart_create daily "04:00" "UTC" "15,5" "First restart" >/dev/null
+    output=$(schedule_restart_create daily "04:10" "UTC" "15,5" "Second restart" 2>&1)
+    assert_true "[[ \$output == *'Potential schedule conflict'* ]]" "schedule restart warns on overlapping schedules" || all_passed=1
+
+    rm -rf "$temp_root"
+    return $all_passed
+}
+
 # ============================================================================
 # BACKUP TESTS
 # ============================================================================
@@ -2259,6 +2509,12 @@ main() {
     run_test "CLI: Status JSON" test_cli_status_json_with_mocks
     run_test "CLI: Status watch" test_cli_status_watch_single_iteration
     run_test "CLI: Watch rejects JSON" test_cli_status_watch_rejects_json
+    run_test "Schedule: Honor requires backend" test_schedule_honor_requires_backend_command
+    run_test "Schedule: Honor create" test_schedule_honor_creates_timer_and_metadata
+    run_test "Schedule: Restart warnings" test_schedule_restart_creates_warning_timers
+    run_test "Schedule: List JSON" test_schedule_list_json_includes_timezone
+    run_test "Schedule: Cancel" test_schedule_cancel_removes_timer_and_metadata
+    run_test "Schedule: Conflict warning" test_schedule_warns_on_overlap
     run_test "Backup: Metadata generation" test_backup_metadata_generation
     run_test "Backup: Schedule parsing" test_backup_schedule_parsing
     run_test "Backup: Filename generation" test_backup_filename_generation

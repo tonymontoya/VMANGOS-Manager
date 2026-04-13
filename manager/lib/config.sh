@@ -28,6 +28,10 @@ export CONFIG_BACKUP_RETENTION_DAYS=""
 export CONFIG_DATABASE_CHARACTERS_DB=""
 export CONFIG_DATABASE_WORLD_DB=""
 export CONFIG_DATABASE_LOGS_DB=""
+export CONFIG_MAINTENANCE_TIMEZONE=""
+export CONFIG_MAINTENANCE_HONOR_COMMAND=""
+export CONFIG_MAINTENANCE_ANNOUNCE_COMMAND=""
+export CONFIG_MAINTENANCE_RESTART_WARNINGS=""
 
 CONFIG_DETECT_ROOTS=()
 CONFIG_DETECT_SERVICE_HINTS=()
@@ -184,6 +188,10 @@ config_load() {
     CONFIG_DATABASE_CHARACTERS_DB=$(ini_read "$config_file" "database" "characters_db" "characters")
     CONFIG_DATABASE_WORLD_DB=$(ini_read "$config_file" "database" "world_db" "mangos")
     CONFIG_DATABASE_LOGS_DB=$(ini_read "$config_file" "database" "logs_db" "logs")
+    CONFIG_MAINTENANCE_TIMEZONE=$(ini_read "$config_file" "maintenance" "timezone" "")
+    CONFIG_MAINTENANCE_HONOR_COMMAND=$(ini_read "$config_file" "maintenance" "honor_command" "")
+    CONFIG_MAINTENANCE_ANNOUNCE_COMMAND=$(ini_read "$config_file" "maintenance" "announce_command" "")
+    CONFIG_MAINTENANCE_RESTART_WARNINGS=$(ini_read "$config_file" "maintenance" "restart_warnings" "30,15,5,1")
     
     log_debug "Configuration loaded from $config_file"
     return 0
@@ -625,6 +633,12 @@ enabled = true
 backup_dir = $CONFIG_DETECT_CURRENT_BACKUP_DIR
 retention_days = 7
 
+[maintenance]
+timezone =
+honor_command =
+announce_command =
+restart_warnings = 30,15,5,1
+
 [logging]
 file = /var/log/vmangos-manager.log
 level = info
@@ -867,6 +881,12 @@ console_enabled = false
 enabled = true
 backup_dir = /opt/mangos/backups
 retention_days = 7
+
+[maintenance]
+timezone =
+honor_command =
+announce_command =
+restart_warnings = 30,15,5,1
 
 [logging]
 file = /var/log/vmangos-manager.log
