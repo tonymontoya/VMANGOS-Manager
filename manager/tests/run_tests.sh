@@ -72,6 +72,170 @@ run_test() {
     return $result
 }
 
+create_test_config() {
+    local config_file="$1"
+    cat > "$config_file" << 'EOF'
+[database]
+host = 127.0.0.1
+port = 3306
+user = mangos
+password =
+auth_db = auth
+characters_db = characters
+world_db = mangos
+logs_db = logs
+
+[server]
+auth_service = auth
+world_service = world
+install_root = /opt/mangos
+
+[backup]
+enabled = true
+backup_dir = /tmp/vmangos-backups
+retention_days = 7
+EOF
+    chmod 600 "$config_file"
+}
+
+setup_status_mock_bin() {
+    local mock_dir="$1"
+
+    cat > "$mock_dir/systemctl" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+cmd="${1:-}"
+
+case "$cmd" in
+    is-active)
+        quiet=0
+        if [[ "${2:-}" == "--quiet" ]]; then
+            quiet=1
+            service="${3:-}"
+        else
+            service="${2:-}"
+        fi
+
+        case "$service" in
+            auth|world)
+                [[ "$quiet" -eq 0 ]] && echo "active"
+                exit 0
+                ;;
+            *)
+                [[ "$quiet" -eq 0 ]] && echo "inactive"
+                exit 3
+                ;;
+        esac
+        ;;
+    show)
+        service="${4:-}"
+        case "$service" in
+            auth) echo "MainPID=111" ;;
+            world) echo "MainPID=222" ;;
+            *) echo "MainPID=0" ;;
+        esac
+        ;;
+    start|stop)
+        printf '%s %s\n' "$cmd" "${2:-}" >> "${STATUS_TEST_SYSTEMCTL_LOG:-/dev/null}"
+        ;;
+    kill)
+        printf 'kill %s %s\n' "${4:-}" "${2:-}" >> "${STATUS_TEST_SYSTEMCTL_LOG:-/dev/null}"
+        ;;
+    *)
+        ;;
+esac
+EOF
+
+    cat > "$mock_dir/ps" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+pid="${2:-0}"
+format="${4:-}"
+
+case "$format" in
+    etimes=)
+        case "$pid" in
+            111) echo "3600" ;;
+            222) echo "7200" ;;
+            *) echo "0" ;;
+        esac
+        ;;
+    rss=)
+        case "$pid" in
+            111) echo "20480" ;;
+            222) echo "524288" ;;
+            *) echo "0" ;;
+        esac
+        ;;
+    %cpu=)
+        case "$pid" in
+            111) echo "0.5" ;;
+            222) echo "12.5" ;;
+            *) echo "0.0" ;;
+        esac
+        ;;
+    *)
+        echo "0"
+        ;;
+esac
+EOF
+
+    cat > "$mock_dir/mysql" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+query=""
+prev=""
+
+for arg in "$@"; do
+    if [[ "$prev" == "-e" ]]; then
+        query="$arg"
+        break
+    fi
+    prev="$arg"
+done
+
+if [[ "$query" == "SELECT 1" ]]; then
+    echo "1"
+    exit 0
+fi
+
+case "$query" in
+    *"auth.account WHERE online = 1"*)
+        if [[ "${STATUS_TEST_PLAYER_MODE:-auth}" == "fallback" ]]; then
+            echo "query failed" >&2
+            exit 1
+        fi
+        echo "4"
+        ;;
+    *"characters.characters WHERE online = 1"*)
+        echo "7"
+        ;;
+    *)
+        echo "0"
+        ;;
+esac
+EOF
+
+    cat > "$mock_dir/df" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'DFEOF'
+Filesystem 1024-blocks Used Available Capacity Mounted on
+/dev/mock 2048000 512000 1536000 25% /opt/mangos
+DFEOF
+EOF
+
+    cat > "$mock_dir/sleep" << 'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+    chmod +x "$mock_dir/systemctl" "$mock_dir/ps" "$mock_dir/mysql" "$mock_dir/df" "$mock_dir/sleep"
+}
+
 # ============================================================================
 # ORIGINAL TESTS
 # ============================================================================
@@ -132,6 +296,184 @@ test_cli_parsing() {
     output=$(bash "$MANAGER_DIR/bin/vmangos-manager" --help 2>&1) || true
     assert_true "[[ \$output == *'VMANGOS Manager'* ]]" "CLI --help shows app name" || all_passed=1
     assert_true "[[ \$output == *'server'* ]]" "CLI --help lists server command" || all_passed=1
+    return $all_passed
+}
+
+test_server_player_count_fallback() {
+    # shellcheck source=../lib/server.sh
+    source "$LIB_DIR/server.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+
+    DB_HOST="127.0.0.1"
+    DB_PORT="3306"
+    DB_USER="mangos"
+    DB_PASS=""
+    AUTH_DB="auth"
+    CONFIG_DATABASE_CHARACTERS_DB="characters"
+
+    mysql() {
+        local args="$*"
+        if [[ "$args" == *"auth.account WHERE online = 1"* ]]; then
+            return 1
+        fi
+        if [[ "$args" == *"characters.characters WHERE online = 1"* ]]; then
+            echo "3"
+            return 0
+        fi
+        echo "1"
+    }
+
+    local result
+    result=$(get_online_player_count_result)
+    assert_equals "3|characters.characters.online" "$result" "player count falls back to characters schema query" || all_passed=1
+
+    return $all_passed
+}
+
+test_server_validate_interval() {
+    # shellcheck source=../lib/server.sh
+    source "$LIB_DIR/server.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+
+    if server_validate_interval "2"; then
+        echo -e "${GREEN}✓${NC} watch interval accepts positive integer"
+    else
+        echo -e "${RED}✗${NC} watch interval rejected valid integer"
+        all_passed=1
+    fi
+
+    if ! server_validate_interval "0"; then
+        echo -e "${GREEN}✓${NC} watch interval rejects zero"
+    else
+        echo -e "${RED}✗${NC} watch interval accepted zero"
+        all_passed=1
+    fi
+
+    if ! server_validate_interval "abc"; then
+        echo -e "${GREEN}✓${NC} watch interval rejects non-numeric values"
+    else
+        echo -e "${RED}✗${NC} watch interval accepted non-numeric value"
+        all_passed=1
+    fi
+
+    return $all_passed
+}
+
+test_server_start_orders_services() {
+    # shellcheck source=../lib/server.sh
+    source "$LIB_DIR/server.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local order_file order
+    order_file=$(mktemp)
+
+    AUTH_SERVICE="auth"
+    WORLD_SERVICE="world"
+    SERVER_CONFIG_LOADED=1
+
+    server_load_config() { return 0; }
+    preflight_check() { return 0; }
+    service_active() { return 1; }
+    service_start() {
+        echo "$1" >> "$order_file"
+        return 0
+    }
+
+    server_start false >/dev/null 2>&1
+    order=$(paste -sd, "$order_file")
+    assert_equals "auth,world" "$order" "server_start starts auth before world" || all_passed=1
+
+    rm -f "$order_file"
+    return $all_passed
+}
+
+test_server_stop_orders_services() {
+    # shellcheck source=../lib/server.sh
+    source "$LIB_DIR/server.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local order_file order
+    order_file=$(mktemp)
+
+    AUTH_SERVICE="auth"
+    WORLD_SERVICE="world"
+    SERVER_CONFIG_LOADED=1
+
+    server_load_config() { return 0; }
+    service_active() { return 0; }
+    systemctl() {
+        if [[ "$1" == "stop" ]]; then
+            echo "$2" >> "$order_file"
+        fi
+        return 0
+    }
+
+    server_stop false false >/dev/null 2>&1
+    order=$(paste -sd, "$order_file")
+    assert_equals "world,auth" "$order" "server_stop stops world before auth" || all_passed=1
+
+    rm -f "$order_file"
+    return $all_passed
+}
+
+test_cli_status_json_with_mocks() {
+    local all_passed=0
+    local temp_dir mock_dir config_file output compact_output
+    temp_dir=$(mktemp -d)
+    mock_dir="$temp_dir/mockbin"
+    mkdir -p "$mock_dir"
+    config_file="$temp_dir/manager.conf"
+
+    create_test_config "$config_file"
+    setup_status_mock_bin "$mock_dir"
+
+    output=$(PATH="$mock_dir:$PATH" MANAGER_CONFIG="$config_file" bash "$MANAGER_DIR/bin/vmangos-manager" server status --format json 2>/dev/null)
+    compact_output=$(printf '%s' "$output" | tr -d '[:space:]')
+
+    assert_true "[[ \$compact_output == *'\"success\":true'* ]]" "CLI status json reports success" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"database_connectivity\":{\"ok\":true'* ]]" "CLI status json includes DB connectivity check" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"source\":\"auth.account.online\"'* ]]" "CLI status json records primary player-count source" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"available_kb\":1536000'* ]]" "CLI status json includes disk availability" || all_passed=1
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_cli_status_watch_single_iteration() {
+    local all_passed=0
+    local temp_dir mock_dir config_file output
+    temp_dir=$(mktemp -d)
+    mock_dir="$temp_dir/mockbin"
+    mkdir -p "$mock_dir"
+    config_file="$temp_dir/manager.conf"
+
+    create_test_config "$config_file"
+    setup_status_mock_bin "$mock_dir"
+
+    output=$(PATH="$mock_dir:$PATH" MANAGER_CONFIG="$config_file" STATUS_TEST_PLAYER_MODE="fallback" STATUS_WATCH_MAX_ITERATIONS=1 bash "$MANAGER_DIR/bin/vmangos-manager" server status --watch --interval 1 2>/dev/null)
+
+    assert_true "[[ \$output == *'VMANGOS Server Status Watch'* ]]" "watch mode prints watch header" || all_passed=1
+    assert_true "[[ \$output == *'Press Ctrl+C to stop'* ]]" "watch mode prints interrupt guidance" || all_passed=1
+    assert_true "[[ \$output == *'Source: characters.characters.online'* ]]" "watch mode reports fallback player-count source" || all_passed=1
+    assert_true "[[ \$output == *'Stopped status watch.'* ]]" "watch mode exits cleanly after test iteration" || all_passed=1
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_cli_status_watch_rejects_json() {
+    local all_passed=0
+    local output
+
+    output=$(bash "$MANAGER_DIR/bin/vmangos-manager" server status --watch --format json 2>&1 || true)
+    assert_true "[[ \$output == *'watch mode only supports text output'* ]]" "watch mode rejects json format" || all_passed=1
+
     return $all_passed
 }
 
@@ -521,6 +863,13 @@ main() {
     run_test "Config: Loading" test_config_loading
     run_test "Config: Creation" test_config_create
     run_test "CLI: Parsing" test_cli_parsing
+    run_test "Server: Player count fallback" test_server_player_count_fallback
+    run_test "Server: Interval validation" test_server_validate_interval
+    run_test "Server: Start order" test_server_start_orders_services
+    run_test "Server: Stop order" test_server_stop_orders_services
+    run_test "CLI: Status JSON" test_cli_status_json_with_mocks
+    run_test "CLI: Status watch" test_cli_status_watch_single_iteration
+    run_test "CLI: Watch rejects JSON" test_cli_status_watch_rejects_json
     run_test "Backup: Metadata generation" test_backup_metadata_generation
     run_test "Backup: Schedule parsing" test_backup_schedule_parsing
     run_test "Backup: Filename generation" test_backup_filename_generation
