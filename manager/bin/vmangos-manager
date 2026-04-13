@@ -42,6 +42,7 @@ GLOBAL OPTIONS:
 
 COMMANDS:
     server [start|stop|restart|status] [OPTIONS]
+      status options: [--format text|json] [--watch] [--interval SECONDS]
     config [create|validate|show] [OPTIONS]
     backup [now|list|verify|restore|clean|schedule] [OPTIONS]
 EOF
@@ -157,17 +158,46 @@ cmd_server() {
             ;;
             
         status)
-            local fmt="text"
+            local fmt="$OUTPUT_FORMAT"
+            local watch=false
+            local interval=2
             while [[ $# -gt 0 ]]; do
                 case "$1" in
-                    --format) fmt="$2"; shift 2 ;;
+                    --format)
+                        if [[ -n "${2:-}" ]]; then
+                            fmt="$2"
+                            shift 2
+                        else
+                            echo "Error: --format requires an argument" >&2
+                            exit 2
+                        fi
+                        ;;
+                    --watch)
+                        watch=true
+                        shift
+                        ;;
+                    --interval)
+                        if [[ -n "${2:-}" ]]; then
+                            interval="$2"
+                            shift 2
+                        else
+                            echo "Error: --interval requires an argument" >&2
+                            exit 2
+                        fi
+                        ;;
                     --) shift; break ;;
                     -*) echo "Unknown option: $1"; exit 2 ;;
                     *) break ;;
                 esac
             done
-            
-            if [[ "$fmt" == "json" ]]; then
+
+            if [[ "$watch" == "true" ]]; then
+                if [[ "$fmt" == "json" ]]; then
+                    echo "Error: watch mode only supports text output" >&2
+                    exit 2
+                fi
+                server_status_watch "$interval"
+            elif [[ "$fmt" == "json" ]]; then
                 server_status_json
             else
                 server_status_text

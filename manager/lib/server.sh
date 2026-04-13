@@ -53,26 +53,44 @@ server_load_config() {
 # ============================================================================
 
 db_check_connection() {
+    server_mysql_query "$AUTH_DB" "SELECT 1" >/dev/null
+}
+
+server_mysql_query() {
+    local database="$1"
+    local query="$2"
+
     if [[ -n "$DB_PASS" ]]; then
-        mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -e "SELECT 1" "$AUTH_DB" >/dev/null 2>&1
+        mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -N -B -e "$query" "$database" 2>/dev/null
     else
-        mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -e "SELECT 1" "$AUTH_DB" >/dev/null 2>&1
+        mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -N -B -e "$query" "$database" 2>/dev/null
     fi
 }
 
-get_online_player_count() {
+get_online_player_count_result() {
     local count
-    if [[ -n "$DB_PASS" ]]; then
-        count=$(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -N -B -e "SELECT COUNT(*) FROM $AUTH_DB.account WHERE online = 1" 2>/dev/null || echo 0)
-    else
-        count=$(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -N -B -e "SELECT COUNT(*) FROM $AUTH_DB.account WHERE online = 1" 2>/dev/null || echo 0)
-    fi
-    
+
+    count=$(server_mysql_query "$AUTH_DB" "SELECT COUNT(*) FROM ${AUTH_DB}.account WHERE online = 1" || true)
     if [[ "$count" =~ ^[0-9]+$ ]]; then
-        echo "$count"
-    else
-        echo "0"
+        printf '%s|auth.account.online\n' "$count"
+        return 0
     fi
+
+    local characters_db="${CONFIG_DATABASE_CHARACTERS_DB:-characters}"
+    count=$(server_mysql_query "$characters_db" "SELECT COUNT(*) FROM ${characters_db}.characters WHERE online = 1" || true)
+    if [[ "$count" =~ ^[0-9]+$ ]]; then
+        printf '%s|characters.characters.online\n' "$count"
+        return 0
+    fi
+
+    printf '0|unavailable\n'
+    return 1
+}
+
+get_online_player_count() {
+    local result
+    result=$(get_online_player_count_result || true)
+    printf '%s\n' "${result%%|*}"
 }
 
 # ============================================================================
@@ -257,52 +275,199 @@ server_restart() {
 # SERVER STATUS (TEXT)
 # ============================================================================
 
-server_status_text() {
-    log_section "VMANGOS Server Status"
-    
+status_set_var() {
+    local name="$1"
+    local value="$2"
+    printf -v "$name" '%s' "$value"
+}
+
+format_uptime_seconds() {
+    local total_seconds="${1:-0}"
+    local days hours minutes seconds
+
+    if [[ ! "$total_seconds" =~ ^[0-9]+$ ]] || [[ "$total_seconds" -le 0 ]]; then
+        printf '0s\n'
+        return 0
+    fi
+
+    days=$((total_seconds / 86400))
+    hours=$(((total_seconds % 86400) / 3600))
+    minutes=$(((total_seconds % 3600) / 60))
+    seconds=$((total_seconds % 60))
+
+    if [[ "$days" -gt 0 ]]; then
+        printf '%sd %sh %sm\n' "$days" "$hours" "$minutes"
+    elif [[ "$hours" -gt 0 ]]; then
+        printf '%sh %sm\n' "$hours" "$minutes"
+    elif [[ "$minutes" -gt 0 ]]; then
+        printf '%sm %ss\n' "$minutes" "$seconds"
+    else
+        printf '%ss\n' "$seconds"
+    fi
+}
+
+server_collect_service_status() {
+    local prefix="$1"
+    local service="$2"
+    local state pid uptime_seconds uptime_human memory_kb memory_mb cpu_percent running
+
+    state=$(systemctl is-active "$service" 2>/dev/null || true)
+    [[ -n "$state" ]] || state="unknown"
+
+    pid=$(systemctl show -p MainPID "$service" 2>/dev/null | cut -d= -f2 || true)
+    [[ "$pid" =~ ^[0-9]+$ ]] || pid=0
+
+    running="false"
+    uptime_seconds=0
+    uptime_human="N/A"
+    memory_mb=0
+    cpu_percent="0.0"
+
+    if [[ "$state" == "active" && "$pid" -gt 0 ]]; then
+        running="true"
+        uptime_seconds=$(ps -p "$pid" -o etimes= 2>/dev/null | awk '{print $1}' || true)
+        uptime_seconds="${uptime_seconds//[[:space:]]/}"
+        [[ "$uptime_seconds" =~ ^[0-9]+$ ]] || uptime_seconds=0
+        uptime_human=$(format_uptime_seconds "$uptime_seconds")
+
+        memory_kb=$(ps -p "$pid" -o rss= 2>/dev/null | awk '{print int($1)}' || true)
+        memory_kb="${memory_kb//[[:space:]]/}"
+        [[ "$memory_kb" =~ ^[0-9]+$ ]] || memory_kb=0
+        memory_mb=$((memory_kb / 1024))
+
+        cpu_percent=$(ps -p "$pid" -o %cpu= 2>/dev/null | awk '{print $1}' || true)
+        cpu_percent="${cpu_percent//[[:space:]]/}"
+        [[ "$cpu_percent" =~ ^[0-9]+([.][0-9]+)?$ ]] || cpu_percent="0.0"
+    else
+        pid=0
+    fi
+
+    status_set_var "STATUS_${prefix}_SERVICE" "$service"
+    status_set_var "STATUS_${prefix}_STATE" "$state"
+    status_set_var "STATUS_${prefix}_RUNNING" "$running"
+    status_set_var "STATUS_${prefix}_PID" "$pid"
+    status_set_var "STATUS_${prefix}_UPTIME_SECONDS" "$uptime_seconds"
+    status_set_var "STATUS_${prefix}_UPTIME_HUMAN" "$uptime_human"
+    status_set_var "STATUS_${prefix}_MEMORY_MB" "$memory_mb"
+    status_set_var "STATUS_${prefix}_CPU_PERCENT" "$cpu_percent"
+}
+
+server_collect_status() {
     server_load_config || {
+        return 1
+    }
+
+    STATUS_TIMESTAMP=$(date -Iseconds)
+
+    server_collect_service_status "AUTH" "$AUTH_SERVICE"
+    server_collect_service_status "WORLD" "$WORLD_SERVICE"
+
+    local disk_data player_result
+
+    if db_check_connection; then
+        STATUS_DB_OK="true"
+        STATUS_DB_MESSAGE="ok"
+        player_result=$(get_online_player_count_result || true)
+        STATUS_PLAYERS_ONLINE="${player_result%%|*}"
+        STATUS_PLAYER_COUNT_SOURCE="${player_result##*|}"
+        if [[ "$STATUS_PLAYER_COUNT_SOURCE" == "unavailable" ]]; then
+            STATUS_PLAYER_COUNT_OK="false"
+        else
+            STATUS_PLAYER_COUNT_OK="true"
+        fi
+    else
+        STATUS_DB_OK="false"
+        STATUS_DB_MESSAGE="unreachable"
+        STATUS_PLAYERS_ONLINE="0"
+        STATUS_PLAYER_COUNT_SOURCE="unavailable"
+        STATUS_PLAYER_COUNT_OK="false"
+    fi
+
+    disk_data=$(df -Pk "$INSTALL_ROOT" 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $4 "|" $5}' || true)
+    if [[ -n "$disk_data" ]]; then
+        STATUS_DISK_AVAILABLE_KB="${disk_data%%|*}"
+        STATUS_DISK_USED_PERCENT="${disk_data##*|}"
+    else
+        STATUS_DISK_AVAILABLE_KB="0"
+        STATUS_DISK_USED_PERCENT="0"
+    fi
+
+    [[ "$STATUS_DISK_AVAILABLE_KB" =~ ^[0-9]+$ ]] || STATUS_DISK_AVAILABLE_KB="0"
+    [[ "$STATUS_DISK_USED_PERCENT" =~ ^[0-9]+$ ]] || STATUS_DISK_USED_PERCENT="0"
+
+    if [[ "$STATUS_DISK_AVAILABLE_KB" -ge 512000 ]]; then
+        STATUS_DISK_OK="true"
+    else
+        STATUS_DISK_OK="false"
+    fi
+}
+
+server_render_service_text() {
+    local label="$1"
+    local prefix="$2"
+    local state_var="STATUS_${prefix}_STATE"
+    local running_var="STATUS_${prefix}_RUNNING"
+    local pid_var="STATUS_${prefix}_PID"
+    local uptime_var="STATUS_${prefix}_UPTIME_HUMAN"
+    local memory_var="STATUS_${prefix}_MEMORY_MB"
+    local cpu_var="STATUS_${prefix}_CPU_PERCENT"
+    local state="${!state_var}"
+    local running="${!running_var}"
+    local pid="${!pid_var}"
+    local uptime="${!uptime_var}"
+    local memory_mb="${!memory_var}"
+    local cpu_percent="${!cpu_var}"
+
+    if [[ "$running" == "true" ]]; then
+        printf '  %-5s %s (PID: %s, uptime: %s, RSS: %s MB, CPU: %s%%)\n' \
+            "$label:" "$state" "$pid" "$uptime" "$memory_mb" "$cpu_percent"
+    else
+        printf '  %-5s %s (PID: n/a)\n' "$label:" "$state"
+    fi
+}
+
+server_render_status_text() {
+    local disk_free_mb=$((STATUS_DISK_AVAILABLE_KB / 1024))
+    local db_label="FAILED"
+    local disk_label="LOW"
+    local player_label="unavailable"
+
+    if [[ "$STATUS_DB_OK" == "true" ]]; then
+        db_label="OK"
+    fi
+
+    if [[ "$STATUS_DISK_OK" == "true" ]]; then
+        disk_label="OK"
+    fi
+
+    if [[ "$STATUS_PLAYER_COUNT_OK" == "true" ]]; then
+        player_label="$STATUS_PLAYERS_ONLINE"
+    fi
+
+    echo "VMANGOS Server Status"
+    echo "Timestamp: $STATUS_TIMESTAMP"
+    echo "Install Root: $INSTALL_ROOT"
+    echo ""
+    echo "Services:"
+    server_render_service_text "Auth" "AUTH"
+    server_render_service_text "World" "WORLD"
+    echo ""
+    echo "Checks:"
+    echo "  Database: $db_label ($STATUS_DB_MESSAGE)"
+    echo "  Disk:     $disk_label ($disk_free_mb MB free, ${STATUS_DISK_USED_PERCENT}% used, path: $INSTALL_ROOT)"
+    echo ""
+    echo "Players:"
+    echo "  Online: $player_label"
+    echo "  Source: $STATUS_PLAYER_COUNT_SOURCE"
+}
+
+server_status_text() {
+    server_collect_status || {
         log_error "Failed to load configuration"
         return 1
     }
-    
-    local auth_status world_status auth_pid world_pid
-    
-    if service_active "$AUTH_SERVICE"; then
-        auth_status="running"
-        auth_pid=$(systemctl show -p MainPID "$AUTH_SERVICE" | cut -d= -f2)
-    else
-        auth_status="stopped"
-        auth_pid="N/A"
-    fi
-    
-    if service_active "$WORLD_SERVICE"; then
-        world_status="running"
-        world_pid=$(systemctl show -p MainPID "$WORLD_SERVICE" | cut -d= -f2)
-    else
-        world_status="stopped"
-        world_pid="N/A"
-    fi
-    
-    echo ""
-    echo "Services:"
-    echo "  Auth Server:  $auth_status (PID: $auth_pid)"
-    echo "  World Server: $world_status (PID: $world_pid)"
-    echo ""
-    
-    if [[ "$world_status" == "running" ]]; then
-        local mem_usage cpu_usage
-        mem_usage=$(ps -p "$world_pid" -o rss= 2>/dev/null | awk '{print $1/1024 " MB"}')
-        cpu_usage=$(ps -p "$world_pid" -o %cpu= 2>/dev/null || echo "N/A")
-        echo "Resource Usage (World):"
-        echo "  Memory: $mem_usage"
-        echo "  CPU:    $cpu_usage%"
-        echo ""
-        
-        local player_count
-        player_count=$(get_online_player_count)
-        echo "Players Online: $player_count"
-        echo ""
-    fi
+
+    server_render_status_text
 }
 
 # ============================================================================
@@ -310,53 +475,136 @@ server_status_text() {
 # ============================================================================
 
 server_status_json() {
-    server_load_config || {
+    server_collect_status || {
         json_output false "null" "CONFIG_ERROR" "Failed to load configuration" "Check config file exists and is readable"
         return 1
     }
-    
-    local auth_status="stopped"
-    local world_status="stopped"
-    local auth_pid=0
-    local world_pid=0
-    local world_mem=0
-    local online_players=0
-    
-    if service_active "$AUTH_SERVICE"; then
-        auth_status="running"
-        auth_pid=$(systemctl show -p MainPID "$AUTH_SERVICE" | cut -d= -f2)
-    fi
-    
-    if service_active "$WORLD_SERVICE"; then
-        world_status="running"
-        world_pid=$(systemctl show -p MainPID "$WORLD_SERVICE" | cut -d= -f2)
-        world_mem=$(ps -p "$world_pid" -o rss= 2>/dev/null || echo 0)
-        world_mem=$((world_mem / 1024))
-        online_players=$(get_online_player_count)
-    fi
-    
+
+    local install_root_escaped auth_service_escaped auth_state_escaped auth_uptime_escaped
+    local world_service_escaped world_state_escaped world_uptime_escaped db_message_escaped
+    local player_source_escaped
+
+    install_root_escaped=$(json_escape "$INSTALL_ROOT")
+    auth_service_escaped=$(json_escape "$STATUS_AUTH_SERVICE")
+    auth_state_escaped=$(json_escape "$STATUS_AUTH_STATE")
+    auth_uptime_escaped=$(json_escape "$STATUS_AUTH_UPTIME_HUMAN")
+    world_service_escaped=$(json_escape "$STATUS_WORLD_SERVICE")
+    world_state_escaped=$(json_escape "$STATUS_WORLD_STATE")
+    world_uptime_escaped=$(json_escape "$STATUS_WORLD_UPTIME_HUMAN")
+    db_message_escaped=$(json_escape "$STATUS_DB_MESSAGE")
+    player_source_escaped=$(json_escape "$STATUS_PLAYER_COUNT_SOURCE")
+
     local data
     data=$(cat <<EOF
 {
+  "install_root": "$install_root_escaped",
   "services": {
     "auth": {
-      "status": "$auth_status",
-      "running": $( [[ "$auth_status" == "running" ]] && echo true || echo false ),
-      "pid": $auth_pid
+      "service": "$auth_service_escaped",
+      "state": "$auth_state_escaped",
+      "running": $STATUS_AUTH_RUNNING,
+      "pid": $STATUS_AUTH_PID,
+      "uptime_seconds": $STATUS_AUTH_UPTIME_SECONDS,
+      "uptime_human": "$auth_uptime_escaped",
+      "memory_mb": $STATUS_AUTH_MEMORY_MB,
+      "cpu_percent": $STATUS_AUTH_CPU_PERCENT
     },
     "world": {
-      "status": "$world_status",
-      "running": $( [[ "$world_status" == "running" ]] && echo true || echo false ),
-      "pid": $world_pid,
-      "memory_mb": $world_mem,
-      "players_online": $online_players
+      "service": "$world_service_escaped",
+      "state": "$world_state_escaped",
+      "running": $STATUS_WORLD_RUNNING,
+      "pid": $STATUS_WORLD_PID,
+      "uptime_seconds": $STATUS_WORLD_UPTIME_SECONDS,
+      "uptime_human": "$world_uptime_escaped",
+      "memory_mb": $STATUS_WORLD_MEMORY_MB,
+      "cpu_percent": $STATUS_WORLD_CPU_PERCENT
     }
+  },
+  "checks": {
+    "database_connectivity": {
+      "ok": $STATUS_DB_OK,
+      "message": "$db_message_escaped"
+    },
+    "disk_space": {
+      "ok": $STATUS_DISK_OK,
+      "path": "$install_root_escaped",
+      "available_kb": $STATUS_DISK_AVAILABLE_KB,
+      "used_percent": $STATUS_DISK_USED_PERCENT
+    }
+  },
+  "players": {
+    "online": $STATUS_PLAYERS_ONLINE,
+    "query_ok": $STATUS_PLAYER_COUNT_OK,
+    "source": "$player_source_escaped"
   }
 }
 EOF
 )
-    
+
     json_output true "$data"
+}
+
+server_validate_interval() {
+    local interval="${1:-}"
+    [[ "$interval" =~ ^[1-9][0-9]*$ ]]
+}
+
+server_status_watch() {
+    local interval="${1:-2}"
+    local interactive="false"
+    local stop_requested=0
+    local iterations=0
+
+    if ! server_validate_interval "$interval"; then
+        log_error "Invalid watch interval: $interval"
+        return "$E_INVALID_ARGS"
+    fi
+
+    [[ -t 1 ]] && interactive="true"
+
+    trap 'stop_requested=1' INT TERM
+
+    if [[ "$interactive" == "true" ]]; then
+        printf '\033[?25l'
+    fi
+
+    while [[ "$stop_requested" -eq 0 ]]; do
+        if [[ "$interactive" == "true" ]]; then
+            printf '\033[H\033[2J'
+        fi
+
+        echo "VMANGOS Server Status Watch"
+        echo "Interval: ${interval}s"
+        echo "Press Ctrl+C to stop"
+        echo ""
+
+        if server_collect_status; then
+            server_render_status_text
+        else
+            log_error "Failed to load configuration"
+            break
+        fi
+
+        if [[ -n "${STATUS_WATCH_MAX_ITERATIONS:-}" ]]; then
+            iterations=$((iterations + 1))
+            if [[ "$iterations" -ge "$STATUS_WATCH_MAX_ITERATIONS" ]]; then
+                break
+            fi
+        fi
+
+        sleep "$interval" || true
+        if [[ "$interactive" != "true" ]]; then
+            echo ""
+        fi
+    done
+
+    trap - INT TERM
+
+    if [[ "$interactive" == "true" ]]; then
+        printf '\033[?25h'
+    fi
+
+    echo "Stopped status watch."
 }
 
 # ============================================================================
