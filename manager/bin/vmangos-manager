@@ -43,6 +43,7 @@ GLOBAL OPTIONS:
 COMMANDS:
     server [start|stop|restart|status] [OPTIONS]
       status options: [--format text|json] [--watch] [--interval SECONDS]
+    account [create|list|setgm|ban|unban|password] [OPTIONS]
     config [create|validate|show] [OPTIONS]
     backup [now|list|verify|restore|clean|schedule] [OPTIONS]
 EOF
@@ -114,6 +115,8 @@ source "$LIB_DIR/common.sh"
 source "$LIB_DIR/config.sh"
 # shellcheck source=lib/server.sh
 source "$LIB_DIR/server.sh"
+# shellcheck source=lib/account.sh
+source "$LIB_DIR/account.sh"
 # shellcheck source=lib/backup.sh
 source "$LIB_DIR/backup.sh"
 
@@ -264,6 +267,233 @@ cmd_config() {
         *)
             echo "Error: Unknown config subcommand: $subcmd" >&2
             echo "Valid subcommands: create, validate, show" >&2
+            exit 2
+            ;;
+    esac
+}
+
+# ============================================================================
+# ACCOUNT COMMAND HANDLER
+# ============================================================================
+
+cmd_account() {
+    local subcmd="${1:-}"
+    shift || true
+
+    case "$subcmd" in
+        create)
+            local username=""
+            local password_mode="interactive"
+            local password_arg=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --password-file)
+                        password_mode="file"
+                        password_arg="${2:-}"
+                        shift 2
+                        ;;
+                    --password-env)
+                        password_mode="env"
+                        shift
+                        ;;
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        echo "Unknown option: $1" >&2
+                        exit 2
+                        ;;
+                    *)
+                        if [[ -z "$username" ]]; then
+                            username="$1"
+                            shift
+                        else
+                            echo "Error: account create accepts only a username as a positional argument" >&2
+                            exit 2
+                        fi
+                        ;;
+                esac
+            done
+            if [[ -z "$username" ]]; then
+                echo "Error: username required" >&2
+                exit 2
+            fi
+            [[ "$password_mode" != "file" || -n "$password_arg" ]] || { echo "Error: --password-file requires a path" >&2; exit 2; }
+            account_create "$username" "$password_mode" "$password_arg"
+            ;;
+
+        list)
+            local online_only=false
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --online)
+                        online_only=true
+                        shift
+                        ;;
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        echo "Unknown option: $1" >&2
+                        exit 2
+                        ;;
+                    *)
+                        echo "Error: account list does not accept positional arguments" >&2
+                        exit 2
+                        ;;
+                esac
+            done
+            account_list "$online_only"
+            ;;
+
+        setgm)
+            local username=""
+            local gm_level=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        echo "Unknown option: $1" >&2
+                        exit 2
+                        ;;
+                    *)
+                        if [[ -z "$username" ]]; then
+                            username="$1"
+                        elif [[ -z "$gm_level" ]]; then
+                            gm_level="$1"
+                        else
+                            echo "Error: account setgm requires exactly <username> <level>" >&2
+                            exit 2
+                        fi
+                        shift
+                        ;;
+                esac
+            done
+            if [[ -z "$username" || -z "$gm_level" ]]; then
+                echo "Error: account setgm requires <username> <level>" >&2
+                exit 2
+            fi
+            account_setgm "$username" "$gm_level"
+            ;;
+
+        ban)
+            local username=""
+            local duration=""
+            local reason=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --reason)
+                        reason="${2:-}"
+                        shift 2
+                        ;;
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        echo "Unknown option: $1" >&2
+                        exit 2
+                        ;;
+                    *)
+                        if [[ -z "$username" ]]; then
+                            username="$1"
+                        elif [[ -z "$duration" ]]; then
+                            duration="$1"
+                        else
+                            echo "Error: account ban requires <username> <duration> --reason <reason>" >&2
+                            exit 2
+                        fi
+                        shift
+                        ;;
+                esac
+            done
+            if [[ -z "$username" || -z "$duration" || -z "$reason" ]]; then
+                echo "Error: account ban requires <username> <duration> --reason <reason>" >&2
+                exit 2
+            fi
+            account_ban "$username" "$duration" "$reason"
+            ;;
+
+        unban)
+            local username=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        echo "Unknown option: $1" >&2
+                        exit 2
+                        ;;
+                    *)
+                        if [[ -z "$username" ]]; then
+                            username="$1"
+                            shift
+                        else
+                            echo "Error: account unban accepts only a username" >&2
+                            exit 2
+                        fi
+                        ;;
+                esac
+            done
+            if [[ -z "$username" ]]; then
+                echo "Error: username required" >&2
+                exit 2
+            fi
+            account_unban "$username"
+            ;;
+
+        password)
+            local username=""
+            local password_mode="interactive"
+            local password_arg=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --password-file)
+                        password_mode="file"
+                        password_arg="${2:-}"
+                        shift 2
+                        ;;
+                    --password-env)
+                        password_mode="env"
+                        shift
+                        ;;
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        echo "Unknown option: $1" >&2
+                        exit 2
+                        ;;
+                    *)
+                        if [[ -z "$username" ]]; then
+                            username="$1"
+                            shift
+                        else
+                            echo "Error: account password accepts only a username as a positional argument" >&2
+                            exit 2
+                        fi
+                        ;;
+                esac
+            done
+            if [[ -z "$username" ]]; then
+                echo "Error: username required" >&2
+                exit 2
+            fi
+            [[ "$password_mode" != "file" || -n "$password_arg" ]] || { echo "Error: --password-file requires a path" >&2; exit 2; }
+            account_password "$username" "$password_mode" "$password_arg"
+            ;;
+
+        *)
+            echo "Error: Unknown account subcommand: $subcmd" >&2
+            echo "Valid subcommands: create, list, setgm, ban, unban, password" >&2
             exit 2
             ;;
     esac
@@ -425,6 +655,9 @@ main() {
     case "$cmd" in
         server)
             cmd_server "$@"
+            ;;
+        account)
+            cmd_account "$@"
             ;;
         config)
             cmd_config "$@"
