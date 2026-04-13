@@ -273,6 +273,26 @@ EOF
     return $all_passed
 }
 
+test_config_resolve_manager_root() {
+    # shellcheck source=../lib/config.sh
+    source "$LIB_DIR/config.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir config_file manager_root
+    temp_dir=$(mktemp -d)
+    mkdir -p "$temp_dir/custom-manager/config"
+    config_file="$temp_dir/custom-manager/config/manager.conf"
+    printf '%s\n' '[database]' > "$config_file"
+    chmod 600 "$config_file"
+
+    manager_root=$(config_resolve_manager_root "$config_file")
+    assert_equals "$temp_dir/custom-manager" "$manager_root" "config_resolve_manager_root derives manager root from config path" || all_passed=1
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
 test_config_create() {
     # shellcheck source=../lib/config.sh
     source "$LIB_DIR/config.sh"
@@ -1062,6 +1082,31 @@ test_backup_service_unit_generation() {
     return $all_passed
 }
 
+test_backup_resolve_manager_bin_from_config_path() {
+    # shellcheck source=../lib/backup.sh
+    source "$LIB_DIR/backup.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir config_file expected_bin resolved_bin
+    temp_dir=$(mktemp -d)
+    mkdir -p "$temp_dir/custom-manager/config" "$temp_dir/custom-manager/bin"
+    config_file="$temp_dir/custom-manager/config/manager.conf"
+    expected_bin="$temp_dir/custom-manager/bin/vmangos-manager"
+    printf '%s\n' '[database]' > "$config_file"
+    chmod 600 "$config_file"
+    printf '%s\n' '#!/usr/bin/env bash' > "$expected_bin"
+    chmod +x "$expected_bin"
+
+    CONFIG_FILE="$config_file"
+    MANAGER_BIN=""
+    resolved_bin=$(backup_resolve_manager_bin)
+    assert_equals "$expected_bin" "$resolved_bin" "backup_resolve_manager_bin follows manager root inferred from config path" || all_passed=1
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
 test_backup_clean_age_retention() {
     # shellcheck source=../lib/backup.sh
     source "$LIB_DIR/backup.sh"
@@ -1323,6 +1368,7 @@ main() {
     
     run_test "Common: JSON utilities" test_common_json
     run_test "Config: Loading" test_config_loading
+    run_test "Config: Manager root resolution" test_config_resolve_manager_root
     run_test "Config: Creation" test_config_create
     run_test "CLI: Parsing" test_cli_parsing
     run_test "Account: Validation" test_account_validation
@@ -1351,6 +1397,7 @@ main() {
     run_test "Backup: Schedule parsing" test_backup_schedule_parsing
     run_test "Backup: Filename generation" test_backup_filename_generation
     run_test "Backup: Service unit generation" test_backup_service_unit_generation
+    run_test "Backup: Manager bin resolution" test_backup_resolve_manager_bin_from_config_path
     run_test "Backup: Age retention cleanup" test_backup_clean_age_retention
     run_test "Backup: Metadata required for verify" test_backup_verify_requires_metadata
     run_test "Backup: Level 2 DB-aware verify" test_backup_verify_level2_db_scoped_tables

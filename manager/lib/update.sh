@@ -50,14 +50,8 @@ update_get_tracking_ref() {
 }
 
 update_get_install_target() {
-    local install_root="/opt/mangos"
-
     config_load "$CONFIG_FILE" >/dev/null 2>&1 || true
-    if [[ -n "${CONFIG_SERVER_INSTALL_ROOT:-}" ]]; then
-        install_root="$CONFIG_SERVER_INSTALL_ROOT"
-    fi
-
-    printf '%s/manager\n' "$install_root"
+    config_resolve_manager_root "$CONFIG_FILE"
 }
 
 update_build_manual_instructions() {
