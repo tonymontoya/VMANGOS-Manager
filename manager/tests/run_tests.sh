@@ -296,6 +296,335 @@ test_cli_parsing() {
     output=$(bash "$MANAGER_DIR/bin/vmangos-manager" --help 2>&1) || true
     assert_true "[[ \$output == *'VMANGOS Manager'* ]]" "CLI --help shows app name" || all_passed=1
     assert_true "[[ \$output == *'server'* ]]" "CLI --help lists server command" || all_passed=1
+    assert_true "[[ \$output == *'account'* ]]" "CLI --help lists account command" || all_passed=1
+    return $all_passed
+}
+
+test_account_validation() {
+    # shellcheck source=../lib/account.sh
+    source "$LIB_DIR/account.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+
+    if validate_username "Player01"; then
+        echo -e "${GREEN}✓${NC} validate_username accepts alphanumeric usernames"
+    else
+        echo -e "${RED}✗${NC} validate_username rejected valid username"
+        all_passed=1
+    fi
+
+    if ! validate_username "bad-user"; then
+        echo -e "${GREEN}✓${NC} validate_username rejects non-alphanumeric usernames"
+    else
+        echo -e "${RED}✗${NC} validate_username accepted invalid username"
+        all_passed=1
+    fi
+
+    if validate_gm_level "3" && ! validate_gm_level "4"; then
+        echo -e "${GREEN}✓${NC} validate_gm_level enforces 0-3"
+    else
+        echo -e "${RED}✗${NC} validate_gm_level failed expected bounds"
+        all_passed=1
+    fi
+
+    if validate_duration "7d" && ! validate_duration "0h"; then
+        echo -e "${GREEN}✓${NC} validate_duration enforces positive unit-suffixed values"
+    else
+        echo -e "${RED}✗${NC} validate_duration failed expected bounds"
+        all_passed=1
+    fi
+
+    if validate_ban_reason "Bad Actor" && ! validate_ban_reason "Bad-Actor"; then
+        echo -e "${GREEN}✓${NC} validate_ban_reason enforces alnum plus spaces"
+    else
+        echo -e "${RED}✗${NC} validate_ban_reason failed expected bounds"
+        all_passed=1
+    fi
+
+    return $all_passed
+}
+
+test_account_hash_known_vector() {
+    # shellcheck source=../lib/account.sh
+    source "$LIB_DIR/account.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local result expected
+
+    expected="D04E6342FE6CB5FAE54C6182F885778D0AEFE4BFCDDC6B5C7DF7DC25FF6E3C2D|46FD48476D925C4422DD1761C299C79FD6C92B5243E4F3C6C62576C0DABD8260"
+    result=$(hash_password "VMANGOS" "4EVER" "D04E6342FE6CB5FAE54C6182F885778D0AEFE4BFCDDC6B5C7DF7DC25FF6E3C2D")
+
+    assert_equals "$expected" "$result" "hash_password matches VMANGOS SRP verifier vector" || all_passed=1
+    return $all_passed
+}
+
+test_account_password_file_checks() {
+    # shellcheck source=../lib/account.sh
+    source "$LIB_DIR/account.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir password_file result
+    temp_dir=$(mktemp -d)
+    password_file="$temp_dir/password.txt"
+
+    printf '%s\n' 'Secret7' > "$password_file"
+    chmod 600 "$password_file"
+    result=$(get_password_from_file "$password_file")
+    assert_equals "Secret7" "$result" "get_password_from_file reads valid 600 file" || all_passed=1
+
+    chmod 644 "$password_file"
+    if ! get_password_from_file "$password_file" >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} get_password_from_file rejects mode 644"
+    else
+        echo -e "${RED}✗${NC} get_password_from_file accepted mode 644"
+        all_passed=1
+    fi
+
+    printf '%s\n' 'short' > "$password_file"
+    chmod 600 "$password_file"
+    if ! get_password_from_file "$password_file" >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} get_password_from_file rejects short passwords"
+    else
+        echo -e "${RED}✗${NC} get_password_from_file accepted short password"
+        all_passed=1
+    fi
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_account_password_file_wrong_owner_rejected() {
+    # shellcheck source=../lib/account.sh
+    source "$LIB_DIR/account.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir password_file
+    temp_dir=$(mktemp -d)
+    password_file="$temp_dir/password.txt"
+    printf '%s\n' 'Secret7' > "$password_file"
+
+    account_get_file_owner_uid() { echo "12345"; }
+    account_get_current_uid() { echo "1000"; }
+    get_file_permissions() { echo "600"; }
+
+    if ! get_password_from_file "$password_file" >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} get_password_from_file rejects wrong ownership"
+    else
+        echo -e "${RED}✗${NC} get_password_from_file accepted wrong ownership"
+        all_passed=1
+    fi
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_account_password_file_accepts_sudo_owner() {
+    # shellcheck source=../lib/account.sh
+    source "$LIB_DIR/account.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir password_file result
+    temp_dir=$(mktemp -d)
+    password_file="$temp_dir/password.txt"
+    printf '%s\n' 'Secret7' > "$password_file"
+
+    account_get_file_owner_uid() { echo "1000"; }
+    account_get_current_uid() { echo "0"; }
+    account_get_sudo_uid() { echo "1000"; }
+    get_file_permissions() { echo "600"; }
+
+    result=$(get_password_from_file "$password_file")
+    assert_equals "Secret7" "$result" "get_password_from_file accepts invoking sudo user ownership" || all_passed=1
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_account_password_env_clears_variable() {
+    # shellcheck source=../lib/account.sh
+    source "$LIB_DIR/account.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_file result
+    temp_file=$(mktemp)
+
+    export VMANGOS_PASSWORD="Secret7"
+    get_password_from_env > "$temp_file"
+    result=$(cat "$temp_file")
+    assert_equals "Secret7" "$result" "get_password_from_env reads VMANGOS_PASSWORD" || all_passed=1
+    assert_true "[[ -z \${VMANGOS_PASSWORD+x} ]]" "get_password_from_env unsets VMANGOS_PASSWORD after read" || all_passed=1
+
+    rm -f "$temp_file"
+    return $all_passed
+}
+
+test_account_create_blocks_injection() {
+    # shellcheck source=../lib/account.sh
+    source "$LIB_DIR/account.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local mysql_called=0
+
+    account_mysql_query() { mysql_called=1; echo "1"; }
+    account_mysql_exec() { mysql_called=1; return 0; }
+
+    if ! account_create "bad'user" "env" "" >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} account_create rejects SQL-injection username before DB access"
+    else
+        echo -e "${RED}✗${NC} account_create accepted invalid username"
+        all_passed=1
+    fi
+    assert_equals "0" "$mysql_called" "account_create does not hit DB for invalid username" || all_passed=1
+
+    return $all_passed
+}
+
+test_account_operations_generate_expected_queries() {
+    # shellcheck source=../lib/account.sh
+    source "$LIB_DIR/account.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local exec_query="" resolve_calls=0 output_file output
+
+    CONFIG_FILE="/tmp/test-manager.conf"
+    ACCOUNT_CONFIG_LOADED=""
+    ACCOUNT_AUTH_DB=""
+    output_file=$(mktemp)
+
+    config_load() {
+        CONFIG_DATABASE_HOST="127.0.0.1"
+        CONFIG_DATABASE_PORT="3306"
+        CONFIG_DATABASE_USER="mangos"
+        CONFIG_DATABASE_PASSWORD="secret"
+        CONFIG_DATABASE_AUTH_DB="auth"
+        return 0
+    }
+
+    account_resolve_account_id() {
+        if [[ "$resolve_calls" -eq 0 ]]; then
+            resolve_calls=1
+            printf '\n'
+        else
+            printf '42\n'
+        fi
+    }
+    account_acquire_password() { printf 'Secret7\n'; }
+    hash_password() { printf 'SALT64|VERIFIER64\n'; }
+    account_mysql_exec() { exec_query="$2"; return 0; }
+
+    account_create "TestUser" "env" "" > "$output_file" 2>&1
+    output=$(cat "$output_file")
+    assert_equals "auth" "$ACCOUNT_AUTH_DB" "account_create loads auth DB config in parent shell" || all_passed=1
+    assert_true "[[ \$exec_query == *'INSERT INTO'* && \$exec_query == *'account'* ]]" "account_create writes auth.account insert" || all_passed=1
+    assert_true "[[ \$exec_query == *'LAST_INSERT_ID()'* && \$exec_query == *'INSERT IGNORE INTO'* && \$exec_query == *'realmcharacters'* ]]" "account_create syncs realmcharacters from inserted account id" || all_passed=1
+    assert_true "[[ \$output == *'AUDIT account.create'* ]]" "account_create emits audit log" || all_passed=1
+
+    account_resolve_account_id() { printf '42\n'; }
+    account_mysql_exec() { exec_query="$2"; return 0; }
+    account_setgm "TestUser" "2" > "$output_file" 2>&1
+    output=$(cat "$output_file")
+    assert_true "[[ \$exec_query == *'account_access'* && \$exec_query == *'VALUES (42, 2, -1)'* ]]" "account_setgm writes global account_access row" || all_passed=1
+    assert_true "[[ \$output == *'AUDIT account.setgm'* ]]" "account_setgm emits audit log" || all_passed=1
+
+    account_get_default_realm_id() { printf '7\n'; }
+    account_mysql_exec() { exec_query="$2"; return 0; }
+    account_ban "TestUser" "1h" "Bad Actor" > "$output_file" 2>&1
+    output=$(cat "$output_file")
+    assert_true "[[ \$exec_query == *'account_banned'* && \$exec_query == *'UNIX_TIMESTAMP() + 3600'* && \$exec_query == *', 7);'* ]]" "account_ban inserts timed ban with resolved realm" || all_passed=1
+    assert_true "[[ \$output == *'AUDIT account.ban'* ]]" "account_ban emits audit log" || all_passed=1
+
+    account_mysql_exec() { exec_query="$2"; return 0; }
+    account_unban "TestUser" > "$output_file" 2>&1
+    output=$(cat "$output_file")
+    assert_true "[[ \$exec_query == *'active'* && \$exec_query == *'= 0'* ]]" "account_unban clears active bans" || all_passed=1
+    assert_true "[[ \$output == *'AUDIT account.unban'* ]]" "account_unban emits audit log" || all_passed=1
+
+    account_mysql_exec() { exec_query="$2"; return 0; }
+    account_password "TestUser" "env" "/unused" > "$output_file" 2>&1 <<<''
+    output=$(cat "$output_file")
+    assert_true "[[ \$exec_query == *\"VERIFIER64\"* && \$exec_query == *\"SALT64\"* ]]" "account_password writes verifier update query" || all_passed=1
+    assert_true "[[ \$output == *'AUDIT account.password'* ]]" "account_password emits audit log" || all_passed=1
+    rm -f "$output_file"
+
+    return $all_passed
+}
+
+test_account_password_env_not_forwarded_to_python() {
+    # shellcheck source=../lib/account.sh
+    source "$LIB_DIR/account.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local env_seen_file output_file output
+
+    ACCOUNT_CONFIG_LOADED=1
+    ACCOUNT_AUTH_DB="auth"
+    env_seen_file=$(mktemp)
+    output_file=$(mktemp)
+
+    account_resolve_account_id() { printf '42\n'; }
+    account_mysql_exec() { return 0; }
+    export VMANGOS_PASSWORD="Secret7"
+
+    python3() {
+        printf '%s' "${VMANGOS_PASSWORD-UNSET}" > "$env_seen_file"
+        cat >/dev/null
+        printf 'SALT64|VERIFIER64\n'
+    }
+
+    account_password "TestUser" "env" "" > "$output_file" 2>&1
+    output=$(cat "$output_file")
+    assert_true "[[ $(cat "$env_seen_file") == 'UNSET' ]]" "account_password does not pass VMANGOS_PASSWORD to hashing subprocess env" || all_passed=1
+    assert_true "[[ \$output == *'AUDIT account.password'* ]]" "account_password still completes via env mode" || all_passed=1
+    unset VMANGOS_PASSWORD
+    rm -f "$env_seen_file" "$output_file"
+
+    return $all_passed
+}
+
+test_account_list_json_output() {
+    # shellcheck source=../lib/account.sh
+    source "$LIB_DIR/account.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local output compact_output
+
+    ACCOUNT_CONFIG_LOADED=1
+    ACCOUNT_AUTH_DB="auth"
+    OUTPUT_FORMAT="json"
+    account_mysql_query() {
+        printf '42\tTESTUSER\t2\t1\t0\n'
+        printf '43\tOTHER\t0\t0\t1\n'
+    }
+
+    output=$(account_list false)
+    compact_output=$(printf '%s' "$output" | tr -d '[:space:]')
+    assert_true "[[ \$compact_output == *'\"accounts\":[{\"id\":42,\"username\":\"TESTUSER\",\"gm_level\":2,\"online\":true,\"banned\":false}'* ]]" "account_list outputs JSON account objects" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"id\":43,\"username\":\"OTHER\",\"gm_level\":0,\"online\":false,\"banned\":true'* ]]" "account_list JSON includes banned status" || all_passed=1
+
+    OUTPUT_FORMAT="text"
+    return $all_passed
+}
+
+test_cli_account_rejects_positional_password() {
+    local all_passed=0
+    local output
+
+    output=$(bash "$MANAGER_DIR/bin/vmangos-manager" account create testuser secret 2>&1 || true)
+    assert_true "[[ \$output == *'accepts only a username as a positional argument'* ]]" "CLI create rejects positional password" || all_passed=1
+
+    output=$(bash "$MANAGER_DIR/bin/vmangos-manager" account password testuser secret 2>&1 || true)
+    assert_true "[[ \$output == *'accepts only a username as a positional argument'* ]]" "CLI password rejects positional password" || all_passed=1
+
     return $all_passed
 }
 
@@ -863,6 +1192,17 @@ main() {
     run_test "Config: Loading" test_config_loading
     run_test "Config: Creation" test_config_create
     run_test "CLI: Parsing" test_cli_parsing
+    run_test "Account: Validation" test_account_validation
+    run_test "Account: Hash vector" test_account_hash_known_vector
+    run_test "Account: Password file checks" test_account_password_file_checks
+    run_test "Account: Wrong owner rejected" test_account_password_file_wrong_owner_rejected
+    run_test "Account: Sudo owner accepted" test_account_password_file_accepts_sudo_owner
+    run_test "Account: Password env handling" test_account_password_env_clears_variable
+    run_test "Account: Injection blocked" test_account_create_blocks_injection
+    run_test "Account: Operation queries" test_account_operations_generate_expected_queries
+    run_test "Account: Env not forwarded" test_account_password_env_not_forwarded_to_python
+    run_test "Account: List JSON" test_account_list_json_output
+    run_test "CLI: Account rejects positional password" test_cli_account_rejects_positional_password
     run_test "Server: Player count fallback" test_server_player_count_fallback
     run_test "Server: Interval validation" test_server_validate_interval
     run_test "Server: Start order" test_server_start_orders_services
