@@ -1,75 +1,58 @@
 #!/usr/bin/env bash
 #
-# VMANGOS Manager - Main entry point
-# Unified CLI for VMANGOS server management
+# VMANGOS Manager - Main CLI Entry Point
 #
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly SCRIPT_DIR
-LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
-readonly LIB_DIR
-
-# Source libraries
-source "$LIB_DIR/common.sh"
-source "$LIB_DIR/config.sh"
-source "$LIB_DIR/server.sh"
-
 # ============================================================================
-# VERSION
+# GLOBALS
 # ============================================================================
 
 readonly VERSION="0.1.0"
-readonly PROGRAM_NAME="vmangos-manager"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+
+readonly LIB_DIR="$SCRIPT_DIR/../lib"
+
+# Global options (exported for use by sourced libraries)
+VERBOSE=0
+OUTPUT_FORMAT="text"
+CONFIG_FILE="${MANAGER_CONFIG:-/opt/mangos/manager/config/manager.conf}"
 
 # ============================================================================
 # USAGE
 # ============================================================================
 
-usage() {
-    cat << EOF
-VMANGOS Manager v${VERSION}
+show_help() {
+    cat << 'EOF'
+VMANGOS Manager - Server Management Tool
+Version: 0.1.0
 
-Usage: ${PROGRAM_NAME} [GLOBAL_OPTIONS] <command> [COMMAND_OPTIONS]
+USAGE:
+    vmangos-manager [GLOBAL_OPTIONS] <COMMAND> [SUBCOMMAND_OPTIONS]
 
-Global Options:
-    -v, --verbose       Enable verbose output
-    -f, --format        Output format: text (default) | json
-    -c, --config        Config file path (default: /opt/mangos/manager/config/manager.conf)
-    -h, --help          Show this help message
-    --version           Show version
+GLOBAL OPTIONS:
+    -c, --config FILE      Configuration file path
+    -v, --verbose          Enable verbose output
+    -f, --format FORMAT    Output format: text | json
+    -h, --help             Show this help message
+    --version              Show version information
 
-Commands:
-    server              Server control operations
-    config              Configuration management
-
-Server Commands:
-    ${PROGRAM_NAME} server start [--wait]
-    ${PROGRAM_NAME} server stop [--graceful|--force]
-    ${PROGRAM_NAME} server restart
-    ${PROGRAM_NAME} server status [--format json]
-
-Config Commands:
-    ${PROGRAM_NAME} config create
-    ${PROGRAM_NAME} config validate
-    ${PROGRAM_NAME} config show
-
-Examples:
-    ${PROGRAM_NAME} server start --wait
-    ${PROGRAM_NAME} server status --format json
-    ${PROGRAM_NAME} -v server restart
-
+COMMANDS:
+    server [start|stop|restart|status] [OPTIONS]
+    config [create|validate|show] [OPTIONS]
 EOF
 }
 
-# ============================================================================
-# GLOBAL OPTIONS
-# ============================================================================
+show_version() {
+    echo "VMANGOS Manager version $VERSION"
+}
 
-VERBOSE=0
-OUTPUT_FORMAT="text"
-CONFIG_FILE="/opt/mangos/manager/config/manager.conf"
+# ============================================================================
+# ARGUMENT PARSING
+# ============================================================================
 
 parse_global_options() {
     while [[ $# -gt 0 ]]; do
@@ -79,23 +62,38 @@ parse_global_options() {
                 shift
                 ;;
             -f|--format)
-                OUTPUT_FORMAT="$2"
-                shift 2
+                if [[ -n "${2:-}" ]]; then
+                    OUTPUT_FORMAT="$2"
+                    shift 2
+                else
+                    echo "Error: --format requires an argument" >&2
+                    exit 2
+                fi
                 ;;
             -c|--config)
-                CONFIG_FILE="$2"
-                shift 2
+                if [[ -n "${2:-}" ]]; then
+                    CONFIG_FILE="$2"
+                    shift 2
+                else
+                    echo "Error: --config requires an argument" >&2
+                    exit 2
+                fi
                 ;;
             -h|--help)
-                usage
+                show_help
                 exit 0
                 ;;
             --version)
-                echo "${PROGRAM_NAME} v${VERSION}"
+                show_version
                 exit 0
                 ;;
+            --)
+                shift
+                break
+                ;;
             -*)
-                error_exit "Unknown option: $1"
+                echo "Error: Unknown option: $1" >&2
+                exit 2
                 ;;
             *)
                 break
@@ -105,24 +103,36 @@ parse_global_options() {
 }
 
 # ============================================================================
-# COMMAND: SERVER
+# COMMAND HANDLERS
 # ============================================================================
 
+# shellcheck source=lib/common.sh
+source "$LIB_DIR/common.sh"
+# shellcheck source=lib/config.sh  
+source "$LIB_DIR/config.sh"
+# shellcheck source=lib/server.sh
+source "$LIB_DIR/server.sh"
+
+# Export globals for library use
+export VERBOSE
+export OUTPUT_FORMAT
+
 cmd_server() {
-    local subcommand="${1:-}"
+    local subcmd="${1:-}"
     shift || true
     
-    case "$subcommand" in
+    case "$subcmd" in
         start)
-            local wait_flag=false
+            local wait=false
             while [[ $# -gt 0 ]]; do
                 case "$1" in
-                    --wait) wait_flag=true; shift ;;
-                    *) error_exit "Unknown option: $1" ;;
+                    --wait) wait=true; shift ;;
+                    --) shift; break ;;
+                    -*) echo "Unknown option: $1"; exit 2 ;;
+                    *) break ;;
                 esac
             done
-            check_root
-            server_start "$wait_flag"
+            server_start "$wait"
             ;;
             
         stop)
@@ -131,28 +141,30 @@ cmd_server() {
                 case "$1" in
                     --graceful) graceful=true; shift ;;
                     --force) force=true; shift ;;
-                    *) error_exit "Unknown option: $1" ;;
+                    --) shift; break ;;
+                    -*) echo "Unknown option: $1"; exit 2 ;;
+                    *) break ;;
                 esac
             done
-            check_root
             server_stop "$graceful" "$force"
             ;;
             
         restart)
-            check_root
             server_restart
             ;;
             
         status)
-            local format="text"
+            local fmt="text"
             while [[ $# -gt 0 ]]; do
                 case "$1" in
-                    --format) format="$2"; shift 2 ;;
-                    *) error_exit "Unknown option: $1" ;;
+                    --format) fmt="$2"; shift 2 ;;
+                    --) shift; break ;;
+                    -*) echo "Unknown option: $1"; exit 2 ;;
+                    *) break ;;
                 esac
             done
             
-            if [[ "$format" == "json" ]]; then
+            if [[ "$fmt" == "json" ]]; then
                 server_status_json
             else
                 server_status_text
@@ -160,42 +172,66 @@ cmd_server() {
             ;;
             
         *)
-            error_exit "Unknown server command: $subcommand"
+            echo "Error: Unknown server subcommand: $subcmd" >&2
+            echo "Valid subcommands: start, stop, restart, status" >&2
+            exit 2
             ;;
     esac
 }
 
-# ============================================================================
-# COMMAND: CONFIG
-# ============================================================================
-
 cmd_config() {
-    local subcommand="${1:-}"
+    local subcmd="${1:-}"
     shift || true
     
-    case "$subcommand" in
+    case "$subcmd" in
         create)
-            config_create "$CONFIG_FILE"
+            local path=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --path) path="$2"; shift 2 ;;
+                    --) shift; break ;;
+                    -*) echo "Unknown option: $1"; exit 2 ;;
+                    *) break ;;
+                esac
+            done
+            
+            if [[ -n "$path" ]]; then
+                config_create "$path"
+            else
+                config_create
+            fi
             ;;
             
         validate)
-            if config_validate "$CONFIG_FILE"; then
-                log_info "✓ Configuration is valid"
-            else
-                error_exit "Configuration validation failed"
-            fi
+            local fmt="text"
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --format) fmt="$2"; shift 2 ;;
+                    --) shift; break ;;
+                    -*) echo "Unknown option: $1"; exit 2 ;;
+                    *) break ;;
+                esac
+            done
+            config_validate "$CONFIG_FILE" "$fmt"
             ;;
             
         show)
-            if [[ -f "$CONFIG_FILE" ]]; then
-                cat "$CONFIG_FILE"
-            else
-                error_exit "Config file not found: $CONFIG_FILE"
-            fi
+            local fmt="text"
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --format) fmt="$2"; shift 2 ;;
+                    --) shift; break ;;
+                    -*) echo "Unknown option: $1"; exit 2 ;;
+                    *) break ;;
+                esac
+            done
+            config_show "$CONFIG_FILE" "$fmt"
             ;;
             
         *)
-            error_exit "Unknown config command: $subcommand"
+            echo "Error: Unknown config subcommand: $subcmd" >&2
+            echo "Valid subcommands: create, validate, show" >&2
+            exit 2
             ;;
     esac
 }
@@ -205,48 +241,33 @@ cmd_config() {
 # ============================================================================
 
 main() {
-    # Parse global options
     parse_global_options "$@"
     
-    # Shift parsed options
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -v|--verbose|-f|--format|-c|--config)
-                if [[ "$1" == -*f* ]] || [[ "$1" == -*c* ]]; then
-                    shift 2
-                else
-                    shift
-                fi
-                ;;
-            -h|--help|--version)
-                shift
-                ;;
-            *)
-                break
-                ;;
-        esac
-    done
+    if [[ $# -eq 0 ]]; then
+        echo "Error: No command specified" >&2
+        show_help >&2
+        exit 2
+    fi
     
-    # Get command
-    local command="${1:-}"
-    shift || true
+    local cmd="$1"
+    shift
     
-    case "$command" in
+    case "$cmd" in
         server)
             cmd_server "$@"
             ;;
         config)
             cmd_config "$@"
             ;;
-        "")
-            usage
-            exit 1
+        help|--help|-h)
+            show_help
             ;;
         *)
-            error_exit "Unknown command: $command"
+            echo "Error: Unknown command: $cmd" >&2
+            show_help >&2
+            exit 2
             ;;
     esac
 }
 
-# Run main
 main "$@"

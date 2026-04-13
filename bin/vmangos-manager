@@ -1,259 +1,321 @@
-#!/bin/bash
-# =============================================================================
-# VMANGOS Manager - Main Entry Point
-# =============================================================================
-# CLI tool for managing VMANGOS private server
-# Version: 0.1.0 (Release A - Foundation)
-# =============================================================================
+#!/usr/bin/env bash
+#
+# VMANGOS Manager - Main CLI Entry Point
+# Unified interface for server control and configuration management
+#
 
-set -uo pipefail
+set -euo pipefail
 
-# =============================================================================
-# Setup Paths
-# =============================================================================
+# ============================================================================
+# GLOBALS
+# ============================================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+readonly VERSION="0.1.0"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly LIB_DIR="$SCRIPT_DIR/../lib"
 
-# Source libraries
-# shellcheck source=../lib/common.sh
-source "$LIB_DIR/common.sh"
-# shellcheck source=../lib/config.sh
-source "$LIB_DIR/config.sh"
-# shellcheck source=../lib/server.sh
-source "$LIB_DIR/server.sh"
+# Global options
+VERBOSE=0
+OUTPUT_FORMAT="text"
+CONFIG_FILE="${MANAGER_CONFIG:-/opt/mangos/manager/config/manager.conf}"
 
-# =============================================================================
-# Global State
-# =============================================================================
+# ============================================================================
+# USAGE
+# ============================================================================
 
-DRY_RUN=false
-CLEANUP_LOCKS=()
-
-# =============================================================================
-# Signal Handlers
-# =============================================================================
-
-cleanup() {
-    log_debug "Cleaning up..."
-    
-    # Release any held locks
-    for lock_file in "${CLEANUP_LOCKS[@]}"; do
-        if [[ -n "$lock_file" && -d "$lock_file" ]]; then
-            log_debug "Releasing lock: $lock_file"
-            lock_release "$lock_file" || true
-        fi
-    done
-    
-    log_debug "Cleanup complete"
-}
-
-# Trap signals to ensure cleanup
-trap cleanup EXIT
-trap 'log_error "Interrupted"; exit 130' INT TERM
-
-# =============================================================================
-# Version & Usage
-# =============================================================================
-
-show_version() {
-    echo "vmangos-manager version $VMANGOS_VERSION"
-    echo "VMANGOS Installation: $VMANGOS_INSTALL_DIR"
-}
-
-show_usage() {
+show_help() {
     cat << 'EOF'
-VMANGOS Manager - CLI tool for managing VMANGOS private server
+VMANGOS Manager - Server Management Tool
+Version: 0.1.0
 
-Usage: vmangos-manager [global-options] <command> [options]
+USAGE:
+    vmangos-manager [GLOBAL_OPTIONS] <COMMAND> [SUBCOMMAND_OPTIONS]
 
-Global Options:
-  -j, --json          Output in JSON format
-  -v, --verbose       Enable verbose logging
-  -n, --dry-run       Show what would be done without executing
-  -h, --help          Show this help message
-  --version           Show version information
+GLOBAL OPTIONS:
+    -c, --config FILE      Configuration file path (default: /opt/mangos/manager/config/manager.conf)
+    -v, --verbose          Enable verbose output
+    -f, --format FORMAT    Output format: text | json (default: text)
+    -h, --help             Show this help message
+    --version              Show version information
 
-Commands:
-  server start [auth|world|all]     Start service(s)
-  server stop [auth|world|all]      Stop service(s)
-  server restart [auth|world|all]   Restart service(s)
-  server status [auth|world|all]    Show service status
-  server logs [auth|world] [-f]     Show service logs
+COMMANDS:
+    server [start|stop|restart|status] [OPTIONS]
+        Control server services
+        
+        start [--wait]
+            Start auth and world services
+            --wait    Wait for services to be ready
+            
+        stop [--graceful|--force]
+            Stop services (world first, then auth)
+            --graceful  Graceful shutdown (default)
+            --force     Force kill
+            
+        restart
+            Restart all services
+            
+        status [--format json]
+            Show service status and player count
 
-Examples:
-  vmangos-manager server start all
-  vmangos-manager server status world --json
-  vmangos-manager server logs auth -f
-  vmangos-manager -n server restart all  # Dry run
+    config [create|validate|show]
+        Configuration management
+        
+        create [--path PATH]
+            Create default configuration file
+            
+        validate [--format json]
+            Validate configuration file
+            
+        show [--format json]
+            Display current configuration
 
+EXAMPLES:
+    # Start server with verbose output
+    vmangos-manager --verbose server start --wait
+    
+    # Check status as JSON
+    vmangos-manager --format json server status
+    
+    # Create config
+    vmangos-manager config create
+    
+    # Validate config
+    vmangos-manager config validate
+
+EXIT CODES:
+    0   Success
+    1   General error
+    2   Invalid arguments
+    3   Not root (for privileged operations)
+    4   Service error
+    5   Config error
 EOF
 }
 
-# =============================================================================
-# Argument Parsing
-# =============================================================================
+show_version() {
+    echo "VMANGOS Manager version $VERSION"
+}
 
-parse_global_args() {
+# ============================================================================
+# ARGUMENT PARSING (Robust getopt-style parsing)
+# ============================================================================
+
+# Parse global options first
+parse_global_options() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -j|--json)
-                export VMANGOS_JSON_OUTPUT="true"
-                shift
-                ;;
             -v|--verbose)
-                export VMANGOS_LOG_LEVEL=$LOG_LEVEL_DEBUG
+                VERBOSE=1
                 shift
                 ;;
-            -n|--dry-run)
-                DRY_RUN=true
-                log_info "DRY RUN MODE - No changes will be made"
-                shift
+            -f|--format)
+                if [[ -n "${2:-}" ]]; then
+                    OUTPUT_FORMAT="$2"
+                    shift 2
+                else
+                    echo "Error: --format requires an argument" >&2
+                    exit 2
+                fi
+                ;;
+            -c|--config)
+                if [[ -n "${2:-}" ]]; then
+                    CONFIG_FILE="$2"
+                    shift 2
+                else
+                    echo "Error: --config requires an argument" >&2
+                    exit 2
+                fi
                 ;;
             -h|--help)
-                show_usage
+                show_help
                 exit 0
                 ;;
             --version)
                 show_version
                 exit 0
                 ;;
-            *)
-                break
-                ;;
-        esac
-    done
-}
-
-# =============================================================================
-# Server Command Handler
-# =============================================================================
-
-handle_server_command() {
-    local action="${1:-}"
-    local target="${2:-}"
-    local format="text"
-    
-    [[ "${VMANGOS_JSON_OUTPUT:-false}" == "true" ]] && format="json"
-    
-    # Validate action
-    case "$action" in
-        start|stop|restart|status|logs) ;;
-        *)
-            error_exit "Unknown server action: $action"
-            ;;
-    esac
-    
-    # Default target
-    [[ -z "$target" ]] && target="all"
-    
-    # Handle dry-run for status/logs (these are read-only)
-    if [[ "$DRY_RUN" == "true" && "$action" != "status" && "$action" != "logs" ]]; then
-        log_info "[DRY RUN] Would $action $target"
-        return 0
-    fi
-    
-    # Handle logs separately (has extra options)
-    if [[ "$action" == "logs" ]]; then
-        local follow="false"
-        local lines="50"
-        
-        # Check for -f (follow) flag
-        for arg in "$@"; do
-            if [[ "$arg" == "-f" || "$arg" == "--follow" ]]; then
-                follow="true"
-            fi
-        done
-        
-        case "$target" in
-            auth|world)
-                server_logs "$target" "$lines" "$follow"
-                return $?
-                ;;
-            *)
-                error_exit "Logs command requires 'auth' or 'world' target"
-                ;;
-        esac
-    fi
-    
-    # Execute action
-    local result=0
-    
-    case "$target" in
-        auth)
-            case "$action" in
-                start) server_start "$SERVICE_AUTH" || result=1 ;;
-                stop) server_stop "$SERVICE_AUTH" || result=1 ;;
-                restart) server_restart "$SERVICE_AUTH" || result=1 ;;
-                status) server_status "$SERVICE_AUTH" "$format" || result=1 ;;
-            esac
-            ;;
-        world)
-            case "$action" in
-                start) server_start "$SERVICE_WORLD" || result=1 ;;
-                stop) server_stop "$SERVICE_WORLD" || result=1 ;;
-                restart) server_restart "$SERVICE_WORLD" || result=1 ;;
-                status) server_status "$SERVICE_WORLD" "$format" || result=1 ;;
-            esac
-            ;;
-        all)
-            case "$action" in
-                start) server_start_all || result=1 ;;
-                stop) server_stop_all || result=1 ;;
-                restart) server_restart_all || result=1 ;;
-                status) server_status_all "$format" || result=1 ;;
-            esac
-            ;;
-        *)
-            error_exit "Unknown target: $target (use auth, world, or all)"
-            ;;
-    esac
-    
-    return $result
-}
-
-# =============================================================================
-# Main Entry Point
-# =============================================================================
-
-main() {
-    # Parse global flags
-    parse_global_args "$@"
-    
-    # Shift parsed args
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -j|--json|-v|--verbose|-n|--dry-run)
+            --)
                 shift
+                break
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                exit 2
                 ;;
             *)
                 break
                 ;;
         esac
     done
-    
-    # Get command
-    local command="${1:-}"
+}
+
+# ============================================================================
+# COMMAND HANDLERS
+# ============================================================================
+
+# Source libraries (lazy init - no privileged ops)
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/config.sh"
+source "$LIB_DIR/server.sh"
+
+# Set globals in sourced libraries
+VERBOSE="$VERBOSE"
+CONFIG_FILE="$CONFIG_FILE"
+SKIP_ROOT_INIT=1  # Prevent privileged ops during library loading
+
+cmd_server() {
+    local subcmd="${1:-}"
     shift || true
     
-    # Route to handler
-    case "$command" in
-        server)
-            if ! check_root; then
-                error_exit "Root privileges required"
+    case "$subcmd" in
+        start)
+            local wait=false
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --wait) wait=true; shift ;;
+                    --) shift; break ;;
+                    -*) echo "Unknown option: $1"; exit 2 ;;
+                    *) break ;;
+                esac
+            done
+            server_start "$wait"
+            ;;
+            
+        stop)
+            local graceful=true force=false
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --graceful) graceful=true; shift ;;
+                    --force) force=true; shift ;;
+                    --) shift; break ;;
+                    -*) echo "Unknown option: $1"; exit 2 ;;
+                    *) break ;;
+                esac
+            done
+            server_stop "$graceful" "$force"
+            ;;
+            
+        restart)
+            server_restart
+            ;;
+            
+        status)
+            local fmt="text"
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --format) fmt="$2"; shift 2 ;;
+                    --) shift; break ;;
+                    -*) echo "Unknown option: $1"; exit 2 ;;
+                    *) break ;;
+                esac
+            done
+            
+            if [[ "$fmt" == "json" ]]; then
+                server_status_json
+            else
+                server_status_text
             fi
-            config_load || true  # Use defaults if config load fails
-            handle_server_command "$@"
             ;;
-        ""|-h|--help)
-            show_usage
-            exit 0
-            ;;
+            
         *)
-            error_exit "Unknown command: $command"
+            echo "Error: Unknown server subcommand: $subcmd" >&2
+            echo "Valid subcommands: start, stop, restart, status" >&2
+            exit 2
             ;;
     esac
 }
 
-# Run main
+cmd_config() {
+    local subcmd="${1:-}"
+    shift || true
+    
+    case "$subcmd" in
+        create)
+            local path=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --path) path="$2"; shift 2 ;;
+                    --) shift; break ;;
+                    -*) echo "Unknown option: $1"; exit 2 ;;
+                    *) break ;;
+                esac
+            done
+            
+            if [[ -n "$path" ]]; then
+                config_create "$path"
+            else
+                config_create
+            fi
+            ;;
+            
+        validate)
+            local fmt="text"
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --format) fmt="$2"; shift 2 ;;
+                    --) shift; break ;;
+                    -*) echo "Unknown option: $1"; exit 2 ;;
+                    *) break ;;
+                esac
+            done
+            config_validate "$CONFIG_FILE" "$fmt"
+            ;;
+            
+        show)
+            local fmt="text"
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --format) fmt="$2"; shift 2 ;;
+                    --) shift; break ;;
+                    -*) echo "Unknown option: $1"; exit 2 ;;
+                    *) break ;;
+                esac
+            done
+            config_show "$CONFIG_FILE" "$fmt"
+            ;;
+            
+        *)
+            echo "Error: Unknown config subcommand: $subcmd" >&2
+            echo "Valid subcommands: create, validate, show" >&2
+            exit 2
+            ;;
+    esac
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+main() {
+    # Parse global options
+    parse_global_options "$@"
+    
+    # Get command
+    if [[ $# -eq 0 ]]; then
+        echo "Error: No command specified" >&2
+        show_help >&2
+        exit 2
+    fi
+    
+    local cmd="$1"
+    shift
+    
+    case "$cmd" in
+        server)
+            cmd_server "$@"
+            ;;
+        config)
+            cmd_config "$@"
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        *)
+            echo "Error: Unknown command: $cmd" >&2
+            show_help >&2
+            exit 2
+            ;;
+    esac
+}
+
 main "$@"

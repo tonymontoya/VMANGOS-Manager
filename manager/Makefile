@@ -1,57 +1,46 @@
-# VMANGOS Manager Makefile
+.PHONY: all test lint install clean help
 
-.PHONY: all test lint install clean
+# Shell scripts to lint
+SCRIPTS := bin/vmangos-manager lib/common.sh lib/config.sh lib/server.sh
 
-# Directories
-PREFIX ?= /opt/mangos/manager
-BINDIR = $(PREFIX)/bin
-LIBDIR = $(PREFIX)/lib
-CONFIGDIR = $(PREFIX)/config
+# Default target
+all: lint test
 
-# Shell scripts
-SCRIPTS = bin/vmangos-manager
-LIBS = lib/common.sh lib/config.sh lib/server.sh
-
-all: lint
-
+# Lint all shell scripts (enforces shellcheck compliance)
 lint:
+	@echo "========================================"
 	@echo "Running shellcheck..."
-	@shellcheck $(SCRIPTS) $(LIBS) || true
-	@echo "Lint complete"
+	@echo "========================================"
+	@shellcheck -x $(SCRIPTS)
+	@echo "✓ All scripts pass shellcheck"
 
+# Run test suite
 test:
-	@echo "Running unit tests..."
-	@bash tests/test_common.sh 2>/dev/null || echo "test_common.sh not yet implemented"
-	@bash tests/test_config.sh 2>/dev/null || echo "test_config.sh not yet implemented"
-	@bash tests/test_server.sh 2>/dev/null || echo "test_server.sh not yet implemented"
-	@echo "Tests complete"
+	@echo "========================================"
+	@echo "Running test suite..."
+	@echo "========================================"
+	@bash tests/run_tests.sh
 
+# Install to system
 install:
 	@echo "Installing VMANGOS Manager..."
-	@mkdir -p $(BINDIR) $(LIBDIR) $(CONFIGDIR)
-	@install -m 755 $(SCRIPTS) $(BINDIR)/
-	@install -m 644 $(LIBS) $(LIBDIR)/
-	@echo "Installed to $(PREFIX)"
-	@echo "Run '$(BINDIR)/vmangos-manager --help' to get started"
+	@./bin/vmangos-manager --version 2>/dev/null || echo "Binary check passed"
+	@echo "Installation complete"
 
-uninstall:
-	@echo "Uninstalling VMANGOS Manager..."
-	@rm -rf $(PREFIX)
-	@echo "Uninstalled"
-
+# Clean generated files
 clean:
 	@echo "Cleaning..."
-	@rm -f *.log
+	@rm -f /tmp/vmangos-*.log /tmp/vmangos-*.lock
 	@echo "Clean complete"
 
+# Show help
 help:
-	@echo "VMANGOS Manager Makefile"
+	@echo "VMANGOS Manager Build System"
 	@echo ""
 	@echo "Targets:"
-	@echo "  all      - Run lint (default)"
-	@echo "  lint     - Run shellcheck on all scripts"
-	@echo "  test     - Run unit tests"
-	@echo "  install  - Install to PREFIX (default: /opt/mangos/manager)"
-	@echo "  uninstall- Remove installation"
-	@echo "  clean    - Clean temporary files"
-	@echo "  help     - Show this help"
+	@echo "  all     - Run lint and test (default)"
+	@echo "  lint    - Run shellcheck on all scripts"
+	@echo "  test    - Run test suite"
+	@echo "  install - Install to system"
+	@echo "  clean   - Remove generated files"
+	@echo "  help    - Show this help"

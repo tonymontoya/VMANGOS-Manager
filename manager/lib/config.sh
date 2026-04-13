@@ -1,191 +1,295 @@
 #!/usr/bin/env bash
 #
-# Configuration management for VMANGOS Manager
-# INI file parsing and validation
+# Configuration module for VMANGOS Manager
 #
 
+# shellcheck source=lib/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
+# Globals
+CONFIG_FILE="${MANAGER_CONFIG:-/opt/mangos/manager/config/manager.conf}"
+export CONFIG_FILE
+CONFIG_PASSWORD_FILE=""
+
+# Loaded config values (exported for use by other modules)
+export CONFIG_DATABASE_HOST=""
+export CONFIG_DATABASE_PORT=""
+export CONFIG_DATABASE_USER=""
+export CONFIG_DATABASE_PASSWORD=""
+export CONFIG_DATABASE_AUTH_DB=""
+
+export CONFIG_SERVER_AUTH_SERVICE=""
+export CONFIG_SERVER_WORLD_SERVICE=""
+export CONFIG_SERVER_INSTALL_ROOT=""
+
+export CONFIG_BACKUP_ENABLED=""
+
 # ============================================================================
-# CONFIG FILE OPERATIONS
+# INI PARSING
 # ============================================================================
 
-# Read a value from INI file
-# Usage: ini_read <file> <section> <key> [default]
 ini_read() {
     local file="$1"
     local section="$2"
     local key="$3"
     local default="${4:-}"
-    local value
     
     if [[ ! -f "$file" ]]; then
         echo "$default"
         return 1
     fi
     
-    # Parse INI file - look for key in section
-    value=$(awk -F '=' \
-        -v section="$section" \
-        -v key="$key" \
-        '
-        /^\[.*\]$/ { current_section = $0; gsub(/^\[|\]$/, "", current_section) }
-        current_section == section && $1 ~ "^" key "$" {
-            gsub(/^[^=]+= */, "")
-            gsub(/^[ \t]+|[ \t]+$/, "")
-            print
-            exit
+    local value
+    value=$(awk -F'=' -v sec="$section" -v k="$key" '
+        /^\[.*\]$/ {
+            gsub(/^\[|\]$/, "", $0)
+            in_section = ($0 == sec)
+            next
         }
-        ' "$file" 2>/dev/null)
+        in_section {
+            gsub(/^[ \t]+|[ \t]+$/, "", $1)
+            if ($1 == k) {
+                gsub(/^[ \t]+|[ \t]+$/, "", $2)
+                print $2
+                found = 1
+                exit
+            }
+        }
+        END {
+            if (!found) exit 1
+        }
+    ' "$file")
     
-    if [[ -n "$value" ]]; then
-        # Remove quotes if present
-        value="${value%\"}"
-        value="${value#\"}"
-        echo "$value"
-    else
-        echo "$default"
-        return 1
+    if [[ -z "$value" ]]; then
+        value="$default"
     fi
+    
+    echo "$value"
 }
 
-# Load configuration into associative array
-# Usage: config_load <file> [prefix]
+# ============================================================================
+# CONFIG LOADING
+# ============================================================================
+
 config_load() {
-    local file="$1"
-    local prefix="${2:-CONFIG_}"
-    local current_section=""
-    local line key value
+    local config_file="${1:-$CONFIG_FILE}"
     
-    if [[ ! -f "$file" ]]; then
-        log_error "Config file not found: $file"
+    if [[ ! -f "$config_file" ]]; then
+        log_error "Configuration file not found: $config_file"
         return 1
     fi
     
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        # Skip comments and empty lines
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
-        
-        # Section header
-        if [[ "$line" =~ ^\[([^\]]+)\]$ ]]; then
-            current_section="${BASH_REMATCH[1]}"
-            continue
-        fi
-        
-        # Key=value pair
-        if [[ "$line" =~ ^([^=]+)=(.*)$ ]]; then
-            key="${BASH_REMATCH[1]}"
-            value="${BASH_REMATCH[2]}"
-            
-            # Trim whitespace
-            key="${key// /}"
-            value="${value#\"}"
-            value="${value%\"}"
-            value="${value# }"
-            value="${value% }"
-            
-            # Export with prefix
-            local var_name="${prefix}${current_section}_${key}"
-            var_name="${var_name//-/_}"
-            var_name="${var_name^^}"
-            
-            export "$var_name=$value"
-            log_debug "Config loaded: $var_name=$value"
-        fi
-    done < "$file"
+    local perms
+    perms=$(stat -c "%a" "$config_file" 2>/dev/null || echo "644")
+    if [[ "$perms" != "600" ]]; then
+        log_warn "Config file permissions are $perms, should be 600"
+    fi
     
+    CONFIG_DATABASE_HOST=$(ini_read "$config_file" "database" "host" "127.0.0.1")
+    CONFIG_DATABASE_PORT=$(ini_read "$config_file" "database" "port" "3306")
+    CONFIG_DATABASE_USER=$(ini_read "$config_file" "database" "user" "mangos")
+    
+    CONFIG_PASSWORD_FILE=$(ini_read "$config_file" "database" "password_file" "")
+    if [[ -f "${CONFIG_PASSWORD_FILE:-}" ]]; then
+        CONFIG_DATABASE_PASSWORD=$(cat "$CONFIG_PASSWORD_FILE" 2>/dev/null || true)
+    else
+        CONFIG_DATABASE_PASSWORD=$(ini_read "$config_file" "database" "password" "")
+    fi
+    
+    CONFIG_DATABASE_AUTH_DB=$(ini_read "$config_file" "database" "auth_db" "auth")
+    
+    CONFIG_SERVER_AUTH_SERVICE=$(ini_read "$config_file" "server" "auth_service" "auth")
+    CONFIG_SERVER_WORLD_SERVICE=$(ini_read "$config_file" "server" "world_service" "world")
+    CONFIG_SERVER_INSTALL_ROOT=$(ini_read "$config_file" "server" "install_root" "/opt/mangos")
+    
+    CONFIG_BACKUP_ENABLED=$(ini_read "$config_file" "backup" "enabled" "true")
+    
+    log_debug "Configuration loaded from $config_file"
     return 0
 }
 
-# Validate configuration file
-# Usage: config_validate <file>
-config_validate() {
-    local file="$1"
-    local errors=0
-    
-    if [[ ! -f "$file" ]]; then
-        log_error "Config file does not exist: $file"
-        return 1
-    fi
-    
-    if [[ ! -r "$file" ]]; then
-        log_error "Config file not readable: $file"
-        return 1
-    fi
-    
-    # Check for required sections
-    local required_sections=("database" "server")
-    for section in "${required_sections[@]}"; do
-        if ! grep -q "^\[$section\]" "$file"; then
-            log_warn "Missing config section: [$section]"
-            ((errors++))
-        fi
-    done
-    
-    # Validate paths exist
-    local install_root
-    install_root=$(ini_read "$file" "server" "install_root" "")
-    if [[ -n "$install_root" && ! -d "$install_root" ]]; then
-        log_warn "Install root does not exist: $install_root"
-        ((errors++))
-    fi
-    
-    return $errors
-}
+# ============================================================================
+# CONFIG CREATION
+# ============================================================================
 
-# Create default configuration file
-# Usage: config_create <file>
 config_create() {
-    local file="$1"
-    local dir
-    dir=$(dirname "$file")
+    local config_path="${1:-$CONFIG_FILE}"
+    local password_file="${2:-}"
     
-    mkdir -p "$dir"
+    log_info "Creating default config: $config_path"
     
-    cat > "$file" << 'EOF'
+    local config_dir
+    config_dir=$(dirname "$config_path")
+    if [[ ! -d "$config_dir" ]]; then
+        mkdir -p "$config_dir" || {
+            log_error "Failed to create config directory: $config_dir"
+            return 1
+        }
+    fi
+    
+    if [[ -z "$password_file" ]]; then
+        password_file="$config_dir/.dbpass"
+    fi
+    
+    cat > "$config_path" << EOF
 # VMANGOS Manager Configuration
-# Generated automatically - modify as needed
+# Auto-generated on $(date -Iseconds)
 
 [database]
-host = 127.0.0.1
+host = 10.0.1.6
 port = 3306
-user = mangos
-password_file = /opt/mangos/.dbpass
+user = vmangos_mgr
+password_file = $password_file
+password = 
 auth_db = auth
 characters_db = characters
-world_db = world
-logs_db = logs
+world_db = mangos
 
 [server]
-install_root = /opt/mangos
 auth_service = auth
 world_service = world
-console_enabled = false
-
-[logging]
-level = info
-file = /var/log/vmangos-manager.log
+install_root = /opt/mangos
+data_dir = /opt/mangos/data
+auth_port = 3724
+world_port = 8085
 
 [backup]
 enabled = true
-path = /opt/mangos/backups
-retention_days = 7
+backup_dir = /opt/mangos/backups
+retention_days = 30
 
-[health]
-enabled = true
-check_interval_minutes = 5
+[logging]
+log_file = /var/log/vmangos-manager.log
+log_level = info
 EOF
+
+    chmod 600 "$config_path"
     
-    chmod 644 "$file"
-    log_info "Created default config: $file"
+    if [[ ! -f "$password_file" ]]; then
+        touch "$password_file"
+        chmod 600 "$password_file"
+        log_info "Created password file: $password_file (mode 600)"
+    fi
+    
+    log_info "Configuration created at $config_path (mode 600)"
 }
 
-# Get database credentials file path
-config_get_cred_file() {
+# ============================================================================
+# CONFIG VALIDATION
+# ============================================================================
+
+config_validate() {
     local config_file="${1:-$CONFIG_FILE}"
-    local cred_file
+    local output_format="${2:-text}"
     
-    cred_file=$(ini_read "$config_file" "database" "password_file" "/opt/mangos/.dbpass")
-    echo "$cred_file"
+    local errors=()
+    local warnings=()
+    
+    if [[ ! -f "$config_file" ]]; then
+        errors+=("Config file not found: $config_file")
+        if [[ "$output_format" == "json" ]]; then
+            json_output false "null" "CONFIG_NOT_FOUND" "$config_file" "Run 'vmangos-manager config create'"
+        else
+            log_error "Config file not found: $config_file"
+            log_info "Run: vmangos-manager config create"
+        fi
+        return 1
+    fi
+    
+    local perms
+    perms=$(stat -c "%a" "$config_file" 2>/dev/null || echo "unknown")
+    if [[ "$perms" != "600" ]]; then
+        warnings+=("Config file permissions are $perms (should be 600)")
+    fi
+    
+    local required_fields=(
+        "database:host"
+        "database:port"
+        "database:user"
+        "server:auth_service"
+        "server:world_service"
+        "server:install_root"
+    )
+    
+    for field in "${required_fields[@]}"; do
+        local section key value
+        section="${field%%:*}"
+        key="${field##*:}"
+        value=$(ini_read "$config_file" "$section" "$key")
+        
+        if [[ -z "$value" ]]; then
+            errors+=("Missing required field: [$section] $key")
+        fi
+    done
+    
+    if [[ "$output_format" == "json" ]]; then
+        local valid=false
+        if [[ ${#errors[@]} -eq 0 ]]; then
+            valid=true
+        fi
+        local data
+        data=$(printf '{"valid": %s, "errors": [], "warnings": []}' "$valid")
+        json_output "$valid" "$data"
+    else
+        echo ""
+        echo "Config File: $config_file"
+        echo "Permissions: $perms"
+        echo ""
+        
+        if [[ ${#errors[@]} -eq 0 && ${#warnings[@]} -eq 0 ]]; then
+            echo "Configuration is valid"
+            return 0
+        fi
+        
+        if [[ ${#errors[@]} -gt 0 ]]; then
+            echo "Errors:"
+            for err in "${errors[@]}"; do
+                echo "  ✗ $err"
+            done
+            echo ""
+        fi
+        
+        if [[ ${#warnings[@]} -gt 0 ]]; then
+            echo "Warnings:"
+            for warn in "${warnings[@]}"; do
+                echo "  ⚠ $warn"
+            done
+        fi
+        
+        if [[ ${#errors[@]} -eq 0 ]]; then
+            return 0
+        else
+            return 1
+        fi
+    fi
+}
+
+# ============================================================================
+# CONFIG SHOW
+# ============================================================================
+
+config_show() {
+    local config_file="${1:-$CONFIG_FILE}"
+    local output_format="${2:-text}"
+    
+    if [[ ! -f "$config_file" ]]; then
+        if [[ "$output_format" == "json" ]]; then
+            json_output false "null" "CONFIG_NOT_FOUND" "Configuration file not found: $config_file" "Run 'config create' first"
+        else
+            log_error "Configuration file not found: $config_file"
+            log_info "Run: vmangos-manager config create"
+        fi
+        return 1
+    fi
+    
+    if [[ "$output_format" == "json" ]]; then
+        local content escaped_content
+        content=$(cat "$config_file")
+        escaped_content=$(json_escape "$content")
+        json_output true "{\"config_file\": \"$config_file\", \"content\": \"$escaped_content\"}"
+    else
+        echo "=== Configuration File: $config_file ==="
+        echo ""
+        cat "$config_file"
+    fi
 }

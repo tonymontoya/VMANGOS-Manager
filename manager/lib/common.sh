@@ -7,41 +7,58 @@
 set -euo pipefail
 
 # ============================================================================
-# GLOBALS
+# GLOBALS (No privileged operations at import time)
 # ============================================================================
 
-CONFIG_FILE="${MANAGER_CONFIG:-/opt/mangos/manager/config/manager.conf}"
+export CONFIG_FILE="${MANAGER_CONFIG:-/opt/mangos/manager/config/manager.conf}"
 LOG_FILE="${MANAGER_LOG:-/var/log/vmangos-manager.log}"
 LOCK_DIR="/var/run/vmangos-manager"
+VERBOSE="${VERBOSE:-0}"
 
 # Exit codes
-E_SUCCESS=0
+export E_SUCCESS=0
 E_ERROR=1
-E_INVALID_ARGS=2
+export E_INVALID_ARGS=2
 E_NOT_ROOT=3
 E_LOCK_FAILED=4
-E_CONFIG_ERROR=5
-E_SERVICE_ERROR=6
+export E_CONFIG_ERROR=5
+export E_SERVICE_ERROR=6
+
+# ============================================================================
+# INITIALIZATION (Called explicitly, not at import)
+# ============================================================================
+
+init_manager() {
+    # Only create directories when explicitly initialized
+    if [[ "${SKIP_ROOT_INIT:-0}" -eq 0 ]]; then
+        mkdir -p "$LOCK_DIR" 2>/dev/null || true
+        if [[ -d "$(dirname "$LOG_FILE")" ]]; then
+            : # Log directory exists
+        else
+            mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+        fi
+    fi
+}
 
 # ============================================================================
 # LOGGING
 # ============================================================================
 
 log_debug() {
-    [[ "${VERBOSE:-0}" -eq 1 ]] || return 0
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] $1" | tee -a "$LOG_FILE" >&2
+    [[ "$VERBOSE" -eq 1 ]] || return 0
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] $1" >&2
 }
 
 log_info() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $1" | tee -a "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $1"
 }
 
 log_warn() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] $1" | tee -a "$LOG_FILE" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] $1" >&2
 }
 
 log_error() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $1" | tee -a "$LOG_FILE" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $1" >&2
 }
 
 # ============================================================================
@@ -94,14 +111,18 @@ acquire_lock() {
     local lock_file="$LOCK_DIR/$lock_name.lock"
     local pid
     
-    mkdir -p "$LOCK_DIR"
+    # Create lock directory if needed (lazy init)
+    if [[ ! -d "$LOCK_DIR" ]]; then
+        mkdir -p "$LOCK_DIR" 2>/dev/null || {
+            error_exit "Cannot create lock directory: $LOCK_DIR" "$E_LOCK_FAILED"
+        }
+    fi
     
     if [[ -f "$lock_file" ]]; then
         pid=$(cat "$lock_file" 2>/dev/null) || true
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             error_exit "Another instance is running (PID: $pid)" "$E_LOCK_FAILED"
         fi
-        # Stale lock file
         rm -f "$lock_file"
     fi
     
@@ -200,32 +221,3 @@ service_stop() {
         return 1
     fi
 }
-
-# ============================================================================
-# DATABASE UTILITIES
-# ============================================================================
-
-db_check_connection() {
-    local cred_file="${1:-}"
-    local mysql_opts=""
-    
-    [[ -n "$cred_file" ]] && mysql_opts="--defaults-file=$cred_file"
-    
-    if mysql $mysql_opts -e "SELECT 1" >/dev/null 2>&1; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# ============================================================================
-# INITIALIZATION
-# ============================================================================
-
-init_manager() {
-    mkdir -p "$LOCK_DIR"
-    mkdir -p "$(dirname "$LOG_FILE")"
-}
-
-# Run initialization
-init_manager
