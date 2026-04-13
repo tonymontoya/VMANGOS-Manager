@@ -422,11 +422,11 @@ config_detect_analyze_candidate() {
     local realmd_conf="$install_root/run/etc/realmd.conf"
     local mangosd_conf="$install_root/run/etc/mangosd.conf"
     local realmd_tuple mangos_login_tuple world_tuple characters_tuple logs_tuple
-    local auth_host auth_port auth_user auth_db
-    local login_host login_port login_user login_db
-    local world_host world_port world_user world_db
-    local characters_host characters_port characters_user characters_db
-    local logs_host logs_port logs_user logs_db
+    local auth_host="" auth_port="" auth_user="" auth_db=""
+    local login_host="" login_port="" login_user="" login_db=""
+    local world_host="" world_port="" world_user="" world_db=""
+    local characters_host="" characters_port="" characters_user="" characters_db=""
+    local logs_host="" logs_port="" logs_user="" logs_db=""
     local endpoint_hosts=() endpoint_ports=() endpoint_users=()
     local manager_root="$install_root/manager"
     local config_dir="$manager_root/config"
