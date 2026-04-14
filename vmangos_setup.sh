@@ -20,6 +20,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Non-interactive mode detection
 VMANGOS_AUTO_INSTALL="${VMANGOS_AUTO_INSTALL:-0}"
+VMANGOS_PROVISION_TARGET="${VMANGOS_PROVISION_TARGET:-}"
+VMANGOS_INPUT_MODE="${VMANGOS_INPUT_MODE:-}"
 
 # Installation paths
 INSTALLROOT="${VMANGOS_INSTALL_ROOT:-/opt/mangos}"
@@ -46,6 +48,7 @@ CHECKPOINT_DIR="${INSTALLROOT}/.install-checkpoints"
 CHECKPOINT_FILE="${CHECKPOINT_DIR}/checkpoint"
 INSTALL_LOG="${INSTALL_LOG:-/var/log/vmangos-install.log}"
 BUILD_IN_BACKGROUND="${VMANGOS_BACKGROUND_BUILD:-0}"
+INSTALLER_STATE_FILE=""
 
 # =============================================================================
 # LOGGING FUNCTIONS
@@ -73,6 +76,14 @@ log_section() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ==========================================" | tee -a "$INSTALL_LOG"
 }
 
+refresh_runtime_paths() {
+    CHECKPOINT_DIR="${INSTALLROOT}/.install-checkpoints"
+    CHECKPOINT_FILE="${CHECKPOINT_DIR}/checkpoint"
+    INSTALLER_STATE_FILE="${CHECKPOINT_DIR}/installer.env"
+}
+
+refresh_runtime_paths
+
 # =============================================================================
 # USER INPUT FUNCTIONS
 # =============================================================================
@@ -97,6 +108,245 @@ ask_yes_no() {
             * ) echo "Please answer yes or no.";;
         esac
     done
+}
+
+prompt_with_default() {
+    local question="$1"
+    local current_value="$2"
+    local result_var="$3"
+    local response
+
+    read -rp "$question [$current_value]: " response
+    printf -v "$result_var" '%s' "${response:-$current_value}"
+}
+
+prompt_with_optional_default() {
+    local question="$1"
+    local current_value="$2"
+    local placeholder="$3"
+    local result_var="$4"
+    local response
+
+    if [ -n "$current_value" ]; then
+        read -rp "$question [$current_value]: " response
+        printf -v "$result_var" '%s' "${response:-$current_value}"
+    else
+        read -rp "$question [$placeholder]: " response
+        printf -v "$result_var" '%s' "$response"
+    fi
+}
+
+installer_target_is_valid() {
+    case "${1:-}" in
+        vmangos_only|vmangos_manager)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+installer_mode_is_valid() {
+    case "${1:-}" in
+        automated|guided)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+installer_target_label() {
+    case "${1:-}" in
+        vmangos_only)
+            printf 'VMANGOS only'
+            ;;
+        vmangos_manager)
+            printf 'VMANGOS + Manager'
+            ;;
+        *)
+            printf '%s' "${1:-unknown}"
+            ;;
+    esac
+}
+
+installer_mode_label() {
+    case "${1:-}" in
+        automated)
+            printf 'Automated'
+            ;;
+        guided)
+            printf 'Guided'
+            ;;
+        *)
+            printf '%s' "${1:-unknown}"
+            ;;
+    esac
+}
+
+validate_installer_selection() {
+    if ! installer_target_is_valid "$VMANGOS_PROVISION_TARGET"; then
+        log_error "Invalid VMANGOS_PROVISION_TARGET: ${VMANGOS_PROVISION_TARGET:-unset}"
+        log_info "Expected one of: vmangos_only, vmangos_manager"
+        exit 1
+    fi
+
+    if ! installer_mode_is_valid "$VMANGOS_INPUT_MODE"; then
+        log_error "Invalid VMANGOS_INPUT_MODE: ${VMANGOS_INPUT_MODE:-unset}"
+        log_info "Expected one of: automated, guided"
+        exit 1
+    fi
+
+    if check_noninteractive && [ "$VMANGOS_INPUT_MODE" != "automated" ]; then
+        log_error "Non-interactive installs require VMANGOS_INPUT_MODE=automated"
+        exit 1
+    fi
+}
+
+select_installer_target() {
+    local choice
+
+    if [ -n "$VMANGOS_PROVISION_TARGET" ]; then
+        return 0
+    fi
+
+    if check_noninteractive; then
+        VMANGOS_PROVISION_TARGET="vmangos_manager"
+        return 0
+    fi
+
+    log_section "INSTALLER TARGET"
+    log_info "Choose what this host should provision:"
+    log_info "  1) VMANGOS only"
+    log_info "  2) VMANGOS + Manager"
+
+    while true; do
+        read -rp "Provisioning target [2]: " choice
+        case "${choice:-2}" in
+            1)
+                VMANGOS_PROVISION_TARGET="vmangos_only"
+                break
+                ;;
+            2)
+                VMANGOS_PROVISION_TARGET="vmangos_manager"
+                break
+                ;;
+            *)
+                echo "Please choose 1 or 2."
+                ;;
+        esac
+    done
+}
+
+select_input_mode() {
+    local choice
+
+    if [ -n "$VMANGOS_INPUT_MODE" ]; then
+        return 0
+    fi
+
+    if check_noninteractive; then
+        VMANGOS_INPUT_MODE="automated"
+        return 0
+    fi
+
+    log_section "INSTALLER INPUT MODE"
+    log_info "Choose how values should be supplied:"
+    log_info "  1) Automated (defaults and auto-detected values)"
+    log_info "  2) Guided (prompt for key install values)"
+
+    while true; do
+        read -rp "Input mode [2]: " choice
+        case "${choice:-2}" in
+            1)
+                VMANGOS_INPUT_MODE="automated"
+                break
+                ;;
+            2)
+                VMANGOS_INPUT_MODE="guided"
+                break
+                ;;
+            *)
+                echo "Please choose 1 or 2."
+                ;;
+        esac
+    done
+}
+
+prompt_guided_install_root() {
+    if [ "$VMANGOS_INPUT_MODE" != "guided" ] || check_noninteractive; then
+        return 0
+    fi
+
+    log_section "GUIDED INSTALL ROOT"
+    prompt_with_default "Install root" "$INSTALLROOT" INSTALLROOT
+    refresh_runtime_paths
+}
+
+load_installer_state() {
+    if [ "$VMANGOS_INPUT_MODE" != "guided" ] || check_noninteractive; then
+        return 0
+    fi
+
+    if [ ! -f "$INSTALLER_STATE_FILE" ]; then
+        return 0
+    fi
+
+    # shellcheck source=/dev/null
+    source "$INSTALLER_STATE_FILE"
+    log_info "Loaded installer state from $INSTALLER_STATE_FILE"
+}
+
+save_installer_state() {
+    if [ "$VMANGOS_INPUT_MODE" != "guided" ] || check_noninteractive; then
+        return 0
+    fi
+
+    mkdir -p "$CHECKPOINT_DIR"
+    cat > "$INSTALLER_STATE_FILE" << EOF
+VMANGOS_PROVISION_TARGET=$(printf '%q' "$VMANGOS_PROVISION_TARGET")
+VMANGOS_INPUT_MODE=$(printf '%q' "$VMANGOS_INPUT_MODE")
+CLIENT_DATA=$(printf '%q' "$CLIENT_DATA")
+SQLADMINUSER=$(printf '%q' "$SQLADMINUSER")
+SQLADMINIP=$(printf '%q' "$SQLADMINIP")
+SQLADMINPASS=$(printf '%q' "$SQLADMINPASS")
+AUTHDB=$(printf '%q' "$AUTHDB")
+WORLDDB=$(printf '%q' "$WORLDDB")
+CHARACTERDB=$(printf '%q' "$CHARACTERDB")
+LOGSDB=$(printf '%q' "$LOGSDB")
+MANGOSDBUSER=$(printf '%q' "$MANGOSDBUSER")
+MANGOSDBPASS=$(printf '%q' "$MANGOSDBPASS")
+MANGOSOSUSER=$(printf '%q' "$MANGOSOSUSER")
+SKIP_SECURE_MYSQL=$(printf '%q' "$SKIP_SECURE_MYSQL")
+SERVERIP=$(printf '%q' "$SERVERIP")
+EOF
+}
+
+prompt_guided_values() {
+    if [ "$VMANGOS_INPUT_MODE" != "guided" ] || check_noninteractive; then
+        return 0
+    fi
+
+    log_section "GUIDED INSTALL SETTINGS"
+    prompt_with_optional_default "Client data path" "$CLIENT_DATA" "auto-detect/skip" CLIENT_DATA
+    prompt_with_default "Auth database name" "$AUTHDB" AUTHDB
+    prompt_with_default "World database name" "$WORLDDB" WORLDDB
+    prompt_with_default "Characters database name" "$CHARACTERDB" CHARACTERDB
+    prompt_with_default "Logs database name" "$LOGSDB" LOGSDB
+    prompt_with_default "VMANGOS DB user" "$MANGOSDBUSER" MANGOSDBUSER
+    prompt_with_default "VMANGOS DB password" "$MANGOSDBPASS" MANGOSDBPASS
+    prompt_with_default "VMANGOS OS user" "$MANGOSOSUSER" MANGOSOSUSER
+}
+
+announce_installer_selection() {
+    log_info "Provisioning target: $(installer_target_label "$VMANGOS_PROVISION_TARGET")"
+    log_info "Input mode: $(installer_mode_label "$VMANGOS_INPUT_MODE")"
+}
+
+installer_should_provision_manager() {
+    [ "$VMANGOS_PROVISION_TARGET" = "vmangos_manager" ]
 }
 
 # =============================================================================
@@ -152,13 +402,13 @@ show_progress_spinner() {
     local pid=$1
     local message="${2:-Processing...}"
     local delay=0.1
-    local spinstr='|/-\'
+    local spinstr='|/-+'
     
     printf "%s " "$message"
-    while [ -d /proc/$pid ]; do
+    while [ -d "/proc/$pid" ]; do
         local temp=${spinstr#?}
         printf " [%c]" "$spinstr"
-        local spinstr=$temp${spinstr%%$temp}
+        local spinstr=$temp${spinstr%%"$temp"}
         sleep $delay
         printf "\b\b\b\b"
     done
@@ -274,7 +524,7 @@ BUILDEOF
     log_info "Waiting for build to complete..."
     
     # Wait for build to complete
-    if wait $BUILD_PID; then
+    if wait "$BUILD_PID"; then
         log_info "Background build completed successfully"
         return 0
     else
@@ -355,13 +605,14 @@ validate_client_data() {
     
     # Check patch.MPQ size (should be ~1.9GB for 1.12.1)
     if [ -f "$data_path/patch.MPQ" ]; then
-        local patch_size=$(stat -c%s "$data_path/patch.MPQ" 2>/dev/null || echo 0)
+        local patch_size
+        patch_size=$(stat -c%s "$data_path/patch.MPQ" 2>/dev/null || echo 0)
         if [ "$patch_size" -lt 1000000000 ]; then
             log_warn "patch.MPQ seems too small ($patch_size bytes) - expected ~1.9GB"
             log_warn "This may not be a valid 1.12.1 client"
             ((errors++))
         else
-            log_info "patch.MPQ size looks correct ($(numfmt --to=iec $patch_size))"
+            log_info "patch.MPQ size looks correct ($(numfmt --to=iec "$patch_size"))"
         fi
     else
         log_warn "Missing patch.MPQ"
@@ -373,7 +624,7 @@ validate_client_data() {
         log_info "Found dbc.MPQ - basic structure looks valid"
     fi
     
-    if [ $errors -gt 0 ]; then
+    if [ "$errors" -gt 0 ]; then
         log_warn "Client data validation found $errors issues"
         return 1
     else
@@ -479,10 +730,13 @@ check_client_data() {
 phase_prerequisites() {
     log_section "PHASE: Installing Prerequisites"
     
-    apt-get update
-    apt-get install -y build-essential cmake git libmariadb-dev libssl-dev \
-        libbz2-dev libreadline-dev libncurses-dev libboost-all-dev \
-        p7zip-full python3 python3-pip python3-venv sysstat wget zlib1g-dev
+    # Keep prerequisite installs headless-safe on real servers where needrestart
+    # may otherwise hold apt open behind a whiptail prompt.
+    DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get update
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none \
+        apt-get install -y build-essential cmake git libmariadb-dev libssl-dev \
+            libbz2-dev libreadline-dev libncurses-dev libboost-all-dev \
+            p7zip-full python3 python3-pip python3-venv sysstat wget zlib1g-dev
     
     set_checkpoint "PREREQS_DONE"
 }
@@ -641,16 +895,7 @@ phase_config_setup() {
     sed -i "s|vmap.enableHeight = 1|vmap.enableHeight = 0|" "$INSTALLROOT/run/etc/mangosd.conf"
     sed -i "s|vmap.enableIndoorCheck = 1|vmap.enableIndoorCheck = 0|" "$INSTALLROOT/run/etc/mangosd.conf"
     
-    # Ask whether bundled VMANGOS Manager files/config should be provisioned
-    log_info ""
-    log_info "VMANGOS Manager Release A does not require RA/SOAP."
-    log_info "If you want bundled manager files and config provisioned under $INSTALLROOT/manager,"
-    log_info "answer yes below."
-    log_info ""
-    
-    if ask_yes_no "Do you want VMANGOS Manager provisioned?" "n"; then
-        ENABLE_VMANGOS_MANAGER=true
-
+    if installer_should_provision_manager; then
         local manager_root manager_config_dir manager_config_file manager_password_file
         manager_root="$INSTALLROOT/manager"
         manager_config_dir="$manager_root/config"
@@ -715,8 +960,7 @@ EOF
             fi
         fi
     else
-        ENABLE_VMANGOS_MANAGER=false
-        log_info "Bundled VMANGOS Manager provisioning skipped."
+        log_info "Provisioning target excludes VMANGOS Manager; bundled manager setup skipped."
     fi
     
     set_checkpoint "CONFIG_DONE"
@@ -804,7 +1048,7 @@ phase_data_extraction() {
         if [ ! -d "$INSTALLROOT/dbc" ] || [ ! -d "$INSTALLROOT/maps" ]; then
             log_error "Map extraction failed - no output files generated"
             EXTRACTION_FAILED=1
-        elif [ -z "$(ls -A $INSTALLROOT/dbc 2>/dev/null)" ]; then
+        elif [ -z "$(ls -A "$INSTALLROOT/dbc" 2>/dev/null)" ]; then
             log_error "Map extraction failed - DBC folder is empty"
             EXTRACTION_FAILED=1
         else
@@ -900,8 +1144,8 @@ phase_data_extraction() {
             log_warn "MoveMapGen completed with warnings (this is usually OK)"
         
         # Stop the heartbeat
-        kill $HEARTBEAT_PID 2>/dev/null || true
-        wait $HEARTBEAT_PID 2>/dev/null || true
+        kill "$HEARTBEAT_PID" 2>/dev/null || true
+        wait "$HEARTBEAT_PID" 2>/dev/null || true
         
         log_info "====================================================================="
         log_info "Movement map generation completed at $(date '+%H:%M:%S')"
@@ -1073,12 +1317,23 @@ phase_database_import() {
         if [ "$MIGRATIONS_EXIST" -gt 0 ] && [ "$WORLD_DB_DOWNLOADED" != "true" ]; then
             log_info "Running database migrations..."
             cd "$INSTALLROOT/source/sql/migrations"
-            [ -f "merge.sh" ] && chmod +x merge.sh && ./merge.sh 2>&1 | tee -a "$INSTALL_LOG" || true
-            
-            [ -f "world_db_updates.sql" ] && mysql "$WORLDDB" < world_db_updates.sql || true
-            [ -f "logs_db_updates.sql" ] && mysql "$LOGSDB" < logs_db_updates.sql || true
-            [ -f "characters_db_updates.sql" ] && mysql "$CHARACTERDB" < characters_db_updates.sql || true
-            [ -f "logon_db_updates.sql" ] && mysql "$AUTHDB" < logon_db_updates.sql || true
+            if [ -f "merge.sh" ]; then
+                chmod +x merge.sh
+                ./merge.sh 2>&1 | tee -a "$INSTALL_LOG" || true
+            fi
+
+            if [ -f "world_db_updates.sql" ]; then
+                mysql "$WORLDDB" < world_db_updates.sql || true
+            fi
+            if [ -f "logs_db_updates.sql" ]; then
+                mysql "$LOGSDB" < logs_db_updates.sql || true
+            fi
+            if [ -f "characters_db_updates.sql" ]; then
+                mysql "$CHARACTERDB" < characters_db_updates.sql || true
+            fi
+            if [ -f "logon_db_updates.sql" ]; then
+                mysql "$AUTHDB" < logon_db_updates.sql || true
+            fi
         else
             log_info "Skipping migrations (using pre-built database or no migrations table)"
         fi
@@ -1164,12 +1419,23 @@ EOF
     if [ "$WORLD_STATUS" = "active" ]; then
         log_info "✓ World service is running on $SERVERIP:8085"
         # Show memory usage
-        WORLD_MEM=$(ps aux | grep mangosd | grep -v grep | awk '{print $6/1024}' | head -1)
+        WORLD_MEM=""
+        WORLD_PID=$(pgrep -n mangosd 2>/dev/null || true)
+        if [ -n "$WORLD_PID" ]; then
+            WORLD_MEM=$(ps -o rss= -p "$WORLD_PID" | awk '{print $1/1024}')
+        fi
         log_info "  World server memory usage: ${WORLD_MEM:-unknown} MB"
     else
         log_error "✗ World service failed to start (status: $WORLD_STATUS)"
         log_info "Check logs: journalctl -u world -n 50"
         log_info "Or: tail -50 $INSTALLROOT/logs/mangosd/Server.log"
+    fi
+
+    if [ -d "$INSTALLROOT/logs/mangosd" ]; then
+        chmod 600 \
+            "$INSTALLROOT/logs/mangosd/Anticheat.log" \
+            "$INSTALLROOT/logs/mangosd/gm_critical.log" \
+            2>/dev/null || true
     fi
     
     set_checkpoint "SERVICES_DONE"
@@ -1183,75 +1449,29 @@ main() {
     log_section "VMANGOS Installation Started"
     log_info "Installation directory: $INSTALLROOT"
     log_info "Log file: $INSTALL_LOG"
-    log_info "Resume support enabled - checkpoints stored in: $CHECKPOINT_DIR"
     
     check_root
+    select_installer_target
+    select_input_mode
+    validate_installer_selection
+    prompt_guided_install_root
+
+    log_info "Resume support enabled - checkpoints stored in: $CHECKPOINT_DIR"
     init_checkpoints
+    load_installer_state
+    validate_installer_selection
+    prompt_guided_values
+    announce_installer_selection
+    save_installer_state
     ensure_server_ip
+    save_installer_state
     
     # Get current checkpoint
     CHECKPOINT=$(get_checkpoint)
     log_info "Resuming from checkpoint: $CHECKPOINT"
     
-    # Execute phases based on checkpoint
     case "$CHECKPOINT" in
-        START)
-            phase_prerequisites
-            ;&
-        PREREQS_DONE)
-            check_client_data
-            phase_database_setup
-            ;&
-        DATABASE_DONE)
-            phase_source_download
-            ;&
-        SOURCE_DONE)
-            phase_build
-            ;&
-        BUILD_DONE)
-            phase_config_setup
-            ;&
-        CONFIG_DONE)
-            phase_data_extraction
-            ;&
-        DATA_DONE)
-            phase_database_import
-            ;&
-        DB_IMPORT_DONE)
-            phase_service_setup
-            ;&
-        SERVICES_DONE)
-            log_section "Installation Complete!"
-            log_info ""
-            log_info "========================================"
-            log_info "VMANGOS SERVER READY"
-            log_info "========================================"
-            log_info ""
-            log_info "Server Address: $SERVERIP"
-            log_info "Auth Server:    $SERVERIP:3724"
-            log_info "World Server:   $SERVERIP:8085"
-            log_info ""
-            log_info "--- Client Configuration ---"
-            log_info "Edit your WoW client's realmlist.wtf:"
-            log_info "  set realmlist $SERVERIP"
-            log_info ""
-            log_info "--- Account Management ---"
-            log_info "If you enabled VMANGOS Manager provisioning:"
-            log_info "  Manager binary: $INSTALLROOT/manager/bin/vmangos-manager"
-            log_info "  Manager config: $INSTALLROOT/manager/config/manager.conf"
-            log_info ""
-            log_info "--- Service Commands ---"
-            log_info "Start:   sudo systemctl start auth world"
-            log_info "Stop:    sudo systemctl stop auth world"
-            log_info "Status:  sudo systemctl status auth world"
-            log_info "Logs:    sudo journalctl -u world -f"
-            log_info ""
-            log_info "--- Installation Directory ---"
-            log_info "$INSTALLROOT"
-            log_info ""
-            log_info "Enjoy your Vanilla WoW server!"
-            log_info "========================================"
-            clear_checkpoint
+        START|PREREQS_DONE|DATABASE_DONE|SOURCE_DONE|BUILD_DONE|CONFIG_DONE|DATA_DONE|DB_IMPORT_DONE|SERVICES_DONE)
             ;;
         *)
             log_error "Unknown checkpoint: $CHECKPOINT"
@@ -1260,7 +1480,83 @@ main() {
             exit 1
             ;;
     esac
+
+    if [ "$CHECKPOINT" = "START" ]; then
+        phase_prerequisites
+        CHECKPOINT="PREREQS_DONE"
+    fi
+
+    if [ "$CHECKPOINT" = "PREREQS_DONE" ]; then
+        check_client_data
+        phase_database_setup
+        CHECKPOINT="DATABASE_DONE"
+    fi
+
+    if [ "$CHECKPOINT" = "DATABASE_DONE" ]; then
+        phase_source_download
+        CHECKPOINT="SOURCE_DONE"
+    fi
+
+    if [ "$CHECKPOINT" = "SOURCE_DONE" ]; then
+        phase_build
+        CHECKPOINT="BUILD_DONE"
+    fi
+
+    if [ "$CHECKPOINT" = "BUILD_DONE" ]; then
+        phase_config_setup
+        CHECKPOINT="CONFIG_DONE"
+    fi
+
+    if [ "$CHECKPOINT" = "CONFIG_DONE" ]; then
+        phase_data_extraction
+        CHECKPOINT="DATA_DONE"
+    fi
+
+    if [ "$CHECKPOINT" = "DATA_DONE" ]; then
+        phase_database_import
+        CHECKPOINT="DB_IMPORT_DONE"
+    fi
+
+    if [ "$CHECKPOINT" = "DB_IMPORT_DONE" ]; then
+        phase_service_setup
+        CHECKPOINT="SERVICES_DONE"
+    fi
+
+    if [ "$CHECKPOINT" = "SERVICES_DONE" ]; then
+        log_section "Installation Complete!"
+        log_info ""
+        log_info "========================================"
+        log_info "VMANGOS SERVER READY"
+        log_info "========================================"
+        log_info ""
+        log_info "Server Address: $SERVERIP"
+        log_info "Auth Server:    $SERVERIP:3724"
+        log_info "World Server:   $SERVERIP:8085"
+        log_info ""
+        log_info "--- Client Configuration ---"
+        log_info "Edit your WoW client's realmlist.wtf:"
+        log_info "  set realmlist $SERVERIP"
+        log_info ""
+        log_info "--- Account Management ---"
+        log_info "If you enabled VMANGOS Manager provisioning:"
+        log_info "  Manager binary: $INSTALLROOT/manager/bin/vmangos-manager"
+        log_info "  Manager config: $INSTALLROOT/manager/config/manager.conf"
+        log_info ""
+        log_info "--- Service Commands ---"
+        log_info "Start:   sudo systemctl start auth world"
+        log_info "Stop:    sudo systemctl stop auth world"
+        log_info "Status:  sudo systemctl status auth world"
+        log_info "Logs:    sudo journalctl -u world -f"
+        log_info ""
+        log_info "--- Installation Directory ---"
+        log_info "$INSTALLROOT"
+        log_info ""
+        log_info "Enjoy your Vanilla WoW server!"
+        log_info "========================================"
+        clear_checkpoint
+    fi
 }
 
-# Run main function
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
