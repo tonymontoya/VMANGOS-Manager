@@ -1966,14 +1966,51 @@ snapshot = {
             "services": {
                 "auth": {"health": "active"},
                 "world": {"health": "warning"},
-            }
+            },
+            "checks": {
+                "disk_space": {"used_percent": 24, "status": "ok", "available_kb": 6291456},
+            },
+            "players": {"online": 1, "source": "auth.account.online"},
+            "host": {
+                "cpu": {"usage_percent": 31.5, "status": "ok", "cores": 8},
+                "memory": {"used_percent": 48.0, "status": "ok", "used_kb": 3145728},
+                "load": {"load_1": 0.62, "load_5": 0.55, "load_15": 0.44, "status": "ok"},
+            },
+            "storage_io": {"available": True, "util_percent": 33.0, "status": "ok", "device": "sda"},
         },
     },
 }
 
+history = []
+for index, cpu, memory, load, disk, players, io in [
+    (0, 18.0, 42.0, 0.22, 22.0, 0.0, 15.0),
+    (1, 24.0, 44.0, 0.34, 23.0, 1.0, 19.0),
+    (2, 29.0, 46.0, 0.48, 24.0, 2.0, 27.0),
+    (3, 31.5, 48.0, 0.62, 24.0, 1.0, 33.0),
+]:
+    trend_snapshot = {
+        "captured_at": f"2026-04-13T21:45:0{index}+00:00",
+        "players": [{"id": 8, "username": "PLAYERONE", "gm_level": 1, "online": True, "banned": False}] if players else [],
+        "server": {
+            "ok": True,
+            "data": {
+                "checks": {"disk_space": {"used_percent": disk}},
+                "players": {"online": players},
+                "host": {
+                    "cpu": {"usage_percent": cpu},
+                    "memory": {"used_percent": memory},
+                    "load": {"load_1": load},
+                },
+                "storage_io": {"available": True, "util_percent": io},
+            },
+        },
+    }
+    history = module.append_monitoring_sample(history, trend_snapshot)
+
 payload = {
     "banner": module.render_action_banner("accounts", snapshot, "backup completed", "success", 2),
     "sidebar": module.render_sidebar("operations", "backup completed", snapshot, 2),
+    "metrics": module.render_metrics_panel(snapshot, history, 2),
     "player": module.render_player_details(snapshot["players"][0], len(snapshot["players"])),
     "empty_player": module.render_player_details(None, 0),
     "logs": module.render_logs_panel(snapshot),
@@ -1994,11 +2031,72 @@ PY
 
     assert_true "[[ \$compact_output == *'READY'* && \$compact_output == *'Accounts'* && \$compact_output == *'commanddeck'* && \$compact_output == *'refresh[/]2s'* ]]" "dashboard action banner exposes tone, view, interval, and command-deck framing" || all_passed=1
     assert_true "[[ \$compact_output == *'VMaNGOSManager'* && \$compact_output == *'RealmPulse'* && \$compact_output == *'Players[/]1online'* && \$compact_output == *'Backups[/]3known'* && \$compact_output == *'ActiveHotkeys'* && \$compact_output == *'l[/]rotatelogs'* && \$compact_output == *'P[/]updateplan'* ]]" "dashboard sidebar exposes live pulse summary, operator framing, and operations keys" || all_passed=1
+    assert_true "[[ \$compact_output == *'HostMetrics'* && \$compact_output == *'Recentwindow[/]4samples/~6s'* && \$compact_output == *'CPU[/]31.5%'* && \$compact_output == *'Players[/]1online'* && \$compact_output == *'Logs[/]'* ]]" "dashboard metrics panel blends current state with monitoring trend context" || all_passed=1
     assert_true "[[ \$compact_output == *'Selected[/][bold#2dd4bf]PLAYERONE'* && \$compact_output == *'Operatormove[/]switchto[bold#f59e0b]Accounts[/]forpassword,GM,andbanactions.'* ]]" "dashboard player details emphasize the selected player workflow" || all_passed=1
     assert_true "[[ \$compact_output == *'Snapshot[/]noactiveplayerrowselected'* && \$compact_output == *'chooseaplayerrowwhensomeonelogsin.'* ]]" "dashboard empty player state explains next operator step" || all_passed=1
     assert_true "[[ \$compact_output == *'LogsHealth'* && \$compact_output == *'Rotationhygiene,retention,andstoragepressure.'* && \$compact_output == *'Retention[/]max=100Mmin=1M'* ]]" "dashboard logs panel summarizes health and retention" || all_passed=1
     assert_true "[[ \$compact_output == *'UpdateState'* && \$compact_output == *'database-impactawareness.'* && \$compact_output == *'Assessment[/][bold#f59e0b]schemamigrationspending'* && \$compact_output == *'Next[/]vmangos-managerbackupnow--verify'* ]]" "dashboard update panel surfaces DB-aware update state and plan steps" || all_passed=1
     assert_true "[[ \$compact_output == *'JobDetails'* && \$compact_output == *'logsrotatecompleted'* && \$compact_output == *'cancelselectedjob'* ]]" "dashboard schedule details include module-local result context" || all_passed=1
+
+    return $all_passed
+}
+
+test_dashboard_monitoring_history_helpers() {
+    local all_passed=0 output compact_output
+
+    output=$(python3 - "$MANAGER_DIR/lib/dashboard.py" <<'PY'
+import importlib.util
+import json
+import sys
+
+spec = importlib.util.spec_from_file_location("dashboard_module", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+history = []
+for index, cpu, memory, load, disk, players, io in [
+    (0, 14.0, 40.0, 0.20, 22.0, 0.0, None),
+    (1, 19.0, 42.0, 0.26, 23.0, 2.0, None),
+    (2, 28.0, 46.0, 0.41, 24.0, 5.0, 18.0),
+    (3, 34.0, 50.0, 0.58, 24.0, 7.0, 24.0),
+]:
+    snapshot = {
+        "captured_at": f"2026-04-13T21:50:0{index}+00:00",
+        "players": [{}] * int(players),
+        "server": {
+            "ok": True,
+            "data": {
+                "checks": {"disk_space": {"used_percent": disk}},
+                "players": {"online": players},
+                "host": {
+                    "cpu": {"usage_percent": cpu},
+                    "memory": {"used_percent": memory},
+                    "load": {"load_1": load},
+                },
+                "storage_io": {"available": io is not None, "util_percent": io},
+            },
+        },
+    }
+    history = module.append_monitoring_sample(history, snapshot, max_samples=3)
+
+payload = {
+    "history_len": len(history),
+    "window": module.history_window_label(history, 2),
+    "cpu_trend": module.describe_trend(module.history_values(history, "cpu"), "cpu"),
+    "player_trend": module.describe_trend(module.history_values(history, "players"), "players"),
+    "io_sparkline": module.render_sparkline(module.history_values(history, "io"), 5),
+    "last_players": history[-1]["players"],
+}
+
+print(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+PY
+)
+
+    compact_output=$(printf '%s' "$output" | tr -d '[:space:]')
+
+    assert_true "[[ \$compact_output == *'\"history_len\":3'* && \$compact_output == *'\"window\":\"3samples/~4s\"'* ]]" "dashboard monitoring history keeps a rolling sample window" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"cpu_trend\":\"rising\"'* && \$compact_output == *'\"player_trend\":\"rising\"'* && \$compact_output == *'\"last_players\":7.0'* ]]" "dashboard monitoring history derives trend direction from recent samples" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"io_sparkline\":\"▁▁·▁█\"'* ]]" "dashboard monitoring history renders compact sparklines for optional metrics" || all_passed=1
 
     return $all_passed
 }
@@ -3212,6 +3310,7 @@ main() {
     run_test "Dashboard: Snapshot aggregation" test_dashboard_snapshot_json_aggregates_backend
     run_test "Dashboard: Action requests" test_dashboard_action_request_builder
     run_test "Dashboard: Render helpers" test_dashboard_render_helpers
+    run_test "Dashboard: Monitoring history" test_dashboard_monitoring_history_helpers
     run_test "Server: Player count fallback" test_server_player_count_fallback
     run_test "Server: Interval validation" test_server_validate_interval
     run_test "Server: Start fails on DB preflight" test_server_start_fails_when_database_unreachable
