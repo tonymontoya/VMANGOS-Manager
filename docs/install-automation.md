@@ -7,6 +7,11 @@ VMANGOS Manager ships two installer entry points aimed at different operator sty
 
 Both target Ubuntu 22.04 and are designed around a full VMANGOS host lifecycle rather than just copying binaries into place.
 
+Both installer entry points now map onto the same two explicit choices:
+
+- provisioning target: `VMANGOS only` or `VMANGOS + Manager`
+- input mode: `Automated` or `Guided`
+
 ## What The Installer Handles
 
 - Ubuntu package prerequisites for building and running VMANGOS
@@ -34,8 +39,11 @@ This flow:
 
 - generates secure random passwords
 - stores setup secrets under `/root/.vmangos-secrets/setup.conf`
+- defaults to `VMANGOS + Manager` and `Automated`
 - runs the full install non-interactively
 - prints the resulting credentials and runtime paths at the end
+
+If `/opt/mangos` already exists, the wrapper now stays non-interactive as well. Set `REINSTALL_POLICY="replace"` in `/root/.vmangos-secrets/setup.conf` if you want the wrapper to remove an existing install root automatically; otherwise it aborts safely.
 
 ### Guided Interactive Install
 
@@ -46,13 +54,17 @@ wget https://raw.githubusercontent.com/tonymontoya/VMANGOS-Manager/main/vmangos_
 sudo bash vmangos_setup.sh
 ```
 
-Expect prompts for:
+Expect the installer to prompt early for:
+
+- provisioning target
+- input mode
+
+Guided mode then prompts for:
 
 - installation root
 - database names and credentials
 - OS user
 - client data location
-- optional Manager provisioning
 
 ## Existing Host Adoption
 

@@ -30,6 +30,11 @@ This screenshot is a real, demo-backed dashboard export generated from the Manag
 
 For a fresh Ubuntu 22.04 host, the repo ships an installer flow that provisions VMANGOS, configures databases, lays out runtime paths, and can provision Manager itself under `/opt/mangos/manager`.
 
+The install story is now explicit on two axes:
+
+- provisioning target: `VMANGOS only` or `VMANGOS + Manager`
+- input mode: `Automated` or `Guided`
+
 Automated install:
 
 ```bash
@@ -53,6 +58,8 @@ The installer handles:
 - client data staging
 - manager provisioning
 - dashboard prerequisites for fresh installs
+
+`auto_install.sh` stays non-interactive and defaults to `VMANGOS + Manager` with `Automated` inputs. `vmangos_setup.sh` prompts early for the target and input mode, then guided installs collect the key host values before the long-running phases start.
 
 If you want the fuller installer story, use the [install automation guide](docs/install-automation.md).
 

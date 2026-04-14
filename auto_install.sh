@@ -77,6 +77,8 @@ CLIENTDATA="/home/tony/Data"
 
 # Auto-install settings
 SKIP_SECURE_MYSQL="yes"
+PROVISIONTARGET="vmangos_manager"
+REINSTALL_POLICY="abort"
 EOF
 
     chmod 600 "$CONFIG_FILE"
@@ -100,6 +102,9 @@ else
     source "$CONFIG_FILE"
 fi
 
+PROVISIONTARGET="${PROVISIONTARGET:-vmangos_manager}"
+REINSTALL_POLICY="${REINSTALL_POLICY:-abort}"
+
 # Verify client data exists
 if [ ! -d "$CLIENTDATA" ]; then
     log_error "Client Data directory not found at: $CLIENTDATA"
@@ -112,19 +117,27 @@ log_info "Client data found at: $CLIENTDATA"
 # Clean up any previous partial installation
 if [ -d "$INSTALLROOT" ]; then
     log_warn "Existing installation found at: $INSTALLROOT"
-    read -p "Remove existing installation? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        log_info "Removing existing installation..."
-        rm -rf "$INSTALLROOT"
-    else
-        log_error "Cannot continue with existing installation. Please backup and remove manually."
-        exit 1
-    fi
+    case "$REINSTALL_POLICY" in
+        replace)
+            log_info "Removing existing installation..."
+            rm -rf "$INSTALLROOT"
+            ;;
+        abort)
+            log_error "Cannot continue with existing installation. Please backup and remove manually."
+            exit 1
+            ;;
+        *)
+            log_error "Invalid REINSTALL_POLICY: $REINSTALL_POLICY"
+            log_error "Expected 'abort' or 'replace'"
+            exit 1
+            ;;
+    esac
 fi
 
 # Export environment variables for vmangos_setup.sh
 export VMANGOS_AUTO_INSTALL="1"
+export VMANGOS_INPUT_MODE="automated"
+export VMANGOS_PROVISION_TARGET="$PROVISIONTARGET"
 export VMANGOS_CLIENT_DATA="$CLIENTDATA"
 export VMANGOS_INSTALL_ROOT="$INSTALLROOT"
 export VMANGOS_SQL_ADMIN_USER="$SQLADMINUSER"

@@ -17,7 +17,10 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
-      - name: Run shellcheck
+      - name: Run installer shellcheck
+        run: shellcheck vmangos_setup.sh auto_install.sh tests/installer/run_tests.sh
+
+      - name: Run manager shellcheck
         working-directory: ./manager
         run: make lint
 
@@ -28,6 +31,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Run tests
+      - name: Run installer tests
+        run: bash tests/installer/run_tests.sh
+
+      - name: Run manager tests
         working-directory: ./manager
         run: make test
