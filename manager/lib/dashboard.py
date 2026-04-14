@@ -36,6 +36,7 @@ ACCENT_TEAL = "#2dd4bf"
 ACCENT_ROSE = "#fb7185"
 ACCENT_MUTED = "#cbd5e1"
 ACCENT_GREEN = "#34d399"
+ACCENT_BLUE = "#3b82f6"
 
 ACTION_STYLES = {
     "info": ("STANDBY", ACCENT_SKY),
@@ -70,6 +71,17 @@ WEEKLY_SCHEDULE_PATTERN = re.compile(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) ([0-1][0-9
 SCHEDULE_TYPE_PATTERN = re.compile(r"^(daily|weekly)$", re.IGNORECASE)
 DAY_NAME_PATTERN = re.compile(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$")
 WARNINGS_PATTERN = re.compile(r"^[1-9][0-9]*(,[1-9][0-9]*)*$")
+
+TREND_HISTORY_LIMIT = 24
+SPARKLINE_BARS = "▁▂▃▄▅▆▇█"
+TREND_THRESHOLDS = {
+    "cpu": 3.0,
+    "memory": 2.0,
+    "load": 0.08,
+    "disk": 1.0,
+    "players": 1.0,
+    "io": 2.0,
+}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -227,6 +239,112 @@ def format_error_text(value: Any, max_length: int = 92) -> str:
         text = " ".join(parts)
 
     return escape_markup(truncate_text(text, max_length))
+
+
+def parse_optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_monitoring_sample(snapshot: dict[str, Any]) -> dict[str, Any]:
+    sample: dict[str, Any] = {
+        "captured_at": str(snapshot.get("captured_at", "") or ""),
+        "cpu": None,
+        "memory": None,
+        "load": None,
+        "disk": None,
+        "players": None,
+        "io": None,
+    }
+
+    server = snapshot.get("server", {})
+    if not server.get("ok"):
+        return sample
+
+    data = server.get("data", {})
+    host = data.get("host", {})
+    players = data.get("players", {})
+    storage_io = data.get("storage_io", {})
+
+    sample["cpu"] = parse_optional_float(host.get("cpu", {}).get("usage_percent"))
+    sample["memory"] = parse_optional_float(host.get("memory", {}).get("used_percent"))
+    sample["load"] = parse_optional_float(host.get("load", {}).get("load_1"))
+    sample["disk"] = parse_optional_float(data.get("checks", {}).get("disk_space", {}).get("used_percent"))
+    sample["players"] = parse_optional_float(players.get("online", len(snapshot.get("players", []))))
+    if storage_io.get("available"):
+        sample["io"] = parse_optional_float(storage_io.get("util_percent"))
+
+    return sample
+
+
+def append_monitoring_sample(
+    history: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+    max_samples: int = TREND_HISTORY_LIMIT,
+) -> list[dict[str, Any]]:
+    sample = extract_monitoring_sample(snapshot)
+    metric_keys = ("cpu", "memory", "load", "disk", "players", "io")
+    if not any(sample.get(key) is not None for key in metric_keys):
+        return list(history)
+
+    updated = list(history)
+    if updated and updated[-1].get("captured_at") == sample.get("captured_at"):
+        updated[-1] = sample
+    else:
+        updated.append(sample)
+
+    return updated[-max_samples:]
+
+
+def history_values(history: list[dict[str, Any]], key: str) -> list[float | None]:
+    return [parse_optional_float(sample.get(key)) for sample in history]
+
+
+def render_sparkline(values: list[float | None], width: int = 10) -> str:
+    window = list(values[-width:])
+    available = [value for value in window if value is not None]
+    if not available:
+        return "·" * width
+
+    if len(window) < width:
+        window = [available[0]] * (width - len(window)) + window
+
+    minimum = min(available)
+    maximum = max(available)
+    if abs(maximum - minimum) < 0.001:
+        return SPARKLINE_BARS[3] * width
+
+    chars: list[str] = []
+    for value in window:
+        if value is None:
+            chars.append("·")
+            continue
+        index = int(round(((value - minimum) / (maximum - minimum)) * (len(SPARKLINE_BARS) - 1)))
+        chars.append(SPARKLINE_BARS[index])
+    return "".join(chars)
+
+
+def describe_trend(values: list[float | None], metric_key: str) -> str:
+    available = [value for value in values if value is not None]
+    if len(available) < 2:
+        return "warming"
+
+    delta = available[-1] - available[0]
+    threshold = TREND_THRESHOLDS.get(metric_key, 1.0)
+    if abs(delta) < threshold:
+        return "steady"
+    return "rising" if delta > 0 else "easing"
+
+
+def history_window_label(history: list[dict[str, Any]], refresh_interval: int) -> str:
+    if len(history) < 2:
+        return "warming up"
+    seconds = max((len(history) - 1) * max(refresh_interval, 1), 0)
+    return f"{len(history)} samples / ~{seconds}s"
 
 
 def player_key_value(value: Any) -> str:
@@ -861,10 +979,19 @@ def render_service_panel(snapshot: dict[str, Any], active_view: str) -> str:
     )
 
 
-def render_metrics_panel(snapshot: dict[str, Any]) -> str:
+def render_metrics_panel(
+    snapshot: dict[str, Any],
+    metric_history: list[dict[str, Any]] | None = None,
+    refresh_interval: int = 2,
+) -> str:
     server = snapshot["server"]
     logs = snapshot["logs"]
-    lines = [f"[bold {ACCENT_GOLD}]Host Metrics[/]", ""]
+    metric_history = metric_history or []
+    lines = [
+        f"[bold {ACCENT_GOLD}]Host Metrics[/]",
+        f"[{ACCENT_MUTED}]Recent window[/] {history_window_label(metric_history, refresh_interval)}",
+        "",
+    ]
 
     if server["ok"]:
         data = server["data"]
@@ -874,37 +1001,41 @@ def render_metrics_panel(snapshot: dict[str, Any]) -> str:
         load = host.get("load", {})
         disk = data.get("checks", {}).get("disk_space", {})
         storage_io = data.get("storage_io", {})
+        players = data.get("players", {})
+        cpu_history = history_values(metric_history, "cpu")
+        memory_history = history_values(metric_history, "memory")
+        load_history = history_values(metric_history, "load")
+        disk_history = history_values(metric_history, "disk")
+        players_history = history_values(metric_history, "players")
+        io_history = history_values(metric_history, "io")
         lines.extend(
             [
-                f"[bold {ACCENT_SKY}]CPU[/]      {cpu.get('usage_percent', 0)}%  {format_state(cpu.get('status', 'unavailable'))}  [{ACCENT_MUTED}]cores[/] {cpu.get('cores', 0)}",
-                f"[bold {ACCENT_SKY}]Memory[/]   {memory.get('used_percent', 0)}%  {format_state(memory.get('status', 'unavailable'))}  {format_mb_from_kb(memory.get('used_kb', 0))} [{ACCENT_MUTED}]used[/]",
-                f"[bold {ACCENT_SKY}]Load[/]     {load.get('load_1', 0)} / {load.get('load_5', 0)} / {load.get('load_15', 0)}  {format_state(load.get('status', 'unavailable'))}",
-                f"[bold {ACCENT_SKY}]Disk[/]     {disk.get('used_percent', 0)}%  {format_state(disk.get('status', 'unavailable'))}  [{ACCENT_MUTED}]free[/] {format_gb_from_kb(disk.get('available_kb', 0))}",
+                f"[bold {ACCENT_SKY}]CPU[/]      {cpu.get('usage_percent', 0)}%  {format_state(cpu.get('status', 'unavailable'))}  [{ACCENT_TEAL}]{render_sparkline(cpu_history)}[/] [{ACCENT_MUTED}]{describe_trend(cpu_history, 'cpu')}[/]",
+                f"[bold {ACCENT_SKY}]Memory[/]   {memory.get('used_percent', 0)}%  {format_state(memory.get('status', 'unavailable'))}  [{ACCENT_TEAL}]{render_sparkline(memory_history)}[/] [{ACCENT_MUTED}]{describe_trend(memory_history, 'memory')}[/]",
+                f"[bold {ACCENT_SKY}]Load[/]     {load.get('load_1', 0)}  {format_state(load.get('status', 'unavailable'))}  [{ACCENT_TEAL}]{render_sparkline(load_history)}[/] [{ACCENT_MUTED}]{describe_trend(load_history, 'load')}[/]",
+                f"[bold {ACCENT_SKY}]Disk[/]     {disk.get('used_percent', 0)}%  {format_state(disk.get('status', 'unavailable'))}  [{ACCENT_TEAL}]{render_sparkline(disk_history)}[/] [{ACCENT_MUTED}]{describe_trend(disk_history, 'disk')}[/]",
+                f"[bold {ACCENT_SKY}]Players[/]  {players.get('online', len(snapshot.get('players', [])))} online  [{ACCENT_BLUE}]{render_sparkline(players_history)}[/] [{ACCENT_MUTED}]{describe_trend(players_history, 'players')}[/]",
             ]
         )
         if storage_io.get("available"):
             lines.append(
-                f"[bold {ACCENT_SKY}]I/O[/]      {storage_io.get('util_percent', 0)}% [{ACCENT_MUTED}]util[/]  {format_state(storage_io.get('status', 'unavailable'))}  {storage_io.get('device', 'n/a')}"
+                f"[bold {ACCENT_SKY}]I/O[/]      {storage_io.get('util_percent', 0)}% [{ACCENT_MUTED}]util[/]  {format_state(storage_io.get('status', 'unavailable'))}  [{ACCENT_TEAL}]{render_sparkline(io_history)}[/] [{ACCENT_MUTED}]{describe_trend(io_history, 'io')}[/]"
             )
         else:
             lines.append(
-                f"[bold {ACCENT_SKY}]I/O[/]      {format_state(storage_io.get('status', 'unavailable'))}  [{ACCENT_MUTED}]install sysstat/iostat for live disk stats[/]"
+                f"[bold {ACCENT_SKY}]I/O[/]      {format_state(storage_io.get('status', 'unavailable'))}  [{ACCENT_MUTED}]install sysstat/iostat for live disk history[/]"
             )
     else:
         lines.append(f"[bold {ACCENT_ROSE}]Server metrics unavailable:[/] {format_error_text(server['error'])}")
 
-    lines.extend(["", f"[bold {ACCENT_SKY}]Log Rotation[/]"])
+    lines.extend(["", f"[bold {ACCENT_SKY}]Logs[/]"])
     if logs["ok"]:
         data = logs["data"]
         config = data.get("config", {})
         log_counts = data.get("logs", {})
-        disk = data.get("disk", {})
         lines.extend(
             [
-                f"[bold {ACCENT_SKY}]Health[/]   {format_state(data.get('status', 'unavailable'))}",
-                f"[bold {ACCENT_SKY}]Config[/]   present={config.get('present', False)}  in_sync={config.get('in_sync', False)}",
-                f"[bold {ACCENT_SKY}]Files[/]    active={log_counts.get('active_files', 0)}  rotated={log_counts.get('rotated_files', 0)}",
-                f"[bold {ACCENT_SKY}]Disk[/]     {disk.get('used_percent', 0)}% [{ACCENT_MUTED}]used[/]  [{ACCENT_MUTED}]free[/] {format_gb_from_kb(disk.get('available_kb', 0))}",
+                f"[{ACCENT_MUTED}]Health[/]   {format_state(data.get('status', 'unavailable'))}  [{ACCENT_MUTED}]active[/] {log_counts.get('active_files', 0)}  [{ACCENT_MUTED}]rotated[/] {log_counts.get('rotated_files', 0)}  [{ACCENT_MUTED}]in_sync[/] {config.get('in_sync', False)}",
             ]
         )
     else:
@@ -1449,7 +1580,7 @@ def create_app(
             layout: grid;
             grid-size: 2 2;
             grid-columns: 1fr 1fr;
-            grid-rows: 11 1fr;
+            grid-rows: 12 1fr;
             grid-gutter: 1 2;
             height: 1fr;
         }
@@ -1690,6 +1821,7 @@ def create_app(
             self.last_action = "dashboard started"
             self.action_tone = "info"
             self.snapshot = empty_snapshot("waiting for first refresh")
+            self.metric_history: list[dict[str, Any]] = []
             self.selected_player_id = ""
             self.selected_account_id = ""
             self.selected_backup_file = ""
@@ -1816,9 +1948,10 @@ def create_app(
 
         def apply_snapshot(self, snapshot: dict[str, Any]) -> None:
             self.snapshot = snapshot
+            self.metric_history = append_monitoring_sample(self.metric_history, snapshot)
             self.refresh_inflight = False
             self.query_one("#service-pane", Static).update(render_service_panel(snapshot, self.active_view))
-            self.query_one("#metrics-pane", Static).update(render_metrics_panel(snapshot))
+            self.query_one("#metrics-pane", Static).update(render_metrics_panel(snapshot, self.metric_history, self.refresh_interval))
             self.query_one("#config-pane", Static).update(render_config_panel(snapshot))
             self.query_one("#logs-pane", Static).update(render_logs_panel(snapshot))
             self.query_one("#update-pane", Static).update(render_update_panel(snapshot, self.update_plan_data))
