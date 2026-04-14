@@ -76,6 +76,8 @@ WARNINGS_PATTERN = re.compile(r"^[1-9][0-9]*(,[1-9][0-9]*)*$")
 
 TREND_HISTORY_LIMIT = 24
 SPARKLINE_BARS = "▁▂▃▄▅▆▇█"
+METER_FILLED = "█"
+METER_EMPTY = "░"
 TREND_THRESHOLDS = {
     "cpu": 3.0,
     "memory": 2.0,
@@ -208,6 +210,11 @@ def format_state(value: Any) -> str:
     text = str(value or "unknown")
     color = STATUS_COLORS.get(text, "white")
     return f"[bold {color}]{text}[/]"
+
+
+def metric_health_color(value: Any) -> str:
+    normalized = str(value or "unknown").strip().lower()
+    return STATUS_COLORS.get(normalized, ACCENT_MUTED)
 
 
 def format_flag(
@@ -349,6 +356,44 @@ def compact_metric_state(value: Any) -> str:
     if normalized in ("", "ok", "healthy", "active"):
         return ""
     return f" {normalized}"
+
+
+def normalize_percent(value: Any) -> float:
+    return max(0.0, min(100.0, clamp_float(value)))
+
+
+def normalize_load_percent(load_value: Any, cores: Any) -> float:
+    load_float = max(0.0, clamp_float(load_value))
+    core_count = max(1.0, clamp_float(cores, 1.0))
+    # Align the bar scale with the same thresholds the backend uses:
+    # warning at 1x cores and critical at 2x cores.
+    return min(100.0, (load_float / (core_count * 2.0)) * 100.0)
+
+
+def render_meter(
+    value: Any,
+    *,
+    width: int = 12,
+    color: str = ACCENT_GREEN,
+    show_minimum_for_positive: bool = False,
+) -> str:
+    percent = normalize_percent(value)
+    filled = int(round((percent / 100.0) * width))
+    if show_minimum_for_positive and percent > 0 and filled == 0:
+        filled = 1
+    filled = max(0, min(width, filled))
+    return f"[bold {color}]{METER_FILLED * filled}[/][{ACCENT_MUTED}]{METER_EMPTY * (width - filled)}[/]"
+
+
+def format_metric_peak(values: list[float | None], metric_key: str) -> str:
+    available = [value for value in values if value is not None]
+    if not available:
+        return "n/a"
+
+    peak = max(available)
+    if metric_key == "load":
+        return f"{peak:.2f}"
+    return f"{peak:.1f}%"
 
 
 def describe_trend(values: list[float | None], metric_key: str) -> str:
@@ -1085,7 +1130,7 @@ def render_metrics_panel(
     metric_history = metric_history or []
     lines = [
         f"[bold {ACCENT_GOLD}]Host Metrics[/]",
-        f"[{ACCENT_MUTED}]Host pressure, capacity, and trend.[/]",
+        f"[{ACCENT_MUTED}]Host pressure and capacity at a glance.[/]",
         f"[{ACCENT_MUTED}]Window[/] {history_window_label(metric_history, refresh_interval)}",
         "",
     ]
@@ -1098,49 +1143,54 @@ def render_metrics_panel(
         load = host.get("load", {})
         disk = data.get("checks", {}).get("disk_space", {})
         storage_io = data.get("storage_io", {})
-        cpu_history = history_values(metric_history, "cpu")
-        memory_history = history_values(metric_history, "memory")
-        load_history = history_values(metric_history, "load")
-        disk_history = history_values(metric_history, "disk")
-        io_history = history_values(metric_history, "io")
+        cpu_percent = normalize_percent(cpu.get("usage_percent", 0))
+        memory_percent = normalize_percent(memory.get("used_percent", 0))
+        load_percent = normalize_load_percent(load.get("load_1", 0), cpu.get("cores", 1))
+        disk_percent = normalize_percent(disk.get("used_percent", 0))
         metric_rows = [
             (
                 "CPU",
-                f"{cpu.get('usage_percent', 0)}% / {cpu.get('cores', 'n/a')}c{compact_metric_state(cpu.get('status', 'unavailable'))}",
-                cpu_history,
+                f"{cpu_percent:.1f}% / {cpu.get('cores', 'n/a')}c{compact_metric_state(cpu.get('status', 'unavailable'))}",
+                cpu.get("status", "unavailable"),
+                cpu_percent,
             ),
             (
                 "Memory",
-                f"{memory.get('used_percent', 0)}% / {format_gb_from_kb(memory.get('used_kb', 0)).replace(' GB', 'G')}/{format_gb_from_kb(memory.get('total_kb', 0)).replace(' GB', 'G')}{compact_metric_state(memory.get('status', 'unavailable'))}",
-                memory_history,
+                f"{memory_percent:.1f}% / {format_gb_from_kb(memory.get('used_kb', 0)).replace(' GB', 'G')}/{format_gb_from_kb(memory.get('total_kb', 0)).replace(' GB', 'G')}{compact_metric_state(memory.get('status', 'unavailable'))}",
+                memory.get("status", "unavailable"),
+                memory_percent,
             ),
             (
                 "Load",
                 f"1m {load.get('load_1', 0)} / 5m {load.get('load_5', 0)}{compact_metric_state(load.get('status', 'unavailable'))}",
-                load_history,
+                load.get("status", "unavailable"),
+                load_percent,
             ),
             (
                 "Disk",
-                f"{disk.get('used_percent', 0)}% / {format_gb_from_kb(disk.get('available_kb', 0)).replace(' GB', 'G')} free{compact_metric_state(disk.get('status', 'unavailable'))}",
-                disk_history,
+                f"{disk_percent:.1f}% / {format_gb_from_kb(disk.get('available_kb', 0)).replace(' GB', 'G')} free{compact_metric_state(disk.get('status', 'unavailable'))}",
+                disk.get("status", "unavailable"),
+                disk_percent,
             ),
         ]
-        for label, summary, history_values_for_metric in metric_rows:
+        for label, summary, status, percent in metric_rows:
             label_segment = f"[bold {ACCENT_SKY}]{label:<6}[/]"
-            summary_segment = pad_markup(
-                summary,
-                24,
-            )
+            summary_segment = pad_markup(f"[bold {metric_health_color(status)}]{escape_markup(summary)}[/]", 31)
             lines.append(
-                f"{label_segment} {summary_segment}  [{ACCENT_TEAL}]{render_sparkline(history_values_for_metric, width=8)}[/]"
+                f"{label_segment} {summary_segment}  {render_meter(percent, width=8, color=metric_health_color(status), show_minimum_for_positive=(label == 'Load'))}"
             )
         if storage_io.get("available"):
+            io_percent = normalize_percent(storage_io.get("util_percent", 0))
+            io_summary_text = (
+                f"{io_percent:.1f}% / {storage_io.get('read_ops_per_sec', 0)}:{storage_io.get('write_ops_per_sec', 0)} rw"
+                f"{compact_metric_state(storage_io.get('status', 'unavailable'))}"
+            )
             io_summary = pad_markup(
-                f"{storage_io.get('util_percent', 0)}% / {storage_io.get('read_ops_per_sec', 0)}:{storage_io.get('write_ops_per_sec', 0)} rw{compact_metric_state(storage_io.get('status', 'unavailable'))}",
-                24,
+                f"[bold {metric_health_color(storage_io.get('status', 'unavailable'))}]{escape_markup(io_summary_text)}[/]",
+                31,
             )
             lines.append(
-                f"[bold {ACCENT_SKY}]{'I/O':<6}[/] {io_summary}  [{ACCENT_TEAL}]{render_sparkline(io_history, width=8)}[/]"
+                f"[bold {ACCENT_SKY}]{'I/O':<6}[/] {io_summary}  {render_meter(io_percent, width=8, color=metric_health_color(storage_io.get('status', 'unavailable')))}"
             )
         else:
             lines.append(
@@ -1161,9 +1211,8 @@ def render_monitor_pressure(
     metric_history = metric_history or []
     lines = [
         f"[bold {ACCENT_GOLD}]Pressure Deck[/]",
-        f"[{ACCENT_MUTED}]Deeper host diagnostics for CPU, memory, load, disk, and I/O.[/]",
+        f"[{ACCENT_MUTED}]CPU, memory, load, disk, and I/O pressure.[/]",
         f"[{ACCENT_MUTED}]Window[/] {history_window_label(metric_history, refresh_interval)}",
-        "",
     ]
 
     if not server["ok"]:
@@ -1182,46 +1231,67 @@ def render_monitor_pressure(
     load_history = history_values(metric_history, "load")
     disk_history = history_values(metric_history, "disk")
     io_history = history_values(metric_history, "io")
+    cpu_percent = normalize_percent(cpu.get("usage_percent", 0))
+    memory_percent = normalize_percent(memory.get("used_percent", 0))
+    load_percent = normalize_load_percent(load.get("load_1", 0), cpu.get("cores", 1))
+    disk_percent = normalize_percent(disk.get("used_percent", 0))
 
     metric_rows = [
         (
             "CPU",
-            f"{cpu.get('usage_percent', 0)}% / {cpu.get('cores', 'n/a')} cores{compact_metric_state(cpu.get('status', 'unavailable'))}",
+            f"{cpu_percent:.1f}% / {cpu.get('cores', 'n/a')} cores{compact_metric_state(cpu.get('status', 'unavailable'))}",
             cpu_history,
             "cpu",
+            cpu.get("status", "unavailable"),
+            cpu_percent,
         ),
         (
             "Memory",
-            f"{memory.get('used_percent', 0)}% / {format_gb_from_kb(memory.get('used_kb', 0))} of {format_gb_from_kb(memory.get('total_kb', 0))}{compact_metric_state(memory.get('status', 'unavailable'))}",
+            f"{memory_percent:.1f}% / {format_gb_from_kb(memory.get('used_kb', 0))} of {format_gb_from_kb(memory.get('total_kb', 0))}{compact_metric_state(memory.get('status', 'unavailable'))}",
             memory_history,
             "memory",
+            memory.get("status", "unavailable"),
+            memory_percent,
         ),
         (
             "Load",
             f"1m {load.get('load_1', 0)}  5m {load.get('load_5', 0)}  15m {load.get('load_15', 0)}{compact_metric_state(load.get('status', 'unavailable'))}",
             load_history,
             "load",
+            load.get("status", "unavailable"),
+            load_percent,
         ),
         (
             "Disk",
-            f"{disk.get('used_percent', 0)}% used / {format_gb_from_kb(disk.get('available_kb', 0))} free{compact_metric_state(disk.get('status', 'unavailable'))}",
+            f"{disk_percent:.1f}% used / {format_gb_from_kb(disk.get('available_kb', 0))} free{compact_metric_state(disk.get('status', 'unavailable'))}",
             disk_history,
             "disk",
+            disk.get("status", "unavailable"),
+            disk_percent,
         ),
     ]
 
-    for label, summary, values, metric_key in metric_rows:
-        lines.append(
-            f"[bold {ACCENT_SKY}]{label:<6}[/] {escape_markup(summary)}  [{ACCENT_MUTED}]{describe_trend(values, metric_key)}[/]  [{ACCENT_TEAL}]{render_sparkline(values, width=10)}[/]"
+    for label, summary, values, metric_key, status, percent in metric_rows:
+        peak_text = format_metric_peak(values, metric_key)
+        lines.extend(
+            [
+                f"[bold {ACCENT_SKY}]{label:<6}[/] {format_state(status)}  {escape_markup(summary)}",
+                f"{render_meter(percent, width=24, color=metric_health_color(status), show_minimum_for_positive=(metric_key == 'load'))}  [{ACCENT_MUTED}]peak[/] {peak_text}  [{ACCENT_MUTED}]trend[/] {describe_trend(values, metric_key)}",
+            ]
         )
 
     if storage_io.get("available"):
+        io_percent = normalize_percent(storage_io.get("util_percent", 0))
+        peak_io = format_metric_peak(io_history, "io")
         io_summary = (
-            f"{storage_io.get('util_percent', 0)}% util / {storage_io.get('read_ops_per_sec', 0)}:{storage_io.get('write_ops_per_sec', 0)} ops"
+            f"{io_percent:.1f}% util / {storage_io.get('read_ops_per_sec', 0)}:{storage_io.get('write_ops_per_sec', 0)} ops"
             f"{compact_metric_state(storage_io.get('status', 'unavailable'))}"
         )
-        lines.append(
-            f"[bold {ACCENT_SKY}]I/O   [/] {escape_markup(io_summary)}  [{ACCENT_MUTED}]{describe_trend(io_history, 'io')}[/]  [{ACCENT_TEAL}]{render_sparkline(io_history, width=10)}[/]"
+        lines.extend(
+            [
+                f"[bold {ACCENT_SKY}]I/O   [/] {format_state(storage_io.get('status', 'unavailable'))}  {escape_markup(io_summary)}",
+                f"{render_meter(io_percent, width=24, color=metric_health_color(storage_io.get('status', 'unavailable')))}  [{ACCENT_MUTED}]peak[/] {peak_io}  [{ACCENT_MUTED}]trend[/] {describe_trend(io_history, 'io')}",
+            ]
         )
     else:
         lines.append(f"[bold {ACCENT_SKY}]I/O   [/] {format_state(storage_io.get('status', 'unavailable'))}")
@@ -2133,7 +2203,7 @@ def create_app(
             layout: grid;
             grid-size: 2 2;
             grid-columns: 7fr 5fr;
-            grid-rows: 1fr 1fr;
+            grid-rows: 18 1fr;
             grid-gutter: 1 2;
             height: 1fr;
         }
