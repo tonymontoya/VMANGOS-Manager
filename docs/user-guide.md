@@ -131,7 +131,7 @@ Use this view when:
 Panel roles in this view:
 
 - `Realm Services` is the fast service and DB pulse plus per-service footprint
-- `Host Metrics` is the machine-level headline pressure panel only
+- `Host Metrics` is the machine-level headline pressure panel only, using compact numeric summaries plus small capacity meters
 - `Player Pulse` is the summary-first population panel: online count, trend, player/staff mix, and GM coverage
 - `Alerts and Events` is the fast-read maintenance and risk panel
 
@@ -157,12 +157,17 @@ Use it when you need to:
 
 Read it in this order:
 
-1. Start with `Pressure Deck` for the current host picture plus short rolling trends.
+1. Start with `Pressure Deck` for the current host picture, bar-first capacity usage, and recent peak/trend context.
 2. Move to `Realm Process Footprint` to check whether `auth` or `world` is the source of pressure.
 3. Use `Trend Ledger` to compare current values against the recent peak window.
 4. Finish with `Storage and Device` when disk saturation, filesystem headroom, or missing `iostat` tooling might explain what you are seeing.
 
 This screen is intentionally denser than `Overview`, but it still follows the same rule: each panel has a clear job. The goal is better diagnosis, not more noise.
+
+Two practical rules help here:
+
+- `Overview` is for fast operator confidence and concise headline telemetry
+- `Monitor` is where the bar-first pressure readout, peak window, and device context justify the extra density
 
 If you have room, run the dashboard in a taller terminal before you camp on `Monitor`. It makes the trend and storage panels easier to absorb at a glance.
 
