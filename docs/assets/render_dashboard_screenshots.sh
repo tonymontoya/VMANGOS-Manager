@@ -12,14 +12,14 @@ MANAGER_CONFIG="${MANAGER_CONFIG:-/opt/mangos/manager/config/manager.conf}"
 REFRESH_INTERVAL="${REFRESH_INTERVAL:-2}"
 THEME_NAME="${THEME_NAME:-dark}"
 SCREEN_COLUMNS="${SCREEN_COLUMNS:-140}"
-SCREEN_LINES="${SCREEN_LINES:-44}"
+SCREEN_LINES="${SCREEN_LINES:-52}"
 
 mkdir -p "$OUTPUT_DIR"
 
 SNAPSHOT_FILE="$OUTPUT_DIR/dashboard-demo-snapshot.json"
 python3 "$SCRIPT_DIR/generate_dashboard_demo.py" --output "$SNAPSHOT_FILE"
 
-for view_name in overview accounts backups config operations; do
+for view_name in overview monitor accounts backups config operations; do
     COLUMNS="$SCREEN_COLUMNS" LINES="$SCREEN_LINES" \
     "$DASHBOARD_PYTHON" "$DASHBOARD_APP" \
         --manager-bin "$MANAGER_BIN" \

@@ -48,6 +48,7 @@ ACTION_STYLES = {
 
 VIEW_TITLES = {
     "overview": "Overview",
+    "monitor": "Monitor",
     "accounts": "Accounts",
     "backups": "Backups",
     "config": "Config",
@@ -55,7 +56,8 @@ VIEW_TITLES = {
 }
 
 VIEW_SUMMARIES = {
-    "overview": "Run the realm from one live control deck: services, host pressure, players, and alerts.",
+    "overview": "Keep a summary-first realm pulse: services, host pressure, players, and alerts.",
+    "monitor": "Diagnose host pressure with deeper trends, device saturation, and realm process footprint.",
     "accounts": "Work the selected-account admin flow for provisioning, access, and moderation.",
     "backups": "Check protection posture, then act on the selected archive with confidence.",
     "config": "Confirm Manager's wiring view before you trust higher-level automation.",
@@ -462,6 +464,15 @@ def format_command_tokens(tokens: list[tuple[str, str]]) -> str:
 
 
 def view_command_tokens(active_view: str) -> list[tuple[str, str]]:
+    if active_view == "monitor":
+        return [
+            ("o", "roster"),
+            ("s", "start"),
+            ("x", "stop"),
+            ("R", "restart"),
+            ("b", "backup"),
+            ("v", "verify"),
+        ]
     if active_view == "accounts":
         return [
             ("c", "create"),
@@ -504,10 +515,11 @@ def render_command_rail(active_view: str) -> str:
     navigation = format_command_tokens(
         [
             ("1", "overview"),
-            ("2", "accounts"),
-            ("3", "backups"),
-            ("4", "config"),
-            ("5", "ops"),
+            ("2", "monitor"),
+            ("3", "accounts"),
+            ("4", "backups"),
+            ("5", "config"),
+            ("6", "ops"),
         ]
     )
     global_actions = format_command_tokens([("r", "refresh"), ("t", "theme"), ("q", "quit")])
@@ -985,10 +997,11 @@ def render_action_banner(
 def render_sidebar(active_view: str, last_action: str, snapshot: dict[str, Any], refresh_interval: int) -> str:
     sections = [
         ("overview", "1", "Overview"),
-        ("accounts", "2", "Accounts"),
-        ("backups", "3", "Backups"),
-        ("config", "4", "Config"),
-        ("operations", "5", "Ops"),
+        ("monitor", "2", "Monitor"),
+        ("accounts", "3", "Accounts"),
+        ("backups", "4", "Backups"),
+        ("config", "5", "Config"),
+        ("operations", "6", "Ops"),
     ]
 
     server = snapshot.get("server", {})
@@ -1135,6 +1148,215 @@ def render_metrics_panel(
             )
     else:
         lines.append(f"[bold {ACCENT_ROSE}]Server metrics unavailable:[/] {format_error_text(server['error'])}")
+
+    return "\n".join(lines)
+
+
+def render_monitor_pressure(
+    snapshot: dict[str, Any],
+    metric_history: list[dict[str, Any]] | None = None,
+    refresh_interval: int = 2,
+) -> str:
+    server = snapshot["server"]
+    metric_history = metric_history or []
+    lines = [
+        f"[bold {ACCENT_GOLD}]Pressure Deck[/]",
+        f"[{ACCENT_MUTED}]Deeper host diagnostics for CPU, memory, load, disk, and I/O.[/]",
+        f"[{ACCENT_MUTED}]Window[/] {history_window_label(metric_history, refresh_interval)}",
+        "",
+    ]
+
+    if not server["ok"]:
+        lines.append(f"[bold {ACCENT_ROSE}]Monitor snapshot unavailable:[/] {format_error_text(server['error'])}")
+        return "\n".join(lines)
+
+    data = server["data"]
+    host = data.get("host", {})
+    cpu = host.get("cpu", {})
+    memory = host.get("memory", {})
+    load = host.get("load", {})
+    disk = data.get("checks", {}).get("disk_space", {})
+    storage_io = data.get("storage_io", {})
+    cpu_history = history_values(metric_history, "cpu")
+    memory_history = history_values(metric_history, "memory")
+    load_history = history_values(metric_history, "load")
+    disk_history = history_values(metric_history, "disk")
+    io_history = history_values(metric_history, "io")
+
+    metric_rows = [
+        (
+            "CPU",
+            f"{cpu.get('usage_percent', 0)}% / {cpu.get('cores', 'n/a')} cores{compact_metric_state(cpu.get('status', 'unavailable'))}",
+            cpu_history,
+            "cpu",
+        ),
+        (
+            "Memory",
+            f"{memory.get('used_percent', 0)}% / {format_gb_from_kb(memory.get('used_kb', 0))} of {format_gb_from_kb(memory.get('total_kb', 0))}{compact_metric_state(memory.get('status', 'unavailable'))}",
+            memory_history,
+            "memory",
+        ),
+        (
+            "Load",
+            f"1m {load.get('load_1', 0)}  5m {load.get('load_5', 0)}  15m {load.get('load_15', 0)}{compact_metric_state(load.get('status', 'unavailable'))}",
+            load_history,
+            "load",
+        ),
+        (
+            "Disk",
+            f"{disk.get('used_percent', 0)}% used / {format_gb_from_kb(disk.get('available_kb', 0))} free{compact_metric_state(disk.get('status', 'unavailable'))}",
+            disk_history,
+            "disk",
+        ),
+    ]
+
+    for label, summary, values, metric_key in metric_rows:
+        lines.append(
+            f"[bold {ACCENT_SKY}]{label:<6}[/] {escape_markup(summary)}  [{ACCENT_MUTED}]{describe_trend(values, metric_key)}[/]  [{ACCENT_TEAL}]{render_sparkline(values, width=10)}[/]"
+        )
+
+    if storage_io.get("available"):
+        io_summary = (
+            f"{storage_io.get('util_percent', 0)}% util / {storage_io.get('read_ops_per_sec', 0)}:{storage_io.get('write_ops_per_sec', 0)} ops"
+            f"{compact_metric_state(storage_io.get('status', 'unavailable'))}"
+        )
+        lines.append(
+            f"[bold {ACCENT_SKY}]I/O   [/] {escape_markup(io_summary)}  [{ACCENT_MUTED}]{describe_trend(io_history, 'io')}[/]  [{ACCENT_TEAL}]{render_sparkline(io_history, width=10)}[/]"
+        )
+    else:
+        lines.append(f"[bold {ACCENT_SKY}]I/O   [/] {format_state(storage_io.get('status', 'unavailable'))}")
+        lines.append(f"[{ACCENT_MUTED}]install [bold {ACCENT_GOLD}]sysstat/iostat[/] for live disk saturation history.")
+
+    return "\n".join(lines)
+
+
+def render_monitor_processes(snapshot: dict[str, Any]) -> str:
+    server = snapshot["server"]
+    lines = [
+        f"[bold {ACCENT_GOLD}]Realm Process Footprint[/]",
+        f"[{ACCENT_MUTED}]Auth/world runtime detail plus DB readiness for diagnosis.[/]",
+        "",
+    ]
+
+    if not server["ok"]:
+        lines.append(f"[bold {ACCENT_ROSE}]Process data unavailable:[/] {format_error_text(server['error'])}")
+        return "\n".join(lines)
+
+    data = server["data"]
+    services = data.get("services", {})
+    db = data.get("checks", {}).get("database_connectivity", {})
+
+    for service_name in ("auth", "world"):
+        service = services.get(service_name, {})
+        label = service_name.title()
+        lines.extend(
+            [
+                f"[bold {ACCENT_SKY}]{label}[/]  {format_state(service.get('health', service.get('state', 'unavailable')))}  [{ACCENT_MUTED}]pid[/] {service.get('pid', 0)}  [{ACCENT_MUTED}]up[/] {service.get('uptime_human', 'n/a')}",
+                f"[{ACCENT_MUTED}]cpu[/] {service.get('cpu_percent', 0)}%  [{ACCENT_MUTED}]mem[/] {service.get('memory_mb', 0)} MB  [{ACCENT_MUTED}]restarts/1h[/] {clamp_int(service.get('restart_count_1h', 0))}  [{ACCENT_MUTED}]crash loop[/] {format_flag(service.get('crash_loop_detected'), true_text='yes', false_text='no', true_color=ACCENT_ROSE)}",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            f"[bold {ACCENT_SKY}]DB[/]    {format_state('ok' if db.get('ok') else db.get('message', 'unreachable'))}",
+            f"[{ACCENT_MUTED}]      check[/] {escape_markup(db.get('message', 'n/a'))}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_monitor_trends(
+    snapshot: dict[str, Any],
+    metric_history: list[dict[str, Any]] | None = None,
+    refresh_interval: int = 2,
+) -> str:
+    server = snapshot["server"]
+    metric_history = metric_history or []
+    lines = [
+        f"[bold {ACCENT_GOLD}]Trend Ledger[/]",
+        f"[{ACCENT_MUTED}]Compare current value, peak window, and direction at a glance.[/]",
+        f"[{ACCENT_MUTED}]Window[/] {history_window_label(metric_history, refresh_interval)}",
+        "",
+    ]
+
+    if not server["ok"]:
+        lines.append(f"[bold {ACCENT_ROSE}]Trend data unavailable:[/] {format_error_text(server['error'])}")
+        return "\n".join(lines)
+
+    data = server["data"]
+    host = data.get("host", {})
+    disk = data.get("checks", {}).get("disk_space", {})
+    storage_io = data.get("storage_io", {})
+    rows = [
+        ("CPU", clamp_float(host.get("cpu", {}).get("usage_percent")), history_values(metric_history, "cpu"), "%"),
+        ("Memory", clamp_float(host.get("memory", {}).get("used_percent")), history_values(metric_history, "memory"), "%"),
+        ("Load", clamp_float(host.get("load", {}).get("load_1")), history_values(metric_history, "load"), ""),
+        ("Disk", clamp_float(disk.get("used_percent")), history_values(metric_history, "disk"), "%"),
+    ]
+
+    for label, current_value, values, suffix in rows:
+        available = [value for value in values if value is not None]
+        peak_text = f"{max(available):.1f}{suffix}" if available else "n/a"
+        lines.append(
+            f"[bold {ACCENT_SKY}]{label:<6}[/] [{ACCENT_MUTED}]now[/] {current_value:.1f}{suffix}  [{ACCENT_MUTED}]peak[/] {peak_text}  [{ACCENT_MUTED}]trend[/] {describe_trend(values, label.lower())}"
+        )
+
+    io_history = history_values(metric_history, "io")
+    if storage_io.get("available"):
+        available_io = [value for value in io_history if value is not None]
+        peak_io = f"{max(available_io):.1f}%" if available_io else "n/a"
+        lines.append(
+            f"[bold {ACCENT_SKY}]I/O   [/] [{ACCENT_MUTED}]now[/] {clamp_float(storage_io.get('util_percent')):.1f}%  [{ACCENT_MUTED}]peak[/] {peak_io}  [{ACCENT_MUTED}]trend[/] {describe_trend(io_history, 'io')}"
+        )
+    else:
+        lines.append(f"[bold {ACCENT_SKY}]I/O   [/] [{ACCENT_MUTED}]now[/] unavailable  [{ACCENT_MUTED}]peak[/] n/a  [{ACCENT_MUTED}]trend[/] warming")
+
+    return "\n".join(lines)
+
+
+def render_monitor_storage(snapshot: dict[str, Any]) -> str:
+    server = snapshot["server"]
+    lines = [
+        f"[bold {ACCENT_GOLD}]Storage and Device[/]",
+        f"[{ACCENT_MUTED}]Filesystem headroom and disk saturation detail.[/]",
+        "",
+    ]
+
+    if not server["ok"]:
+        lines.append(f"[bold {ACCENT_ROSE}]Storage data unavailable:[/] {format_error_text(server['error'])}")
+        return "\n".join(lines)
+
+    data = server["data"]
+    disk = data.get("checks", {}).get("disk_space", {})
+    storage_io = data.get("storage_io", {})
+    lines.extend(
+        [
+            f"[{ACCENT_MUTED}]Path[/]        {escape_markup(disk.get('path', 'n/a'))}",
+            f"[{ACCENT_MUTED}]FS[/]          {escape_markup(disk.get('filesystem', 'n/a'))}  [{ACCENT_MUTED}]used[/] {disk.get('used_percent', 0)}%  [{ACCENT_MUTED}]free[/] {format_gb_from_kb(disk.get('available_kb', 0))}",
+            f"[{ACCENT_MUTED}]Status[/]      {format_state(disk.get('status', 'unavailable'))}",
+            "",
+        ]
+    )
+
+    if storage_io.get("available"):
+        lines.extend(
+            [
+                f"[{ACCENT_MUTED}]Device[/]      {escape_markup(storage_io.get('device', 'n/a'))}  [{ACCENT_MUTED}]source[/] {escape_markup(storage_io.get('source', 'n/a'))}",
+                f"[{ACCENT_MUTED}]Ops/s[/]       read {storage_io.get('read_ops_per_sec', 0)}  write {storage_io.get('write_ops_per_sec', 0)}",
+                f"[{ACCENT_MUTED}]KB/s[/]        read {storage_io.get('read_kbps', 0)}  write {storage_io.get('write_kbps', 0)}",
+                f"[{ACCENT_MUTED}]Await[/]       {storage_io.get('await_ms', 0)} ms  [{ACCENT_MUTED}]util[/] {storage_io.get('util_percent', 0)}%",
+                f"[{ACCENT_MUTED}]I/O[/]         {format_state(storage_io.get('status', 'unavailable'))}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"[{ACCENT_MUTED}]Device[/]      n/a",
+                f"[{ACCENT_MUTED}]I/O[/]         {format_state(storage_io.get('status', 'unavailable'))}",
+                f"[{ACCENT_MUTED}]Note[/]        install [bold {ACCENT_GOLD}]sysstat/iostat[/] to expose live read/write rates and disk wait.",
+            ]
+        )
 
     return "\n".join(lines)
 
@@ -1907,6 +2129,15 @@ def create_app(
             height: 1fr;
         }
 
+        #monitor-grid {
+            layout: grid;
+            grid-size: 2 2;
+            grid-columns: 7fr 5fr;
+            grid-rows: 1fr 1fr;
+            grid-gutter: 1 2;
+            height: 1fr;
+        }
+
         .table-detail {
             layout: vertical;
             height: 1fr;
@@ -1966,6 +2197,13 @@ def create_app(
         #player-pulse-pane,
         #alerts-pane {
             min-height: 16;
+        }
+
+        #monitor-pressure-pane,
+        #monitor-process-pane,
+        #monitor-trends-pane,
+        #monitor-storage-pane {
+            min-height: 14;
         }
 
         #accounts-table {
@@ -2215,10 +2453,11 @@ def create_app(
             ("j", "cancel_selected_schedule", "Cancel Job"),
             ("k", "validate_config", "Validate"),
             ("1", "show_overview", "Overview"),
-            ("2", "show_accounts", "Accounts"),
-            ("3", "show_backups", "Backups"),
-            ("4", "show_config", "Config"),
-            ("5", "show_operations", "Ops"),
+            ("2", "show_monitor", "Monitor"),
+            ("3", "show_accounts", "Accounts"),
+            ("4", "show_backups", "Backups"),
+            ("5", "show_config", "Config"),
+            ("6", "show_operations", "Ops"),
             ("t", "toggle_theme", "Theme"),
         ]
 
@@ -2257,6 +2496,12 @@ def create_app(
                                 yield Static("", id="metrics-pane", classes="panel accent-panel")
                                 yield Static("", id="player-pulse-pane", classes="panel hero-panel")
                                 yield Static("", id="alerts-pane", classes="panel accent-panel")
+                        with Container(id="monitor-view", classes="view hidden"):
+                            with Container(id="monitor-grid"):
+                                yield Static("", id="monitor-pressure-pane", classes="panel hero-panel")
+                                yield Static("", id="monitor-process-pane", classes="panel accent-panel")
+                                yield Static("", id="monitor-trends-pane", classes="panel hero-panel")
+                                yield Static("", id="monitor-storage-pane", classes="panel accent-panel")
                         with Container(id="accounts-view", classes="view hidden"):
                             with Horizontal(id="accounts-layout"):
                                 with Vertical(classes="panel table-panel", id="accounts-table-layout"):
@@ -2312,7 +2557,7 @@ def create_app(
             self.add_class(f"theme-{self.theme_name}")
 
         def apply_view_state(self) -> None:
-            for view_name in ("overview", "accounts", "backups", "config", "operations"):
+            for view_name in ("overview", "monitor", "accounts", "backups", "config", "operations"):
                 widget = self.query_one(f"#{view_name}-view", Container)
                 if view_name == self.active_view:
                     widget.remove_class("hidden")
@@ -2371,6 +2616,10 @@ def create_app(
             self.query_one("#metrics-pane", Static).update(render_metrics_panel(snapshot, self.metric_history, self.refresh_interval))
             self.query_one("#player-pulse-pane", Static).update(render_player_pulse(snapshot, self.metric_history, self.refresh_interval))
             self.query_one("#alerts-pane", Static).update(render_alerts_panel(snapshot))
+            self.query_one("#monitor-pressure-pane", Static).update(render_monitor_pressure(snapshot, self.metric_history, self.refresh_interval))
+            self.query_one("#monitor-process-pane", Static).update(render_monitor_processes(snapshot))
+            self.query_one("#monitor-trends-pane", Static).update(render_monitor_trends(snapshot, self.metric_history, self.refresh_interval))
+            self.query_one("#monitor-storage-pane", Static).update(render_monitor_storage(snapshot))
             self.query_one("#config-pane", Static).update(render_config_panel(snapshot))
             self.query_one("#logs-pane", Static).update(render_logs_panel(snapshot))
             self.query_one("#update-pane", Static).update(render_update_panel(snapshot, self.update_plan_data))
@@ -2583,6 +2832,10 @@ def create_app(
 
         def action_show_overview(self) -> None:
             self.active_view = "overview"
+            self.apply_view_state()
+
+        def action_show_monitor(self) -> None:
+            self.active_view = "monitor"
             self.apply_view_state()
 
         def action_show_accounts(self) -> None:
