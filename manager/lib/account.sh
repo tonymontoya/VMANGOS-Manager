@@ -19,10 +19,7 @@ ACCOUNT_PASSWORD_VALUE=""
 account_load_config() {
     [[ "$ACCOUNT_CONFIG_LOADED" == "1" ]] && return 0
 
-    config_load "$CONFIG_FILE" || {
-        log_error "Failed to load configuration"
-        return 1
-    }
+    config_load "$CONFIG_FILE" || return 1
 
     ACCOUNT_DB_HOST="${CONFIG_DATABASE_HOST:-127.0.0.1}"
     ACCOUNT_DB_PORT="${CONFIG_DATABASE_PORT:-3306}"

@@ -158,6 +158,12 @@ config_load() {
         log_error "Configuration file not found: $config_file"
         return 1
     fi
+
+    if [[ ! -r "$config_file" ]]; then
+        log_error "Configuration file is not readable: $config_file"
+        log_error "Run with sudo or adjust file ownership/permissions"
+        return 1
+    fi
     
     local perms
     perms=$(get_file_permissions "$config_file" 2>/dev/null || echo "644")

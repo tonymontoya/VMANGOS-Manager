@@ -992,6 +992,26 @@ test_cli_account_rejects_positional_password() {
     return $all_passed
 }
 
+test_cli_account_reports_unreadable_config() {
+    local all_passed=0
+    local temp_dir config_file output
+    temp_dir=$(mktemp -d)
+    config_file="$temp_dir/manager.conf"
+
+    create_test_config "$config_file"
+    chmod 000 "$config_file"
+
+    output=$(bash "$MANAGER_DIR/bin/vmangos-manager" -c "$config_file" account list 2>&1 || true)
+
+    assert_true "[[ \$output == *'Configuration file is not readable:'* ]]" "CLI account reports unreadable config path" || all_passed=1
+    assert_true "[[ \$output == *'Run with sudo or adjust file ownership/permissions'* ]]" "CLI account suggests sudo or permission fix" || all_passed=1
+    assert_true "[[ \$output != *'Check database connectivity and credentials'* ]]" "CLI account does not misreport unreadable config as DB failure" || all_passed=1
+
+    chmod 600 "$config_file"
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
 test_update_check_text_output() {
     # shellcheck source=../lib/update.sh
     source "$LIB_DIR/update.sh"
@@ -3582,6 +3602,7 @@ main() {
     run_test "Account: Operation queries" test_account_operations_generate_expected_queries
     run_test "Account: Env not forwarded" test_account_password_env_not_forwarded_to_python
     run_test "Account: List JSON" test_account_list_json_output
+    run_test "Account: Unreadable config" test_cli_account_reports_unreadable_config
     run_test "CLI: Account rejects positional password" test_cli_account_rejects_positional_password
     run_test "Update: Text output" test_update_check_text_output
     run_test "Update: JSON output" test_update_check_json_output
