@@ -59,7 +59,7 @@ VIEW_SUMMARIES = {
     "accounts": "Provision, secure, and moderate accounts without leaving the console.",
     "backups": "Inspect backup inventory and queue protection workflows.",
     "config": "Validate Manager wiring against the host it is operating.",
-    "operations": "Run logs, schedule, and update workflows from one surface.",
+    "operations": "Review the maintenance queue and preflight risky change windows.",
 }
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9]{2,32}$")
@@ -455,12 +455,12 @@ def view_command_tokens(active_view: str) -> list[tuple[str, str]]:
         ]
     if active_view == "operations":
         return [
-            ("l", "rotate logs"),
-            ("T", "test logs"),
             ("h", "honor job"),
             ("m", "restart job"),
-            ("P", "update plan"),
             ("j", "cancel job"),
+            ("P", "update plan"),
+            ("T", "test logs"),
+            ("l", "rotate logs"),
         ]
     if active_view == "config":
         return [("k", "validate config")]
@@ -1337,7 +1337,12 @@ def format_update_assessment(value: Any) -> str:
 
 def render_logs_panel(snapshot: dict[str, Any]) -> str:
     logs = snapshot.get("logs", {})
-    lines = [f"[bold {ACCENT_GOLD}]Logs Health[/]", "", f"[{ACCENT_MUTED}]Rotation hygiene, retention, and storage pressure.[/]", ""]
+    lines = [
+        f"[bold {ACCENT_GOLD}]Maintenance Guardrails[/]",
+        "",
+        f"[{ACCENT_MUTED}]Log hygiene and storage pressure before a maintenance window.[/]",
+        "",
+    ]
 
     if not logs.get("ok"):
         lines.append(f"[bold {ACCENT_ROSE}]Logs snapshot unavailable:[/] {format_error_text(logs.get('error', 'unknown error'))}")
@@ -1348,15 +1353,20 @@ def render_logs_panel(snapshot: dict[str, Any]) -> str:
     log_counts = data.get("logs", {})
     disk = data.get("disk", {})
     policy = data.get("policy", {})
+    config_state = "healthy" if config.get("present") and config.get("in_sync") else "warning"
+    sensitive_state = "healthy" if log_counts.get("sensitive_permissions_ok") else "warning"
 
     lines.extend(
         [
-            f"[{ACCENT_MUTED}]Health[/]        {format_state(data.get('status', 'unavailable'))}",
-            f"[{ACCENT_MUTED}]Config[/]        present={config.get('present', False)}  in_sync={config.get('in_sync', False)}",
-            f"[{ACCENT_MUTED}]Sensitive[/]     perms_ok={log_counts.get('sensitive_permissions_ok', False)}",
+            f"[{ACCENT_MUTED}]Scope[/]         supporting context only; the queue lives below.",
+            f"[{ACCENT_MUTED}]Logs[/]          {format_state(data.get('status', 'unavailable'))}",
+            f"[{ACCENT_MUTED}]Rotation[/]      {format_state(config_state)}  present={config.get('present', False)}  in_sync={config.get('in_sync', False)}",
+            f"[{ACCENT_MUTED}]Sensitive[/]     {format_state(sensitive_state)}  perms_ok={log_counts.get('sensitive_permissions_ok', False)}",
             f"[{ACCENT_MUTED}]Files[/]         active={log_counts.get('active_files', 0)}  rotated={log_counts.get('rotated_files', 0)}",
-            f"[{ACCENT_MUTED}]Disk[/]          {disk.get('used_percent', 0)}% used  free {format_gb_from_kb(disk.get('available_kb', 0))}",
+            f"[{ACCENT_MUTED}]Headroom[/]      {disk.get('used_percent', 0)}% used  free {format_gb_from_kb(disk.get('available_kb', 0))}",
             f"[{ACCENT_MUTED}]Retention[/]     max={policy.get('max_size', 'n/a')}  min={policy.get('min_size', 'n/a')}",
+            "",
+            f"[{ACCENT_MUTED}]Actions[/]       [bold {ACCENT_GOLD}]T[/] test logs  [bold {ACCENT_GOLD}]l[/] rotate logs",
         ]
     )
     return "\n".join(lines)
@@ -1365,13 +1375,19 @@ def render_logs_panel(snapshot: dict[str, Any]) -> str:
 def render_update_panel(snapshot: dict[str, Any], update_plan_data: dict[str, Any] | None = None) -> str:
     check = snapshot.get("update_check", {})
     inspect = snapshot.get("update_inspect", {})
-    lines = [f"[bold {ACCENT_GOLD}]Update State[/]", "", f"[{ACCENT_MUTED}]Git tracking plus database-impact awareness.[/]", ""]
+    lines = [
+        f"[bold {ACCENT_GOLD}]Update Readiness[/]",
+        "",
+        f"[{ACCENT_MUTED}]Repository drift and database impact before risky code changes.[/]",
+        "",
+    ]
 
     if check.get("ok"):
         data = check.get("data", {})
+        repo_state = "warning" if data.get("update_available") or data.get("worktree_dirty") else "healthy"
         lines.extend(
             [
-                f"[{ACCENT_MUTED}]State[/]         {format_state('warning' if data.get('update_available') else 'healthy')}",
+                f"[{ACCENT_MUTED}]Repo[/]          {format_state(repo_state)}",
                 f"[{ACCENT_MUTED}]Branch[/]        {escape_markup(data.get('branch', 'n/a'))}",
                 f"[{ACCENT_MUTED}]Tracking[/]      {escape_markup(data.get('remote_ref', 'n/a'))}",
                 f"[{ACCENT_MUTED}]Behind[/]        {data.get('commits_behind', 0)}  [{ACCENT_MUTED}]dirty[/] {data.get('worktree_dirty', False)}",
@@ -1397,7 +1413,7 @@ def render_update_panel(snapshot: dict[str, Any], update_plan_data: dict[str, An
         lines.append(f"[{ACCENT_MUTED}]Inspect unavailable:[/] {format_error_text(inspect.get('error', 'no update metadata'))}")
 
     if update_plan_data:
-        lines.extend(["", f"[bold {ACCENT_SKY}]Plan[/]"])
+        lines.extend(["", f"[bold {ACCENT_SKY}]Plan Snapshot[/]"])
         warning_text = str(update_plan_data.get("warning", "") or "")
         if warning_text:
             lines.append(f"[{ACCENT_MUTED}]Warning[/]      {escape_markup(truncate_text(warning_text, 56))}")
@@ -1408,6 +1424,14 @@ def render_update_panel(snapshot: dict[str, Any], update_plan_data: dict[str, An
                 lines.append(f"[{ACCENT_MUTED}]Then[/]         {escape_markup(truncate_text(steps[1], 56))}")
         else:
             lines.append(f"[{ACCENT_MUTED}]Next[/]         no pending plan steps")
+    else:
+        lines.extend(
+            [
+                "",
+                f"[bold {ACCENT_SKY}]Plan Snapshot[/]",
+                f"[{ACCENT_MUTED}]Next[/]         [bold {ACCENT_GOLD}]P[/] refresh the update plan before a change window.",
+            ]
+        )
 
     return "\n".join(lines)
 
@@ -1426,21 +1450,18 @@ def schedule_label(schedule: dict[str, Any]) -> str:
 def render_schedule_details(
     schedule: dict[str, Any] | None,
     total_schedules: int,
-    last_action: str = "",
-    action_tone: str = "info",
 ) -> str:
-    tone_label, tone_color = ACTION_STYLES.get(action_tone, ACTION_STYLES["info"])
+    queue_label = f"{total_schedules} queued job{'s' if total_schedules != 1 else ''}"
     if not schedule:
         return "\n".join(
             [
-                f"[bold {ACCENT_GOLD}]Job Details[/]",
+                f"[bold {ACCENT_GOLD}]Selected Job[/]",
                 "",
-                f"[{ACCENT_MUTED}]Selection[/]     choose a job row to inspect or cancel it.",
+                f"[{ACCENT_MUTED}]Selection[/]     choose a job row from the queue to inspect or cancel it.",
+                f"[{ACCENT_MUTED}]Queue[/]         {queue_label}",
                 "",
-                f"[{ACCENT_MUTED}]Ops Result[/]    [bold {tone_color}]{tone_label}[/]",
-                f"[{ACCENT_MUTED}]                {escape_markup(truncate_text(last_action or 'operations ready', 60))}",
-                "",
-                f"[{ACCENT_MUTED}]Action[/]        cancel the selected job from here.",
+                f"[{ACCENT_MUTED}]Create[/]        [bold {ACCENT_GOLD}]h[/] honor job  [bold {ACCENT_GOLD}]m[/] restart job",
+                f"[{ACCENT_MUTED}]Cancel[/]        [bold {ACCENT_GOLD}]j[/] cancel the selected job",
             ]
         )
 
@@ -1448,19 +1469,18 @@ def render_schedule_details(
     announce_message = str(schedule.get("announce_message", "") or "none")
     return "\n".join(
         [
-            f"[bold {ACCENT_GOLD}]Job Details[/]",
+            f"[bold {ACCENT_GOLD}]Selected Job[/]",
             "",
+            f"[{ACCENT_MUTED}]Queue[/]         {queue_label}",
             f"[{ACCENT_MUTED}]Job ID[/]        {escape_markup(schedule.get('id', 'n/a'))}",
             f"[{ACCENT_MUTED}]Type[/]          {escape_markup(schedule.get('job_type', 'n/a'))}",
+            f"[{ACCENT_MUTED}]Cadence[/]       {escape_markup(schedule.get('schedule_type', 'n/a'))}",
             f"[{ACCENT_MUTED}]Schedule[/]      {escape_markup(schedule_label(schedule))}",
             f"[{ACCENT_MUTED}]Next Run[/]      {escape_markup(schedule.get('next_run', 'n/a') or 'n/a')}",
             f"[{ACCENT_MUTED}]Warnings[/]      {escape_markup(warnings)}",
             f"[{ACCENT_MUTED}]Announce[/]      {escape_markup(announce_message)}",
             "",
-            f"[{ACCENT_MUTED}]Ops Result[/]    [bold {tone_color}]{tone_label}[/]",
-            f"[{ACCENT_MUTED}]                {escape_markup(truncate_text(last_action or 'operations ready', 60))}",
-            "",
-            f"[{ACCENT_MUTED}]Action[/]        cancel this job if the schedule is no longer desired.",
+            f"[{ACCENT_MUTED}]Cancel[/]        [bold {ACCENT_GOLD}]j[/] remove this job if the schedule is no longer desired.",
         ]
     )
 
@@ -2107,7 +2127,7 @@ def create_app(
                                     yield Static("", id="logs-pane", classes="panel accent-panel")
                                     yield Static("", id="update-pane", classes="panel hero-panel")
                                 with Vertical(classes="panel table-panel table-detail", id="schedules-layout"):
-                                    yield Static("[b]Scheduled Jobs[/b]", classes="table-detail-title")
+                                    yield Static("[b]Maintenance Queue[/b]", classes="table-detail-title")
                                     with Horizontal(classes="table-detail-body"):
                                         yield DataTable(id="schedules-table", classes="detail-table")
                                         yield Static("", id="schedule-details", classes="detail-pane")
@@ -2312,7 +2332,7 @@ def create_app(
                 self.selected_schedule_id = ""
 
             self.query_one("#schedule-details", Static).update(
-                render_schedule_details(selected_schedule, len(schedules), self.last_action, self.action_tone)
+                render_schedule_details(selected_schedule, len(schedules))
             )
 
         def update_selected_account(self, row_key: Any) -> None:
@@ -2343,7 +2363,7 @@ def create_app(
                 schedule = schedules[0]
             self.selected_schedule_id = str(schedule.get("id", "")) if schedule else ""
             self.query_one("#schedule-details", Static).update(
-                render_schedule_details(schedule, len(schedules), self.last_action, self.action_tone)
+                render_schedule_details(schedule, len(schedules))
             )
 
         def open_command_form(
@@ -2748,7 +2768,7 @@ def create_app(
             self.query_one("#service-pane", Static).update(render_service_panel(self.snapshot, self.active_view))
             if self.active_view == "operations":
                 self.query_one("#schedule-details", Static).update(
-                    render_schedule_details(self.selected_schedule(), len(self.snapshot.get("schedules", [])), self.last_action, self.action_tone)
+                    render_schedule_details(self.selected_schedule(), len(self.snapshot.get("schedules", [])))
                 )
                 self.query_one("#update-pane", Static).update(render_update_panel(self.snapshot, self.update_plan_data))
 
