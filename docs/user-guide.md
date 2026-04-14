@@ -6,7 +6,7 @@ It shows you how to:
 
 - bring Manager onto a fresh or existing VMaNGOS host
 - launch the dashboard and understand each screen
-- use the built-in workflows for accounts, backups, config checks, logs, schedules, and update planning
+- use the built-in workflows for monitoring, accounts, backups, config checks, logs, schedules, and update planning
 - settle into a practical daily operating routine
 
 All screenshots in this guide are generated from the shipped dashboard renderer against a reproducible demo snapshot.
@@ -72,9 +72,10 @@ Then launch the operator console:
 sudo /opt/mangos/manager/bin/vmangos-manager dashboard --refresh 2
 ```
 
-The dashboard is organized into five views:
+The dashboard is organized into six views:
 
 - `Overview`
+- `Monitor`
 - `Accounts`
 - `Backups`
 - `Config`
@@ -101,10 +102,11 @@ If a panel starts mixing realm-wide counters into a selected-item view, that is 
 If you are new to Manager, the best first pass is simple:
 
 1. Start in `Overview` and make sure the host and services look sane.
-2. Visit `Config` and verify Manager is reading the right install root, service names, and databases.
-3. Visit `Backups` and confirm the protection story before you trust any update or maintenance workflow.
-4. Visit `Accounts` so you know where user actions live before you need them under pressure.
-5. Finish in `Ops` and review the maintenance queue plus change-window readiness.
+2. Visit `Monitor` when you want to understand host pressure, disk saturation, or realm process footprint in more detail.
+3. Visit `Config` and verify Manager is reading the right install root, service names, and databases.
+4. Visit `Backups` and confirm the protection story before you trust any update or maintenance workflow.
+5. Visit `Accounts` so you know where user actions live before you need them under pressure.
+6. Finish in `Ops` and review the maintenance queue plus change-window readiness.
 
 ## Overview View
 
@@ -115,7 +117,7 @@ This is the screen you leave open when you want live awareness of the realm.
 What it is best at:
 
 - checking whether `auth` and `world` are healthy
-- seeing CPU, memory, load, disk, player count, and short-term trends
+- seeing headline CPU, memory, load, disk, player count, and short-term trends
 - spotting whether players are actually online and whether staff are present
 - jumping quickly into stop, start, restart, backup, verify, and config validation actions
 
@@ -124,18 +126,45 @@ Use this view when:
 - you just logged into the host
 - you are validating that a restart actually settled
 - you want a top-like operational snapshot instead of several separate shell commands
+- you want to know whether to worry before you move into the deeper `Monitor` screen
 
 Panel roles in this view:
 
 - `Realm Services` is the fast service and DB pulse plus per-service footprint
-- `Host Metrics` is the machine-level pressure and capacity panel only
+- `Host Metrics` is the machine-level headline pressure panel only
 - `Player Pulse` is the summary-first population panel: online count, trend, player/staff mix, and GM coverage
 - `Alerts and Events` is the fast-read maintenance and risk panel
+
+If `Overview` tells you something is off but not why, switch to `Monitor`. That split is intentional: `Overview` stays summary-first, while `Monitor` carries the denser diagnostic surface.
 
 The full online roster is still available, but it is now a drill-down instead of taking over summary space:
 
 - press `o` from `Overview` to open the live online roster
 - press `Enter` from that roster to jump straight into the selected account in `Accounts`
+
+## Monitor View
+
+![Monitor view](assets/dashboard-monitor.svg)
+
+Monitor is the diagnosis screen. It exists so `Overview` can stay fast and readable instead of trying to become a cramped terminal copy of `htop`, `df`, and `iostat` all at once.
+
+Use it when you need to:
+
+- explain CPU, memory, load, disk, or I/O pressure instead of just noticing it
+- compare current values against the recent monitoring window
+- inspect `auth` and `world` process footprint in one place
+- understand whether storage contention is likely driving realm instability
+
+Read it in this order:
+
+1. Start with `Pressure Deck` for the current host picture plus short rolling trends.
+2. Move to `Realm Process Footprint` to check whether `auth` or `world` is the source of pressure.
+3. Use `Trend Ledger` to compare current values against the recent peak window.
+4. Finish with `Storage and Device` when disk saturation, filesystem headroom, or missing `iostat` tooling might explain what you are seeing.
+
+This screen is intentionally denser than `Overview`, but it still follows the same rule: each panel has a clear job. The goal is better diagnosis, not more noise.
+
+If you have room, run the dashboard in a taller terminal before you camp on `Monitor`. It makes the trend and storage panels easier to absorb at a glance.
 
 ## Accounts View
 
@@ -153,7 +182,7 @@ Use the Accounts view when you need to:
 
 Recommended flow:
 
-1. Move to `Accounts` with `2`.
+1. Move to `Accounts` with `3`.
 2. Highlight the account you care about.
 3. Use the command rail actions for this view: `c`, `p`, `g`, `n`, `u`.
 4. Let the dashboard feed you back into the updated table state after the action completes.
@@ -279,10 +308,11 @@ The goal is not to make updates look risk-free. The goal is to surface the impor
 If you want a stable realm without living in the CLI all day, this is a good default rhythm:
 
 1. Open `Overview` and confirm services, players, and host pressure look sane.
-2. Check `Backups` and make sure recent protection exists before risky work.
-3. Visit `Operations` when you need to understand queued maintenance or preflight a risky change window.
-4. Use `Accounts` for user-facing admin changes instead of one-off SQL.
-5. Use `Config` whenever the host wiring changes or Manager behavior looks suspicious.
+2. Use `Monitor` when `Overview` shows pressure and you need the deeper host or process explanation.
+3. Check `Backups` and make sure recent protection exists before risky work.
+4. Visit `Operations` when you need to understand queued maintenance or preflight a risky change window.
+5. Use `Accounts` for user-facing admin changes instead of one-off SQL.
+6. Use `Config` whenever the host wiring changes or Manager behavior looks suspicious.
 
 ## When To Drop To The CLI
 
@@ -299,7 +329,8 @@ Use the dashboard for everyday operation, then drop to the CLI for the narrower 
 
 | Area | Use the dashboard for | Use the CLI for |
 | --- | --- | --- |
-| Server | status, start, stop, restart | text watch mode, raw JSON output |
+| Server | summary status, start, stop, restart | text watch mode, raw JSON output |
+| Monitor | deeper host diagnostics, trend comparison, process footprint, storage saturation detail | ad hoc host-native tooling and custom one-off investigation |
 | Accounts | account inventory, create, password reset, GM changes, ban, unban, account visibility | scripted bulk workflows |
 | Backups | backup readiness, inventory, backup now, verify, restore dry-run, timer visibility, daily/weekly timer create | cleanup, timer removal, live restore |
 | Config | validation plus read-only configuration wiring summary | config creation, detect, show, and file editing |

@@ -2069,11 +2069,16 @@ for index, cpu, memory, load, disk, players, io in [
 
 payload = {
     "banner": module.render_action_banner("accounts", snapshot, "backup completed", "success", 2),
+    "monitor_banner": module.render_action_banner("monitor", snapshot, "metrics sampled", "info", 2),
     "ops_banner": module.render_action_banner("operations", snapshot, "update plan refreshed", "warning", 2),
     "sidebar": module.render_sidebar("operations", "backup completed", snapshot, 2),
     "overview_command_rail": module.render_command_rail("overview"),
     "command_rail": module.render_command_rail("operations"),
     "metrics": module.render_metrics_panel(snapshot, history, 2),
+    "monitor_pressure": module.render_monitor_pressure(snapshot, history, 2),
+    "monitor_processes": module.render_monitor_processes(snapshot),
+    "monitor_trends": module.render_monitor_trends(snapshot, history, 2),
+    "monitor_storage": module.render_monitor_storage(snapshot),
     "player_pulse": module.render_player_pulse(snapshot, history, 2),
     "alerts": module.render_alerts_panel(snapshot),
     "backups": module.render_backups_summary(snapshot, {"file": "backup-20260413-213000.tar.gz", "timestamp": "2026-04-13T21:30:00+00:00", "size_bytes": 52428800, "created_by": "manager", "databases": ["auth", "characters", "mangos", "logs"]}),
@@ -2087,6 +2092,16 @@ payload = {
         {"id": "20260413220000-1111", "job_type": "restart", "schedule_type": "weekly", "time": "04:00", "day": "Sun", "timezone": "UTC", "warnings": "30,15,5,1", "announce_message": "Weekly maintenance", "next_run": "Sun 2026-04-19 04:00:00 UTC"},
         1,
     ),
+    "monitor_storage_missing": module.render_monitor_storage({
+        **snapshot,
+        "server": {
+            "ok": True,
+            "data": {
+                **snapshot["server"]["data"],
+                "storage_io": {"available": False, "status": "unavailable"},
+            },
+        },
+    }),
 }
 
 print(json.dumps(payload, sort_keys=True))
@@ -2096,6 +2111,8 @@ PY
     compact_output=$(printf '%s' "$output" | tr -d '[:space:]')
     banner_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["banner"])')
     compact_banner=$(printf '%s' "$banner_output" | tr -d '[:space:]')
+    monitor_banner_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["monitor_banner"])')
+    compact_monitor_banner=$(printf '%s' "$monitor_banner_output" | tr -d '[:space:]')
     ops_banner_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ops_banner"])')
     compact_ops_banner=$(printf '%s' "$ops_banner_output" | tr -d '[:space:]')
     sidebar_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sidebar"])')
@@ -2106,6 +2123,16 @@ PY
     compact_command=$(printf '%s' "$command_output" | tr -d '[:space:]')
     metrics_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["metrics"])')
     compact_metrics=$(printf '%s' "$metrics_output" | tr -d '[:space:]')
+    monitor_pressure_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["monitor_pressure"])')
+    compact_monitor_pressure=$(printf '%s' "$monitor_pressure_output" | tr -d '[:space:]')
+    monitor_processes_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["monitor_processes"])')
+    compact_monitor_processes=$(printf '%s' "$monitor_processes_output" | tr -d '[:space:]')
+    monitor_trends_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["monitor_trends"])')
+    compact_monitor_trends=$(printf '%s' "$monitor_trends_output" | tr -d '[:space:]')
+    monitor_storage_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["monitor_storage"])')
+    compact_monitor_storage=$(printf '%s' "$monitor_storage_output" | tr -d '[:space:]')
+    monitor_storage_missing_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["monitor_storage_missing"])')
+    compact_monitor_storage_missing=$(printf '%s' "$monitor_storage_missing_output" | tr -d '[:space:]')
     player_pulse_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["player_pulse"])')
     compact_player_pulse=$(printf '%s' "$player_pulse_output" | tr -d '[:space:]')
     alerts_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["alerts"])')
@@ -2128,11 +2155,17 @@ PY
     compact_schedule=$(printf '%s' "$schedule_output" | tr -d '[:space:]')
 
     assert_true "[[ \$compact_banner == *'VMaNGOSManager'* && \$compact_banner == *'realmconsole'* && \$compact_banner == *'Accounts'* && \$compact_banner == *'lastrefresh[/]'* && \$compact_banner == *'status[/][bold#34d399]READY'* && \$compact_banner == *'ThisView[/]Worktheselected-accountadminflowforprovisioning,access,andmoderation.'* ]]" "dashboard action banner exposes app framing, active view, and result state" || all_passed=1
+    assert_true "[[ \$compact_monitor_banner == *'Monitor'* && \$compact_monitor_banner == *'status[/][bold#7dd3fc]LIVE'* && \$compact_monitor_banner == *'ThisView[/]Diagnosehostpressurewithdeepertrends,devicesaturation,andrealmprocessfootprint.'* ]]" "dashboard monitor banner frames the deeper diagnostics view explicitly" || all_passed=1
     assert_true "[[ \$compact_ops_banner == *'Operations'* && \$compact_ops_banner == *'status[/][bold#f59e0b]CHECK'* && \$compact_ops_banner == *'ThisView[/]Reviewthemaintenancequeueandpreflightriskychangewindows.'* ]]" "dashboard operations banner frames the screen as maintenance queue plus change-window preflight" || all_passed=1
-    assert_true "[[ \$compact_sidebar == *'VMaNGOSManager'* && \$compact_sidebar == *'RealmPulse'* && \$compact_sidebar == *'Updated[/]'* && \$compact_sidebar == *'Players[/]1online'* && \$compact_sidebar == *'Backups[/]3known'* && \$compact_sidebar != *'ActiveHotkeys'* ]]" "dashboard sidebar stays focused on navigation and realm pulse" || all_passed=1
-    assert_true "[[ \$compact_overview_command == *'ThisView[/][bold#f59e0b]o[/]roster'* && \$compact_overview_command == *'[bold#f59e0b]k[/]validateconfig'* ]]" "dashboard overview command rail exposes roster drilldown and core actions" || all_passed=1
-    assert_true "[[ \$compact_command == *'Navigate[/][bold#f59e0b]1[/]overview'* && \$compact_command == *'Global[/][bold#f59e0b]r[/]refresh'* && \$compact_command == *'ThisView[/][bold#f59e0b]h[/]runjob'* && \$compact_command == *'[bold#f59e0b]j[/]canceljob'* && \$compact_command == *'[bold#f59e0b]P[/]updateplan'* && \$compact_command == *'[bold#f59e0b]l[/]rotatelogs'* ]]" "dashboard command rail provides the canonical contextual action surface" || all_passed=1
+    assert_true "[[ \$compact_sidebar == *'VMaNGOSManager'* && \$compact_sidebar == *'Monitor'* && \$compact_sidebar == *'RealmPulse'* && \$compact_sidebar == *'Updated[/]'* && \$compact_sidebar == *'Players[/]1online'* && \$compact_sidebar == *'Backups[/]3known'* && \$compact_sidebar != *'ActiveHotkeys'* ]]" "dashboard sidebar stays focused on navigation and realm pulse while exposing the Monitor module" || all_passed=1
+    assert_true "[[ \$compact_overview_command == *'Navigate[/][bold#f59e0b]1[/]overview'* && \$compact_overview_command == *'[bold#f59e0b]2[/]monitor'* && \$compact_overview_command == *'ThisView[/][bold#f59e0b]o[/]roster'* && \$compact_overview_command == *'[bold#f59e0b]k[/]validateconfig'* ]]" "dashboard overview command rail exposes monitor navigation plus core actions" || all_passed=1
+    assert_true "[[ \$compact_command == *'Navigate[/][bold#f59e0b]1[/]overview'* && \$compact_command == *'[bold#f59e0b]2[/]monitor'* && \$compact_command == *'[bold#f59e0b]6[/]ops'* && \$compact_command == *'Global[/][bold#f59e0b]r[/]refresh'* && \$compact_command == *'ThisView[/][bold#f59e0b]h[/]runjob'* && \$compact_command == *'[bold#f59e0b]j[/]canceljob'* && \$compact_command == *'[bold#f59e0b]P[/]updateplan'* && \$compact_command == *'[bold#f59e0b]l[/]rotatelogs'* ]]" "dashboard command rail provides the canonical contextual action surface across six modules" || all_passed=1
     assert_true "[[ \$compact_metrics == *'HostMetrics'* && \$compact_metrics == *'Hostpressure,capacity,andtrend.'* && \$compact_metrics == *'Window[/]4samples/~6s'* && \$compact_metrics == *'CPU[/]31.5%/8c'* && \$compact_metrics == *'Memory[/]48.0%/3.0G/6.0G'* && \$compact_metrics == *'Load[/]1m0.62'* && \$compact_metrics == *'Disk[/]24%'* && \$compact_metrics == *'I/O[/]33.0%'* && \$compact_metrics != *'Players[/]'* && \$compact_metrics != *'Logs[/]'* ]]" "dashboard metrics panel stays scoped to host pressure and trends while improving capacity density" || all_passed=1
+    assert_true "[[ \$compact_monitor_pressure == *'PressureDeck'* && \$compact_monitor_pressure == *'DeeperhostdiagnosticsforCPU,memory,load,disk,andI/O.'* && \$compact_monitor_pressure == *'CPU[/]31.5%/8cores'* && \$compact_monitor_pressure == *'Memory[/]48.0%/3.0GBof6.0GB'* && \$compact_monitor_pressure == *'Load[/]1m0.625m0.5515m0.44'* && \$compact_monitor_pressure == *'Disk[/]24%used/6.0GBfree'* && \$compact_monitor_pressure == *'I/O[/]33.0%util/1.4:2.6ops'* && \$compact_monitor_pressure != *'Players[/]'* ]]" "dashboard monitor pressure panel presents denser host diagnostics without leaking non-monitor data" || all_passed=1
+    assert_true "[[ \$compact_monitor_processes == *'RealmProcessFootprint'* && \$compact_monitor_processes == *'Auth[/][bold#2dd4bf]active[/]'* && \$compact_monitor_processes == *'World[/][bold#f59e0b]warning[/]'* && \$compact_monitor_processes == *'cpu[/]12.5%'* && \$compact_monitor_processes == *'mem[/]512MB'* && \$compact_monitor_processes == *'crashloop[/][bold#cbd5e1]no[/]'* && \$compact_monitor_processes == *'DB[/][bold#22c55e]ok[/]'* ]]" "dashboard monitor process panel surfaces auth/world footprint and DB readiness" || all_passed=1
+    assert_true "[[ \$compact_monitor_trends == *'TrendLedger'* && \$compact_monitor_trends == *'Comparecurrentvalue,peakwindow,anddirectionataglance.'* && \$compact_monitor_trends == *'CPU[/][#cbd5e1]now[/]31.5%'* && \$compact_monitor_trends == *'peak[/]31.5%'* && \$compact_monitor_trends == *'Memory[/][#cbd5e1]now[/]48.0%'* && \$compact_monitor_trends == *'I/O[/][#cbd5e1]now[/]33.0%'* ]]" "dashboard monitor trends panel compares live values against the recent window" || all_passed=1
+    assert_true "[[ \$compact_monitor_storage == *'StorageandDevice'* && \$compact_monitor_storage == *'FS[/]n/a[#cbd5e1]used[/]24%'* && \$compact_monitor_storage == *'Device[/]sda'* && \$compact_monitor_storage == *'Ops/s[/]read1.4write2.6'* && \$compact_monitor_storage == *'Await[/]0ms'* && \$compact_monitor_storage == *'I/O[/][bold#22c55e]ok[/]'* ]]" "dashboard monitor storage panel exposes device-level detail when iostat data is present" || all_passed=1
+    assert_true "[[ \$compact_monitor_storage_missing == *'I/O[/][bold#94a3b8]unavailable[/]'* && \$compact_monitor_storage_missing == *'install[bold#f59e0b]sysstat/iostat[/]toexposeliveread/writeratesanddiskwait.'* ]]" "dashboard monitor storage panel degrades cleanly when optional iostat data is absent" || all_passed=1
     assert_true "[[ \$compact_player_pulse == *'PlayerPulse'* && \$compact_player_pulse == *'OnlineNow[/][bold#f59e0b]1[/]'* && \$compact_player_pulse == *'Mix[/]players=0staff=1'* && \$compact_player_pulse == *'GMCoverage[/]1GM/1online'* && \$compact_player_pulse == *'GMsOnline[/]1'* && \$compact_player_pulse == *'Drilldown[/][bold#f59e0b]o[/]onlineroster'* && \$compact_player_pulse != *'Roster[/]'* ]]" "dashboard player pulse focuses on operator-facing summary stats instead of roster sampling" || all_passed=1
     assert_true "[[ \$compact_alerts == *'AlertsandEvents'* && \$compact_alerts == *'Overall[/][bold#34d399]healthy[/][#cbd5e1]active[/]0'* && \$compact_alerts == *'Noactivealerts'* && \$compact_alerts == *'Honorqueuerefreshed'* ]]" "dashboard alerts panel surfaces recent operator-relevant events with explicit active-alert count" || all_passed=1
     assert_true "[[ \$compact_backups == *'BackupReadiness'* && \$compact_backups == *'Protection[/][bold#34d399]healthy[/]'* && \$compact_backups == *'TimerState'* && \$compact_backups == *'Daily[/]'* && \$compact_backups == *'daily04:00'* && \$compact_backups == *'Readyfor[/]verifyorrestoredry-runfromthisselection.'* ]]" "dashboard backups panel centers protection posture and selected backup readiness" || all_passed=1
@@ -2287,9 +2320,9 @@ args = module.parse_args([
     "--manager-bin", "/tmp/mock-manager",
     "--config", "/tmp/manager.conf",
     "--theme", "dark",
-    "--view", "operations",
+    "--view", "monitor",
     "--snapshot-file", "/tmp/demo-snapshot.json",
-    "--screenshot", "/tmp/operations.svg",
+    "--screenshot", "/tmp/monitor.svg",
 ])
 
 print(json.dumps({
@@ -2303,8 +2336,8 @@ PY
 
     compact_output=$(printf '%s' "$output" | tr -d '[:space:]')
 
-    assert_true "[[ \$compact_output == *'\"view\":\"operations\"'* && \$compact_output == *'\"snapshot_file\":\"/tmp/demo-snapshot.json\"'* ]]" "dashboard parse_args accepts view-specific demo capture options" || all_passed=1
-    assert_true "[[ \$compact_output == *'\"screenshot\":\"/tmp/operations.svg\"'* && \$compact_output == *'\"theme\":\"dark\"'* ]]" "dashboard parse_args preserves screenshot capture arguments" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"view\":\"monitor\"'* && \$compact_output == *'\"snapshot_file\":\"/tmp/demo-snapshot.json\"'* ]]" "dashboard parse_args accepts view-specific demo capture options" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"screenshot\":\"/tmp/monitor.svg\"'* && \$compact_output == *'\"theme\":\"dark\"'* ]]" "dashboard parse_args preserves screenshot capture arguments" || all_passed=1
 
     return $all_passed
 }
