@@ -104,7 +104,7 @@ If you are new to Manager, the best first pass is simple:
 2. Visit `Config` and verify Manager is reading the right install root, service names, and databases.
 3. Visit `Backups` and confirm the protection story before you trust any update or maintenance workflow.
 4. Visit `Accounts` so you know where user actions live before you need them under pressure.
-5. Finish in `Ops` and review scheduled work, logs, and update state.
+5. Finish in `Ops` and review the maintenance queue plus change-window readiness.
 
 ## Overview View
 
@@ -222,25 +222,31 @@ If the Config view looks wrong, fix that before you trust any higher-level workf
 
 ![Operations view](assets/dashboard-operations.svg)
 
-Operations is where the day-two admin workflows come together.
+Operations is the maintenance queue and change-window preflight screen.
 
 Use it for:
 
-- log rotation health and test runs
-- scheduled honor or restart jobs
-- schedule cancellation
-- update planning and DB-impact awareness
+- seeing what maintenance is already queued
+- inspecting or canceling a selected honor or restart job
+- checking log guardrails before a maintenance window
+- reviewing update readiness and DB impact before risky source changes
 
-This screen is the best answer to, "What maintenance is queued, and what happens if I update now?"
+Read it in this order:
+
+1. Start with `Maintenance Queue` to see what restart or honor work is already scheduled.
+2. Use `Selected Job` to inspect cadence, warnings, and cancellation impact for the highlighted item.
+3. Glance at `Maintenance Guardrails` to confirm logs and storage are not about to betray the window.
+4. Use `Update Readiness` when the next change involves source pulls or database movement.
 
 Recommended flow before a realm update:
 
-1. Review the update state and DB-impact summary.
-2. Generate or refresh the update plan.
-3. Take and verify a backup.
-4. Only then move into a real update workflow.
+1. Review `Maintenance Queue` so you know whether any restart work is already timed near the window.
+2. Review `Update Readiness` and the DB-impact summary.
+3. Generate or refresh the update plan.
+4. Take and verify a backup.
+5. Only then move into a real update workflow.
 
-The command rail matters here because this screen combines multiple maintenance workflows. If a task is not in the rail, it is probably still a CLI-first path for now.
+The command rail follows the same hierarchy as the screen: queue actions first, then update planning, then log guardrail actions. If a task is not in the rail, it is probably still a CLI-first path for now.
 
 ## Updates Workflow
 
@@ -248,8 +254,8 @@ Manager treats updates like an operator workflow, not a blind pull-and-pray even
 
 Use this sequence:
 
-1. Open `Ops` and review the current update state.
-2. Check whether the update is code-only or likely to include database work.
+1. Open `Ops` and start with the maintenance queue so you understand what is already scheduled.
+2. Check `Update Readiness` to see whether the change is code-only or likely to include database work.
 3. Create and verify a backup before you touch the source tree.
 4. Run the update plan so the work is visible as explicit steps.
 5. Execute the update during a maintenance window instead of improvising live.
@@ -268,7 +274,7 @@ If you want a stable realm without living in the CLI all day, this is a good def
 
 1. Open `Overview` and confirm services, players, and host pressure look sane.
 2. Check `Backups` and make sure recent protection exists before risky work.
-3. Visit `Operations` when planning maintenance, restart jobs, or update work.
+3. Visit `Operations` when you need to understand queued maintenance or preflight a risky change window.
 4. Use `Accounts` for user-facing admin changes instead of one-off SQL.
 5. Use `Config` whenever the host wiring changes or Manager behavior looks suspicious.
 
@@ -291,7 +297,7 @@ This is the current dashboard-to-CLI split for Release C:
 | Accounts | create, password reset, GM changes, ban, unban, account visibility | scripted bulk workflows |
 | Backups | inventory, backup now, verify, restore dry-run, timer visibility, daily/weekly timer create | cleanup, timer removal, live restore |
 | Config | validation plus read-only wiring summary | config creation, detect, show, and file editing |
-| Operations | logs rotate/test, honor and restart scheduling, schedule cancel, update planning visibility | update apply and other source-tree workflows |
+| Operations | maintenance queue, honor and restart scheduling, schedule cancel, logs guardrails, update planning visibility | update apply and other source-tree workflows |
 
 Use these supporting docs when you need that lower-level surface:
 

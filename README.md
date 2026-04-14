@@ -106,7 +106,7 @@ Inside the dashboard you get:
 - player pulse summary, GM presence, alert visibility, and online roster drilldown
 - backup visibility plus verify, schedule, and restore dry-run entry points
 - account workflows for create, password reset, GM level changes, and ban or unban actions
-- log rotation and config visibility for safer day-two operations
+- a dedicated Ops surface for maintenance queue visibility, update readiness, and log guardrails
 
 It keeps the deployment terminal-first while still giving admins something that looks and feels deliberate.
 
@@ -131,7 +131,7 @@ Release C gives you a broad operator surface, but not every CLI path is fully ab
 | Accounts | create, reset password, set GM, ban, unban, visibility | scripted bulk workflows |
 | Backups | inventory, create, verify, restore dry-run, timer visibility, daily/weekly timer create | cleanup, timer removal, real restore |
 | Config | validation and read-only wiring summary | detect, create, show, file editing |
-| Operations | logs workflows, honor/restart scheduling, cancel job, update visibility | update apply and source-tree work |
+| Operations | maintenance queue, honor/restart scheduling, cancel job, update readiness, log guardrails | update apply and source-tree work |
 
 The user guide tracks these boundaries in more detail and is the best place to see the current product surface with screenshots.
 
