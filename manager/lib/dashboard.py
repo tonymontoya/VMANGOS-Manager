@@ -365,7 +365,9 @@ def normalize_percent(value: Any) -> float:
 def normalize_load_percent(load_value: Any, cores: Any) -> float:
     load_float = max(0.0, clamp_float(load_value))
     core_count = max(1.0, clamp_float(cores, 1.0))
-    return min(100.0, (load_float / core_count) * 100.0)
+    # Align the bar scale with the same thresholds the backend uses:
+    # warning at 1x cores and critical at 2x cores.
+    return min(100.0, (load_float / (core_count * 2.0)) * 100.0)
 
 
 def render_meter(
@@ -373,9 +375,12 @@ def render_meter(
     *,
     width: int = 12,
     color: str = ACCENT_GREEN,
+    show_minimum_for_positive: bool = False,
 ) -> str:
     percent = normalize_percent(value)
     filled = int(round((percent / 100.0) * width))
+    if show_minimum_for_positive and percent > 0 and filled == 0:
+        filled = 1
     filled = max(0, min(width, filled))
     return f"[bold {color}]{METER_FILLED * filled}[/][{ACCENT_MUTED}]{METER_EMPTY * (width - filled)}[/]"
 
@@ -1125,7 +1130,7 @@ def render_metrics_panel(
     metric_history = metric_history or []
     lines = [
         f"[bold {ACCENT_GOLD}]Host Metrics[/]",
-        f"[{ACCENT_MUTED}]Host pressure, capacity, and trend.[/]",
+        f"[{ACCENT_MUTED}]Host pressure and capacity at a glance.[/]",
         f"[{ACCENT_MUTED}]Window[/] {history_window_label(metric_history, refresh_interval)}",
         "",
     ]
@@ -1172,7 +1177,7 @@ def render_metrics_panel(
             label_segment = f"[bold {ACCENT_SKY}]{label:<6}[/]"
             summary_segment = pad_markup(f"[bold {metric_health_color(status)}]{escape_markup(summary)}[/]", 31)
             lines.append(
-                f"{label_segment} {summary_segment}  {render_meter(percent, width=8, color=metric_health_color(status))}"
+                f"{label_segment} {summary_segment}  {render_meter(percent, width=8, color=metric_health_color(status), show_minimum_for_positive=(label == 'Load'))}"
             )
         if storage_io.get("available"):
             io_percent = normalize_percent(storage_io.get("util_percent", 0))
@@ -1206,9 +1211,8 @@ def render_monitor_pressure(
     metric_history = metric_history or []
     lines = [
         f"[bold {ACCENT_GOLD}]Pressure Deck[/]",
-        f"[{ACCENT_MUTED}]Deeper host diagnostics for CPU, memory, load, disk, and I/O.[/]",
+        f"[{ACCENT_MUTED}]CPU, memory, load, disk, and I/O pressure.[/]",
         f"[{ACCENT_MUTED}]Window[/] {history_window_label(metric_history, refresh_interval)}",
-        "",
     ]
 
     if not server["ok"]:
@@ -1272,7 +1276,7 @@ def render_monitor_pressure(
         lines.extend(
             [
                 f"[bold {ACCENT_SKY}]{label:<6}[/] {format_state(status)}  {escape_markup(summary)}",
-                f"{render_meter(percent, width=24, color=metric_health_color(status))}  [{ACCENT_MUTED}]peak[/] {peak_text}  [{ACCENT_MUTED}]trend[/] {describe_trend(values, metric_key)}",
+                f"{render_meter(percent, width=24, color=metric_health_color(status), show_minimum_for_positive=(metric_key == 'load'))}  [{ACCENT_MUTED}]peak[/] {peak_text}  [{ACCENT_MUTED}]trend[/] {describe_trend(values, metric_key)}",
             ]
         )
 
@@ -2199,7 +2203,7 @@ def create_app(
             layout: grid;
             grid-size: 2 2;
             grid-columns: 7fr 5fr;
-            grid-rows: 1fr 1fr;
+            grid-rows: 18 1fr;
             grid-gutter: 1 2;
             height: 1fr;
         }
