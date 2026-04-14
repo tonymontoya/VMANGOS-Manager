@@ -1727,6 +1727,34 @@ JSON
     exit 0
 fi
 
+if [[ "$args" == *"account list"* ]]; then
+    cat <<'JSON'
+{"success":true,"timestamp":"2026-04-13T22:00:00+00:00","data":{"accounts":[{"id":7,"username":"PLAYERONE","gm_level":0,"online":true,"banned":false},{"id":8,"username":"GMADMIN","gm_level":3,"online":false,"banned":false}]},"error":null}
+JSON
+    exit 0
+fi
+
+if [[ "$args" == *"backup list --format json"* ]]; then
+    cat <<'JSON'
+[{"timestamp":"2026-04-13T21:30:00+00:00","file":"backup-20260413-213000.tar.gz","size_bytes":52428800,"created_by":"manager","databases":["auth","characters","mangos","logs"]}]
+JSON
+    exit 0
+fi
+
+if [[ "$args" == *"config validate --format json"* ]]; then
+    cat <<'JSON'
+{"success":true,"timestamp":"2026-04-13T22:00:00+00:00","data":{"valid":true},"error":null}
+JSON
+    exit 0
+fi
+
+if [[ "$args" == *"config show --format json"* ]]; then
+    cat <<'JSON'
+{"success":true,"timestamp":"2026-04-13T22:00:00+00:00","data":{"content":"[database]\nhost = 127.0.0.1\nport = 3306\nuser = mangos\nauth_db = auth\ncharacters_db = characters\nworld_db = mangos\nlogs_db = logs\n\n[server]\nauth_service = auth\nworld_service = world\ninstall_root = /opt/mangos\n\n[backup]\nbackup_dir = /tmp/vmangos-backups\n"},"error":null}
+JSON
+    exit 0
+fi
+
 echo "unexpected command: $args" >&2
 exit 1
 EOF
@@ -1739,6 +1767,11 @@ EOF
     assert_true "[[ \$compact_output == *'\"server\":{\"ok\":true'* ]]" "dashboard snapshot records server payload" || all_passed=1
     assert_true "[[ \$compact_output == *'\"logs\":{\"ok\":true'* ]]" "dashboard snapshot records logs payload" || all_passed=1
     assert_true "[[ \$compact_output == *'\"players\":[{\"id\":7,\"username\":\"PLAYERONE\"'* ]]" "dashboard snapshot flattens online player list" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"all_accounts\":[{\"id\":7,\"username\":\"PLAYERONE\"'* ]]" "dashboard snapshot includes full account listing" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"backups\":{\"entries\":[{\"timestamp\":\"2026-04-13T21:30:00+00:00\",\"file\":\"backup-20260413-213000.tar.gz\"'* ]]" "dashboard snapshot includes backup entries" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"summary\":{\"count\":1,\"backup_dir\":\"/tmp/vmangos-backups\",\"latest_file\":\"backup-20260413-213000.tar.gz\"'* ]]" "dashboard snapshot summarizes backup metadata" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"config_validate\":{\"ok\":true'* ]]" "dashboard snapshot includes config validation result" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"config_summary\":{\"install_root\":\"/opt/mangos\",\"auth_service\":\"auth\",\"world_service\":\"world\"'* ]]" "dashboard snapshot includes parsed config summary" || all_passed=1
     assert_true "[[ \$compact_output == *'\"captured_at\":\"'* ]]" "dashboard snapshot includes capture timestamp" || all_passed=1
 
     rm -rf "$temp_dir"
