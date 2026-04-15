@@ -25,8 +25,8 @@ If you are starting from scratch, the installer handles dependencies, source com
 **Zero-touch (recommended):**
 
 ```bash
-wget https://raw.githubusercontent.com/tonymontoya/VMANGOS-Manager/main/auto_install.sh
-wget https://raw.githubusercontent.com/tonymontoya/VMANGOS-Manager/main/vmangos_setup.sh
+wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/auto_install.sh
+wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/vmangos_setup.sh
 sudo bash auto_install.sh
 ```
 
@@ -38,7 +38,7 @@ sudo bash auto_install.sh
 **Guided:**
 
 ```bash
-wget https://raw.githubusercontent.com/tonymontoya/VMANGOS-Manager/main/vmangos_setup.sh
+wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/vmangos_setup.sh
 sudo bash vmangos_setup.sh
 ```
 
@@ -52,8 +52,8 @@ For installer internals (checkpoints, environment variables, background builds),
 Already have a realm running? Manager can adopt it.
 
 ```bash
-git clone https://github.com/tonymontoya/VMANGOS-Manager.git
-cd VMANGOS-Manager/manager
+git clone https://github.com/tonymontoya/VMaNGOS-Manager.git
+cd VMaNGOS-Manager/manager
 make test
 sudo make install PREFIX=/opt/mangos/manager
 sudo /opt/mangos/manager/bin/vmangos-manager config detect
@@ -243,18 +243,18 @@ sudo /opt/mangos/manager/bin/vmangos-manager logs recent --limit 10
 
 | Task | Command |
 |---|---|
-| Start services and wait for health | `sudo vmangos-manager server start --wait` |
-| Restart services | `sudo vmangos-manager server restart` |
-| Watch live status | `sudo vmangos-manager server status --watch` |
-| Create account | `sudo VMANGOS_PASSWORD='pass' vmangos-manager account create USER --password-env` |
-| Set GM level | `sudo vmangos-manager account setgm USER 3` |
-| Ban account | `sudo vmangos-manager account ban USER 7d --reason "Rule violation"` |
-| Backup now + verify | `sudo vmangos-manager backup now --verify` |
-| Schedule daily backup | `sudo vmangos-manager backup schedule --daily 04:00` |
-| Check recent errors | `sudo vmangos-manager logs recent --source world --severity error` |
-| Schedule weekly restart | `sudo vmangos-manager schedule restart --time 04:00 --weekly Sun` |
-| Check for updates | `sudo vmangos-manager update check` |
-| Inspect DB impact | `sudo vmangos-manager update inspect` |
+| Start services and wait for health | `sudo /opt/mangos/manager/bin/vmangos-manager server start --wait` |
+| Restart services | `sudo /opt/mangos/manager/bin/vmangos-manager server restart` |
+| Watch live status | `sudo /opt/mangos/manager/bin/vmangos-manager server status --watch` |
+| Create account | `sudo VMANGOS_PASSWORD='pass' /opt/mangos/manager/bin/vmangos-manager account create USER --password-env` |
+| Set GM level | `sudo /opt/mangos/manager/bin/vmangos-manager account setgm USER 3` |
+| Ban account | `sudo /opt/mangos/manager/bin/vmangos-manager account ban USER 7d --reason "Rule violation"` |
+| Backup now + verify | `sudo /opt/mangos/manager/bin/vmangos-manager backup now --verify` |
+| Schedule daily backup | `sudo /opt/mangos/manager/bin/vmangos-manager backup schedule --daily 04:00` |
+| Check recent errors | `sudo /opt/mangos/manager/bin/vmangos-manager logs recent --source world --severity error` |
+| Schedule weekly restart | `sudo /opt/mangos/manager/bin/vmangos-manager schedule restart --time 04:00 --weekly Sun` |
+| Check for updates | `sudo /opt/mangos/manager/bin/vmangos-manager update check` |
+| Inspect DB impact | `sudo /opt/mangos/manager/bin/vmangos-manager update inspect` |
 
 ---
 
@@ -301,16 +301,16 @@ Manager treats updates as a deliberate workflow, not a blind pull.
 
 ```bash
 # 1. Check what is available
-sudo vmangos-manager update check
+sudo /opt/mangos/manager/bin/vmangos-manager update check
 
 # 2. Inspect DB impact (read-only)
-sudo vmangos-manager update inspect
+sudo /opt/mangos/manager/bin/vmangos-manager update inspect
 
 # 3. Generate a plan
-sudo vmangos-manager update plan --include-db
+sudo /opt/mangos/manager/bin/vmangos-manager update plan --include-db
 
 # 4. Apply during a maintenance window
-sudo vmangos-manager update apply --backup-first --include-db
+sudo /opt/mangos/manager/bin/vmangos-manager update apply --backup-first --include-db
 ```
 
 > **Safety notes from the code:**

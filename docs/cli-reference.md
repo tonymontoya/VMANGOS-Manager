@@ -69,8 +69,8 @@ sudo make uninstall PREFIX=/opt/mangos/manager
 ## 🖥️ Dashboard
 
 ```bash
-vmangos-manager dashboard [--refresh SECONDS] [--theme dark|light]
-vmangos-manager dashboard --bootstrap
+/opt/mangos/manager/bin/vmangos-manager dashboard [--refresh SECONDS] [--theme dark|light]
+/opt/mangos/manager/bin/vmangos-manager dashboard --bootstrap
 ```
 
 - `--bootstrap` creates the Python venv and installs Textual (one-time).
@@ -82,10 +82,10 @@ vmangos-manager dashboard --bootstrap
 ## 🎮 Server
 
 ```bash
-vmangos-manager server start [--wait] [--timeout SECONDS]
-vmangos-manager server stop [--graceful|--force] [--timeout SECONDS]
-vmangos-manager server restart [--timeout SECONDS]
-vmangos-manager server status [--format text|json] [--watch] [--interval SECONDS]
+/opt/mangos/manager/bin/vmangos-manager server start [--wait] [--timeout SECONDS]
+/opt/mangos/manager/bin/vmangos-manager server stop [--graceful|--force] [--timeout SECONDS]
+/opt/mangos/manager/bin/vmangos-manager server restart [--timeout SECONDS]
+/opt/mangos/manager/bin/vmangos-manager server status [--format text|json] [--watch] [--interval SECONDS]
 ```
 
 - `start --wait` performs bounded post-start health verification.
@@ -97,11 +97,11 @@ vmangos-manager server status [--format text|json] [--watch] [--interval SECONDS
 ## 📝 Logs
 
 ```bash
-vmangos-manager logs status [--format text|json]
-vmangos-manager logs recent [--source all|auth|world] [--window 15m|1h|1d] [--severity all|debug|info|notice|warning|error|critical|alert] [--limit N] [--format text|json]
-vmangos-manager logs recent [--source ...] [--window ...] [--severity ...] [--limit N] [--watch|--follow] [--interval SECONDS]
-vmangos-manager logs rotate [--force]
-vmangos-manager logs test-config
+/opt/mangos/manager/bin/vmangos-manager logs status [--format text|json]
+/opt/mangos/manager/bin/vmangos-manager logs recent [--source all|auth|world] [--window 15m|1h|1d] [--severity all|debug|info|notice|warning|error|critical|alert] [--limit N] [--format text|json]
+/opt/mangos/manager/bin/vmangos-manager logs recent [--source ...] [--window ...] [--severity ...] [--limit N] [--watch|--follow] [--interval SECONDS]
+/opt/mangos/manager/bin/vmangos-manager logs rotate [--force]
+/opt/mangos/manager/bin/vmangos-manager logs test-config
 ```
 
 - `logs status` checks log-rotation posture and disk headroom.
@@ -114,11 +114,11 @@ vmangos-manager logs test-config
 ## ⏰ Schedule
 
 ```bash
-vmangos-manager schedule honor --time 06:00 --daily [--timezone UTC]
-vmangos-manager schedule restart --time 04:00 --weekly Sun [--timezone UTC] [--announce "Weekly maintenance"] [--warnings 30,15,5,1]
-vmangos-manager schedule list [--format text|json]
-vmangos-manager schedule simulate <job-id>
-vmangos-manager schedule cancel <job-id>
+/opt/mangos/manager/bin/vmangos-manager schedule honor --time 06:00 --daily [--timezone UTC]
+/opt/mangos/manager/bin/vmangos-manager schedule restart --time 04:00 --weekly Sun [--timezone UTC] [--announce "Weekly maintenance"] [--warnings 30,15,5,1]
+/opt/mangos/manager/bin/vmangos-manager schedule list [--format text|json]
+/opt/mangos/manager/bin/vmangos-manager schedule simulate <job-id>
+/opt/mangos/manager/bin/vmangos-manager schedule cancel <job-id>
 ```
 
 - Schedules are stored under the Manager state directory and rendered into `systemd` timer/service units.
@@ -131,12 +131,12 @@ vmangos-manager schedule cancel <job-id>
 ## 👤 Account
 
 ```bash
-vmangos-manager account create <username> [--password-file PATH|--password-env]
-vmangos-manager account list [--online]
-vmangos-manager account setgm <username> <0-3>
-vmangos-manager account ban <username> <duration> --reason "<words>"
-vmangos-manager account unban <username>
-vmangos-manager account password <username> [--password-file PATH|--password-env]
+/opt/mangos/manager/bin/vmangos-manager account create <username> [--password-file PATH|--password-env]
+/opt/mangos/manager/bin/vmangos-manager account list [--online]
+/opt/mangos/manager/bin/vmangos-manager account setgm <username> <0-3>
+/opt/mangos/manager/bin/vmangos-manager account ban <username> <duration> --reason "<words>"
+/opt/mangos/manager/bin/vmangos-manager account unban <username>
+/opt/mangos/manager/bin/vmangos-manager account password <username> [--password-file PATH|--password-env]
 ```
 
 - Passwords are **never** accepted as positional arguments.
@@ -148,14 +148,14 @@ vmangos-manager account password <username> [--password-file PATH|--password-env
 ## 💾 Backup
 
 ```bash
-vmangos-manager backup now [--verify]
-vmangos-manager backup list [--format text|json]
-vmangos-manager backup verify <file> [--level 1|2]
-vmangos-manager backup restore <file> [--dry-run]
-vmangos-manager backup clean [--keep-last N]
-vmangos-manager backup schedule status [--format text|json]
-vmangos-manager backup schedule --daily HH:MM
-vmangos-manager backup schedule --weekly "Sun 04:00"
+/opt/mangos/manager/bin/vmangos-manager backup now [--verify]
+/opt/mangos/manager/bin/vmangos-manager backup list [--format text|json]
+/opt/mangos/manager/bin/vmangos-manager backup verify <file> [--level 1|2]
+/opt/mangos/manager/bin/vmangos-manager backup restore <file> [--dry-run]
+/opt/mangos/manager/bin/vmangos-manager backup clean [--keep-last N]
+/opt/mangos/manager/bin/vmangos-manager backup schedule status [--format text|json]
+/opt/mangos/manager/bin/vmangos-manager backup schedule --daily HH:MM
+/opt/mangos/manager/bin/vmangos-manager backup schedule --weekly "Sun 04:00"
 ```
 
 ---
@@ -163,10 +163,10 @@ vmangos-manager backup schedule --weekly "Sun 04:00"
 ## ⚙️ Config
 
 ```bash
-vmangos-manager config create [--path FILE]
-vmangos-manager config detect [--format text|json]
-vmangos-manager config validate [--format text|json]
-vmangos-manager config show [--format text|json]
+/opt/mangos/manager/bin/vmangos-manager config create [--path FILE]
+/opt/mangos/manager/bin/vmangos-manager config detect [--format text|json]
+/opt/mangos/manager/bin/vmangos-manager config validate [--format text|json]
+/opt/mangos/manager/bin/vmangos-manager config show [--format text|json]
 ```
 
 - `config detect` is **read-only**. It inspects install roots, parses `mangosd.conf` / `realmd.conf`, matches `systemd` service names, and prints a proposed `manager.conf` with confidence scoring.
@@ -177,17 +177,17 @@ vmangos-manager config show [--format text|json]
 ## 🔄 Update
 
 ```bash
-vmangos-manager update check
-vmangos-manager --format json update check
-vmangos-manager update inspect
-vmangos-manager --format json update inspect
-vmangos-manager update plan
-vmangos-manager --format json update plan --include-db
-vmangos-manager update apply --backup-first
-vmangos-manager update apply --backup-first --include-db
+/opt/mangos/manager/bin/vmangos-manager update check
+/opt/mangos/manager/bin/vmangos-manager --format json update check
+/opt/mangos/manager/bin/vmangos-manager update inspect
+/opt/mangos/manager/bin/vmangos-manager --format json update inspect
+/opt/mangos/manager/bin/vmangos-manager update plan
+/opt/mangos/manager/bin/vmangos-manager --format json update plan --include-db
+/opt/mangos/manager/bin/vmangos-manager update apply --backup-first
+/opt/mangos/manager/bin/vmangos-manager update apply --backup-first --include-db
 ```
 
-- `update check` prefers the VMANGOS core source tree under `<install_root>/source`; falls back to the current `VMANGOS-Manager` checkout.
+- `update check` prefers the VMANGOS core source tree under `<install_root>/source`; falls back to the current `VMaNGOS-Manager` checkout.
 - `update inspect` performs a read-only DB assessment against `auth`, `world`, and `logs`.
 - `update plan --include-db` adds migration assessment and fails closed when manual SQL review is needed.
 - `update apply` is **non-atomic** and does not promise rollback.
@@ -235,6 +235,6 @@ sudo /opt/mangos/manager/bin/vmangos-manager logs recent --source world --severi
 **Update check from a checkout:**
 
 ```bash
-cd ~/source/VMANGOS-Manager
+cd ~/source/VMaNGOS-Manager
 ./manager/bin/vmangos-manager update check
 ```

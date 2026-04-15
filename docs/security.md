@@ -77,7 +77,7 @@ Manager's update workflow is intentionally non-atomic. The recommended process i
 
 ## 🐛 Reporting
 
-Report security-relevant defects via the [GitHub issue tracker](https://github.com/tonymontoya/VMANGOS-Manager/issues). Please include:
+Report security-relevant defects via the [GitHub issue tracker](https://github.com/tonymontoya/VMaNGOS-Manager/issues). Please include:
 
 - The affected command
 - Whether the issue occurred from a source checkout or installed copy

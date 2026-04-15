@@ -56,19 +56,19 @@ If `account list --online` fails for a non-root operator, ensure `manager.conf` 
 
 ## 🔄 Updates
 
-### `Update check requires a VMANGOS-Manager git checkout`
+### `Update check requires a VMaNGOS-Manager git checkout`
 
 The installed manager under `/opt/mangos/manager` is a bundled copy, not a git repo. Run the command from a source checkout:
 
 ```bash
-cd ~/source/VMANGOS-Manager
+cd ~/source/VMaNGOS-Manager
 ./manager/bin/vmangos-manager update check
 ```
 
 Or point to a checkout explicitly:
 
 ```bash
-VMANGOS_MANAGER_REPO=~/source/VMANGOS-Manager ./manager/bin/vmangos-manager update check
+VMANGOS_MANAGER_REPO=~/source/VMaNGOS-Manager ./manager/bin/vmangos-manager update check
 ```
 
 ### `Failed to fetch remote metadata`
@@ -171,6 +171,6 @@ sudo /opt/mangos/manager/bin/vmangos-manager config validate
 Validate a source checkout:
 
 ```bash
-cd /home/tony/source/VMANGOS-Manager
+cd /home/tony/source/VMaNGOS-Manager
 ./manager/bin/vmangos-manager update check
 ```

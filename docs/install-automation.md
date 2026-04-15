@@ -35,8 +35,8 @@ Both target **Ubuntu 22.04 LTS**.
 This path generates secure passwords, picks sane defaults, and runs end-to-end without prompting.
 
 ```bash
-wget https://raw.githubusercontent.com/tonymontoya/VMANGOS-Manager/main/auto_install.sh
-wget https://raw.githubusercontent.com/tonymontoya/VMANGOS-Manager/main/vmangos_setup.sh
+wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/auto_install.sh
+wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/vmangos_setup.sh
 sudo bash auto_install.sh
 ```
 
@@ -53,7 +53,7 @@ sudo bash auto_install.sh
 Use this when you want to choose values during install.
 
 ```bash
-wget https://raw.githubusercontent.com/tonymontoya/VMANGOS-Manager/main/vmangos_setup.sh
+wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/vmangos_setup.sh
 sudo bash vmangos_setup.sh
 ```
 

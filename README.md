@@ -1,6 +1,6 @@
 # VMANGOS Manager
 
-![CI](https://github.com/tonymontoya/VMANGOS-Manager/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/tonymontoya/VMaNGOS-Manager/actions/workflows/ci.yml/badge.svg)
 ![Ubuntu 22.04](https://img.shields.io/badge/ubuntu-22.04-E95420)
 ![Status](https://img.shields.io/badge/status-v0.2%20candidate-0f766e)
 ![Interface](https://img.shields.io/badge/interface-Textual%20TUI-0f172a)
@@ -50,8 +50,8 @@ A terminal-native administration suite for VMANGOS private servers. One installe
 
 ```bash
 # Download the installer scripts
-wget https://raw.githubusercontent.com/tonymontoya/VMANGOS-Manager/main/auto_install.sh
-wget https://raw.githubusercontent.com/tonymontoya/VMANGOS-Manager/main/vmangos_setup.sh
+wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/auto_install.sh
+wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/vmangos_setup.sh
 
 # Run automated provisioning (VMANGOS + Manager, auto-generated credentials)
 sudo bash auto_install.sh
@@ -60,15 +60,15 @@ sudo bash auto_install.sh
 Want to pick your own DB names and paths? Use the guided installer instead:
 
 ```bash
-wget https://raw.githubusercontent.com/tonymontoya/VMANGOS-Manager/main/vmangos_setup.sh
+wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/vmangos_setup.sh
 sudo bash vmangos_setup.sh
 ```
 
 ### Option B — Existing VMANGOS Host
 
 ```bash
-git clone https://github.com/tonymontoya/VMANGOS-Manager.git
-cd VMANGOS-Manager/manager
+git clone https://github.com/tonymontoya/VMaNGOS-Manager.git
+cd VMaNGOS-Manager/manager
 make test
 sudo make install PREFIX=/opt/mangos/manager
 sudo /opt/mangos/manager/bin/vmangos-manager config detect
@@ -138,22 +138,22 @@ sudo /opt/mangos/manager/bin/vmangos-manager dashboard --refresh 2  # run
 
 ```bash
 # Server control
-sudo vmangos-manager server start --wait
-sudo vmangos-manager server restart
-sudo vmangos-manager server status --watch
+sudo /opt/mangos/manager/bin/vmangos-manager server start --wait
+sudo /opt/mangos/manager/bin/vmangos-manager server restart
+sudo /opt/mangos/manager/bin/vmangos-manager server status --watch
 
 # Account admin
-sudo VMANGOS_PASSWORD='ChangeMe7' vmangos-manager account create TESTUSER --password-env
-sudo vmangos-manager account setgm TESTUSER 3
-sudo vmangos-manager account ban TESTUSER 7d --reason "Exploit abuse"
+sudo VMANGOS_PASSWORD='ChangeMe7' /opt/mangos/manager/bin/vmangos-manager account create TESTUSER --password-env
+sudo /opt/mangos/manager/bin/vmangos-manager account setgm TESTUSER 3
+sudo /opt/mangos/manager/bin/vmangos-manager account ban TESTUSER 7d --reason "Exploit abuse"
 
 # Backup + schedule
-sudo vmangos-manager backup now --verify
-sudo vmangos-manager backup schedule --daily 04:00
+sudo /opt/mangos/manager/bin/vmangos-manager backup now --verify
+sudo /opt/mangos/manager/bin/vmangos-manager backup schedule --daily 04:00
 
 # Logs + maintenance
-sudo vmangos-manager logs recent --source world --severity error --limit 25
-sudo vmangos-manager schedule restart --time 04:00 --weekly Sun
+sudo /opt/mangos/manager/bin/vmangos-manager logs recent --source world --severity error --limit 25
+sudo /opt/mangos/manager/bin/vmangos-manager schedule restart --time 04:00 --weekly Sun
 ```
 
 ---
@@ -186,7 +186,7 @@ See [Security Notes](docs/security.md) for full details.
 - [VMANGOS Core](https://github.com/vmangos/core)
 - [VMANGOS Database](https://github.com/brotalnia/database)
 - [VMANGOS Wiki](https://github.com/vmangos/wiki/wiki)
-- [GitHub Issues](https://github.com/tonymontoya/VMANGOS-Manager/issues)
+- [GitHub Issues](https://github.com/tonymontoya/VMaNGOS-Manager/issues)
 
 ---
 
