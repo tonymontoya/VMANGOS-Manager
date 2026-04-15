@@ -108,7 +108,17 @@ Inside the dashboard you get:
 - player pulse summary, GM presence, alert visibility, and online roster drilldown
 - backup visibility plus verify, schedule, and restore dry-run entry points
 - account workflows for create, password reset, GM level changes, and ban or unban actions
-- a dedicated Ops surface for maintenance queue visibility, update readiness, and log guardrails
+- a dedicated Logs module that leads with investigation facts, then lets you drill into selected auth/world events
+- a dedicated Ops surface for maintenance readiness, scheduled tasks, and change-window planning
+
+If you are deciding where to start:
+
+- use `Overview` to answer, "is the realm healthy right now?"
+- use `Accounts` for create, password, GM, ban, and unban work
+- use `Backups` for protection checks, verify, and restore dry-run
+- use `Logs` for recent auth/world evidence during an incident
+- use `Ops` for maintenance scheduling, queued task review, and update preflight
+- use `Config` when the host wiring or install layout looks suspicious
 
 It keeps the deployment terminal-first while still giving admins something that looks credible, legible, and worth keeping open.
 
@@ -116,7 +126,7 @@ It keeps the deployment terminal-first while still giving admins something that 
 
 The dashboard is organized around a simple split:
 
-- the top banner tells you where you are, what that view is for, and what the last action did
+- the top banner tells you where you are, what that view is for, and the state, receipt, and next step of the last action
 - the left sidebar keeps navigation and realm pulse visible from every screen
 - the bottom command rail is the canonical action surface for the current view
 - the main panels are view-specific and should stay scoped to the thing they are showing
@@ -133,7 +143,8 @@ The dashboard already covers the work most realm operators do every week. The CL
 | Accounts | account inventory, create, reset password, set GM, ban, unban, visibility | scripted bulk workflows |
 | Backups | backup readiness, inventory, create, verify, restore dry-run, timer visibility, daily/weekly timer create | cleanup, timer removal, real restore |
 | Config | validation plus read-only configuration wiring summary | detect, create, show, file editing |
-| Operations | maintenance queue, maintenance/restart scheduling, cancel schedule, update readiness, log guardrails | update apply and source-tree work |
+| Logs | filtered auth/world investigation, selected event detail, live follow via refresh | raw JSON, CLI watch mode, custom shell pipelines |
+| Operations | maintenance readiness, scheduled task creation/review, task removal, change-window planning visibility | update apply and source-tree work |
 
 The user guide tracks these boundaries in more detail and is the best place to see the current product surface with screenshots.
 

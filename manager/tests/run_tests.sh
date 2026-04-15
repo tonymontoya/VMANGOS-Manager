@@ -360,6 +360,64 @@ EOF
     chmod +x "$mock_dir/logrotate"
 }
 
+setup_logs_recent_mock_bin() {
+    local mock_dir="$1"
+
+    cat > "$mock_dir/journalctl" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' "$*" >> "${LOGS_TEST_JOURNALCTL_LOG:-/dev/null}"
+
+args=" $* "
+log_file=""
+exit_code=0
+priority_pattern=""
+
+if [[ "$args" == *" -u auth "* ]]; then
+    log_file="${LOGS_TEST_JOURNALCTL_AUTH_FILE:-/dev/null}"
+    exit_code="${LOGS_TEST_JOURNALCTL_AUTH_EXIT:-0}"
+elif [[ "$args" == *" -u world "* ]]; then
+    log_file="${LOGS_TEST_JOURNALCTL_WORLD_FILE:-/dev/null}"
+    exit_code="${LOGS_TEST_JOURNALCTL_WORLD_EXIT:-0}"
+fi
+
+case "$args" in
+    *" -p alert..alert "*)
+        priority_pattern='"PRIORITY":"[0-1]"'
+        ;;
+    *" -p crit..alert "*)
+        priority_pattern='"PRIORITY":"[0-2]"'
+        ;;
+    *" -p err..alert "*)
+        priority_pattern='"PRIORITY":"[0-3]"'
+        ;;
+    *" -p warning..alert "*)
+        priority_pattern='"PRIORITY":"[0-4]"'
+        ;;
+    *" -p notice..alert "*)
+        priority_pattern='"PRIORITY":"[0-5]"'
+        ;;
+    *" -p info..alert "*)
+        priority_pattern='"PRIORITY":"[0-6]"'
+        ;;
+    *)
+        priority_pattern=""
+        ;;
+esac
+
+if [[ -n "$priority_pattern" ]]; then
+    grep -E "$priority_pattern" "$log_file" || true
+else
+    cat "$log_file"
+fi
+
+exit "$exit_code"
+EOF
+
+    chmod +x "$mock_dir/journalctl"
+}
+
 setup_dashboard_mock_python() {
     local mock_python="$1"
 
@@ -653,7 +711,7 @@ test_cli_parsing() {
     output=$(bash "$MANAGER_DIR/bin/vmangos-manager" --help 2>&1) || true
     assert_true "[[ \$output == *'VMANGOS Manager'* ]]" "CLI --help shows app name" || all_passed=1
     assert_true "[[ \$output == *'server'* ]]" "CLI --help lists server command" || all_passed=1
-    assert_true "[[ \$output == *'logs [status|rotate|test-config]'* ]]" "CLI --help lists logs command" || all_passed=1
+    assert_true "[[ \$output == *'logs [status|rotate|test-config|recent]'* ]]" "CLI --help lists logs command" || all_passed=1
     assert_true "[[ \$output == *'account'* ]]" "CLI --help lists account command" || all_passed=1
     assert_true "[[ \$output == *'dashboard [--refresh SECONDS] [--theme dark|light] [--bootstrap]'* ]]" "CLI --help lists dashboard command" || all_passed=1
     assert_true "[[ \$output == *'update'* ]]" "CLI --help lists update command" || all_passed=1
@@ -1025,6 +1083,7 @@ test_update_check_text_output() {
         CONFIG_SERVER_INSTALL_ROOT="/srv/mangos"
         return 0
     }
+    config_resolve_manager_root() { printf '/srv/mangos/manager\n'; }
     update_find_repo_root() { printf '/tmp/vmangos-manager\n'; }
     update_git() {
         local args="$*"
@@ -1068,6 +1127,7 @@ test_update_check_json_output() {
         CONFIG_SERVER_INSTALL_ROOT="/opt/mangos"
         return 0
     }
+    config_resolve_manager_root() { printf '/opt/mangos/manager\n'; }
     update_find_repo_root() { printf '/repo/root\n'; }
     update_git() {
         local args="$*"
@@ -1741,6 +1801,13 @@ JSON
     exit 0
 fi
 
+if [[ "$args" == *"logs recent"* ]]; then
+    cat <<'JSON'
+{"success":true,"timestamp":"2026-04-13T22:00:00+00:00","data":{"scope":"realm","filters":{"source":"all","window":"15m","severity":"all","limit":25},"summary":{"backing":"journald","events_returned":2,"sources_requested":2,"sources_available":2,"available_sources":["auth","world"],"source_counts":{"auth":1,"world":1},"severity_counts":{"warning":1,"error":1}},"capabilities":{"severity_filter_supported":true,"time_window_supported":true,"follow_via_refresh":true},"sources":[{"source":"auth","service":"auth","backing":"journald","available":true,"severity_supported":true,"time_window_supported":true,"events":[],"error":""},{"source":"world","service":"world","backing":"journald","available":true,"severity_supported":true,"time_window_supported":true,"events":[],"error":""}],"events":[{"timestamp":"2026-04-13T21:58:00+00:00","source":"world","service":"world","unit":"world.service","identifier":"mangosd","severity":"error","priority":3,"message":"World crashed while loading map","raw":"World crashed while loading map"},{"timestamp":"2026-04-13T21:56:00+00:00","source":"auth","service":"auth","unit":"auth.service","identifier":"realmd","severity":"warning","priority":4,"message":"Auth rejected invalid login","raw":"Auth rejected invalid login"}]},"error":null}
+JSON
+    exit 0
+fi
+
 if [[ "$args" == *"account list --online"* ]]; then
     cat <<'JSON'
 {"success":true,"timestamp":"2026-04-13T22:00:00+00:00","data":{"accounts":[{"id":7,"username":"PLAYERONE","gm_level":0,"online":true,"banned":false}]},"error":null}
@@ -1815,11 +1882,13 @@ EOF
 
     assert_true "[[ \$compact_output == *'\"server\":{\"ok\":true'* ]]" "dashboard snapshot records server payload" || all_passed=1
     assert_true "[[ \$compact_output == *'\"logs\":{\"ok\":true'* ]]" "dashboard snapshot records logs payload" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"realm_logs\":{\"ok\":true'* && \$compact_output == *'\"events_returned\":2'* ]]" "dashboard snapshot records realm log payload" || all_passed=1
     assert_true "[[ \$compact_output == *'\"schedule_list\":{\"ok\":true'* && \$compact_output == *'\"id\":\"20260413220000-1111\"'* ]]" "dashboard snapshot records schedule payload" || all_passed=1
     assert_true "[[ \$compact_output == *'\"update_check\":{\"ok\":true'* && \$compact_output == *'\"commits_behind\":2'* ]]" "dashboard snapshot records update check payload" || all_passed=1
     assert_true "[[ \$compact_output == *'\"update_inspect\":{\"ok\":true'* && \$compact_output == *'\"db_assessment\":\"schema_migrations_pending\"'* ]]" "dashboard snapshot records update inspect payload" || all_passed=1
     assert_true "[[ \$compact_output == *'\"players\":[{\"id\":7,\"username\":\"PLAYERONE\"'* ]]" "dashboard snapshot flattens online player list" || all_passed=1
     assert_true "[[ \$compact_output == *'\"all_accounts\":[{\"id\":7,\"username\":\"PLAYERONE\"'* ]]" "dashboard snapshot includes full account listing" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"log_events\":[{\"timestamp\":\"2026-04-13T21:58:00+00:00\",\"source\":\"world\"'* ]]" "dashboard snapshot flattens realm log events for the dedicated logs view" || all_passed=1
     assert_true "[[ \$compact_output == *'\"schedules\":[{\"id\":\"20260413220000-1111\"'* ]]" "dashboard snapshot flattens scheduled job list" || all_passed=1
     assert_true "[[ \$compact_output == *'\"backups\":{\"entries\":[{\"timestamp\":\"2026-04-13T21:30:00+00:00\",\"file\":\"backup-20260413-213000.tar.gz\"'* ]]" "dashboard snapshot includes backup entries" || all_passed=1
     assert_true "[[ \$compact_output == *'\"summary\":{\"count\":1,\"backup_dir\":\"/tmp/vmangos-backups\",\"latest_file\":\"backup-20260413-213000.tar.gz\"'* ]]" "dashboard snapshot summarizes backup metadata" || all_passed=1
@@ -1946,7 +2015,8 @@ test_dashboard_render_helpers() {
     local sidebar_output compact_sidebar command_output compact_command metrics_output compact_metrics
     local overview_command_output compact_overview_command player_pulse_output compact_player_pulse alerts_output compact_alerts
     local backups_output compact_backups player_output compact_player empty_player_output compact_empty_player
-    local config_output compact_config logs_output compact_logs update_output compact_update
+    local config_output compact_config logs_output compact_logs realm_logs_output compact_realm_logs
+    local log_detail_output compact_log_detail update_output compact_update logs_command_output compact_logs_command
     local banner_output compact_banner ops_banner_output compact_ops_banner schedule_output compact_schedule
 
     output=$(python3 - "$MANAGER_DIR/lib/dashboard.py" <<'PY'
@@ -1980,6 +2050,30 @@ snapshot = {
             "logs": {"active_files": 4, "rotated_files": 2, "sensitive_permissions_ok": True},
             "disk": {"used_percent": 18, "available_kb": 2097152},
             "policy": {"max_size": "100M", "min_size": "1M"},
+        },
+    },
+    "realm_logs": {
+        "ok": True,
+        "data": {
+            "filters": {"source": "all", "window": "15m", "severity": "warning", "limit": 25},
+            "summary": {
+                "backing": "journald",
+                "events_returned": 2,
+                "sources_requested": 2,
+                "sources_available": 2,
+                "available_sources": ["auth", "world"],
+                "source_counts": {"auth": 1, "world": 1},
+                "severity_counts": {"warning": 1, "error": 1},
+            },
+            "capabilities": {"severity_filter_supported": True, "time_window_supported": True, "follow_via_refresh": True},
+            "sources": [
+                {"source": "auth", "service": "auth", "backing": "journald", "available": True},
+                {"source": "world", "service": "world", "backing": "journald", "available": True},
+            ],
+            "events": [
+                {"timestamp": "2026-04-13T21:58:00+00:00", "source": "world", "service": "world", "unit": "world.service", "identifier": "mangosd", "severity": "error", "message": "World crashed while loading map"},
+                {"timestamp": "2026-04-13T21:56:00+00:00", "source": "auth", "service": "auth", "unit": "auth.service", "identifier": "realmd", "severity": "warning", "message": "Auth rejected invalid login"},
+            ],
         },
     },
     "update_check": {
@@ -2046,6 +2140,10 @@ snapshot = {
         "db_secret_source": "inline",
     },
     "config_path": "/opt/mangos/manager/config/manager.conf",
+    "log_events": [
+        {"timestamp": "2026-04-13T21:58:00+00:00", "source": "world", "service": "world", "unit": "world.service", "identifier": "mangosd", "severity": "error", "message": "World crashed while loading map"},
+        {"timestamp": "2026-04-13T21:56:00+00:00", "source": "auth", "service": "auth", "unit": "auth.service", "identifier": "realmd", "severity": "warning", "message": "Auth rejected invalid login"},
+    ],
     "schedules": [
         {
             "id": "20260413220000-1111",
@@ -2088,11 +2186,22 @@ for index, cpu, memory, load, disk, players, io in [
     history = module.append_monitoring_sample(history, trend_snapshot)
 
 payload = {
-    "banner": module.render_action_banner("accounts", snapshot, "backup completed", "success", 2),
+    "banner": module.render_action_banner("accounts", snapshot, "account create PLAYERONE: created account", "success", 2, "Created account PLAYERONE.", "Stay in Accounts to set GM access or reset the password again."),
     "monitor_banner": module.render_action_banner("monitor", snapshot, "metrics sampled", "info", 2),
-    "ops_banner": module.render_action_banner("operations", snapshot, "update plan refreshed", "warning", 2),
+    "ops_banner": module.render_action_banner("operations", snapshot, "update plan refreshed", "warning", 2, "Generated a change-window plan and flagged follow-up work before code changes.", "Review Change Window Readiness before any CLI update apply step."),
+    "cross_view_banner": module.render_action_banner(
+        "monitor",
+        snapshot,
+        "account create PLAYERONE: created account",
+        "success",
+        2,
+        "Created account PLAYERONE.",
+        "Stay in Accounts to set GM access or reset the password again.",
+        "accounts",
+    ),
     "sidebar": module.render_sidebar("operations", "backup completed", snapshot, 2),
     "overview_command_rail": module.render_command_rail("overview"),
+    "logs_command_rail": module.render_command_rail("logs"),
     "command_rail": module.render_command_rail("operations"),
     "metrics": module.render_metrics_panel(snapshot, history, 2),
     "monitor_pressure": module.render_monitor_pressure(snapshot, history, 2),
@@ -2105,6 +2214,8 @@ payload = {
     "config": module.render_config_panel(snapshot),
     "player": module.render_player_details(snapshot["players"][0], len(snapshot["players"])),
     "empty_player": module.render_player_details(None, 0),
+    "realm_logs": module.render_realm_logs_summary(snapshot),
+    "log_detail": module.render_log_event_details(snapshot["log_events"][0], len(snapshot["log_events"])),
     "logs": module.render_logs_panel(snapshot),
     "schedule_intro": module.render_schedule_intro(snapshot["schedules"]),
     "update": module.render_update_panel(snapshot, {"warning": "Supported DB migrations are pending.", "steps": ["vmangos-manager backup now --verify", "vmangos-manager server stop --graceful"]}),
@@ -2137,10 +2248,14 @@ PY
     compact_monitor_banner=$(printf '%s' "$monitor_banner_output" | tr -d '[:space:]')
     ops_banner_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ops_banner"])')
     compact_ops_banner=$(printf '%s' "$ops_banner_output" | tr -d '[:space:]')
+    cross_view_banner_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["cross_view_banner"])')
+    compact_cross_view_banner=$(printf '%s' "$cross_view_banner_output" | tr -d '[:space:]')
     sidebar_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sidebar"])')
     compact_sidebar=$(printf '%s' "$sidebar_output" | tr -d '[:space:]')
     overview_command_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["overview_command_rail"])')
     compact_overview_command=$(printf '%s' "$overview_command_output" | tr -d '[:space:]')
+    logs_command_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["logs_command_rail"])')
+    compact_logs_command=$(printf '%s' "$logs_command_output" | tr -d '[:space:]')
     command_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["command_rail"])')
     compact_command=$(printf '%s' "$command_output" | tr -d '[:space:]')
     metrics_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["metrics"])')
@@ -2167,6 +2282,10 @@ PY
     compact_player=$(printf '%s' "$player_output" | tr -d '[:space:]')
     empty_player_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["empty_player"])')
     compact_empty_player=$(printf '%s' "$empty_player_output" | tr -d '[:space:]')
+    realm_logs_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["realm_logs"])')
+    compact_realm_logs=$(printf '%s' "$realm_logs_output" | tr -d '[:space:]')
+    log_detail_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["log_detail"])')
+    compact_log_detail=$(printf '%s' "$log_detail_output" | tr -d '[:space:]')
     logs_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["logs"])')
     compact_logs=$(printf '%s' "$logs_output" | tr -d '[:space:]')
     schedule_intro_output=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["schedule_intro"])')
@@ -2179,12 +2298,14 @@ PY
     load_critical_percent=$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["load_critical_percent"])')
     monitor_pressure_line_count=$(printf '%s\n' "$monitor_pressure_output" | awk 'END{print NR}')
 
-    assert_true "[[ \$compact_banner == *'VMaNGOSManager'* && \$compact_banner == *'realmconsole'* && \$compact_banner == *'Accounts'* && \$compact_banner == *'lastrefresh[/]'* && \$compact_banner == *'status[/][bold#34d399]READY'* && \$compact_banner == *'ThisView[/]Worktheselected-accountadminflowforprovisioning,access,andmoderation.'* ]]" "dashboard action banner exposes app framing, active view, and result state" || all_passed=1
-    assert_true "[[ \$compact_monitor_banner == *'Monitor'* && \$compact_monitor_banner == *'status[/][bold#7dd3fc]LIVE'* && \$compact_monitor_banner == *'ThisView[/]Diagnosehostpressurewithdeepertrends,devicesaturation,andrealmprocessfootprint.'* ]]" "dashboard monitor banner frames the deeper diagnostics view explicitly" || all_passed=1
-    assert_true "[[ \$compact_ops_banner == *'Operations'* && \$compact_ops_banner == *'status[/][bold#f59e0b]CHECK'* && \$compact_ops_banner == *'ThisView[/]Reviewthemaintenancequeueandpreflightriskychangewindows.'* ]]" "dashboard operations banner frames the screen as maintenance queue plus change-window preflight" || all_passed=1
+    assert_true "[[ \$compact_banner == *'VMaNGOSManager'* && \$compact_banner == *'realmconsole'* && \$compact_banner == *'Accounts'* && \$compact_banner == *'lastrefresh[/]'* && \$compact_banner == *'actionstate[/][bold#34d399]Complete'* && \$compact_banner == *'ThisView[/]Worktheselected-accountadminflowforprovisioning,access,andmoderation.'* && \$compact_banner == *'Receipt[/]CreatedaccountPLAYERONE.'* && \$compact_banner == *'Next[/]StayinAccountstosetGMaccessorresetthepasswordagain.'* ]]" "dashboard action banner exposes app framing, active view, and stronger receipt feedback" || all_passed=1
+    assert_true "[[ \$compact_monitor_banner == *'Monitor'* && \$compact_monitor_banner == *'actionstate[/][bold#7dd3fc]Action'* && \$compact_monitor_banner == *'ThisView[/]Diagnosehostpressurewithdeepertrends,devicesaturation,andrealmprocessfootprint.'* ]]" "dashboard monitor banner frames the deeper diagnostics view explicitly" || all_passed=1
+    assert_true "[[ \$compact_ops_banner == *'Operations'* && \$compact_ops_banner == *'actionstate[/][bold#f59e0b]Attention'* && \$compact_ops_banner == *'ThisView[/]Workthemaintenanceandchange-windowflow:readiness,scheduledtasks,andupdateplanning.'* && \$compact_ops_banner == *'Receipt[/]Generatedachange-windowplanandflaggedfollow-upworkbeforecodechanges.'* ]]" "dashboard operations banner frames the screen as maintenance and change-window workflow with receipt context" || all_passed=1
+    assert_true "[[ \$compact_cross_view_banner == *'Monitor'* && \$compact_cross_view_banner == *'Lastaction[/]accountcreatePLAYERONE:createdaccount'* && \$compact_cross_view_banner != *'Receipt[/]'* && \$compact_cross_view_banner != *'Next[/]'* ]]" "dashboard banner keeps global action state but hides follow-up guidance outside the originating view" || all_passed=1
     assert_true "[[ \$compact_sidebar == *'VMaNGOSManager'* && \$compact_sidebar == *'Monitor'* && \$compact_sidebar == *'RealmPulse'* && \$compact_sidebar == *'Updated[/]'* && \$compact_sidebar == *'Players[/]1online'* && \$compact_sidebar == *'Backups[/]3known'* && \$compact_sidebar != *'ActiveHotkeys'* ]]" "dashboard sidebar stays focused on navigation and realm pulse while exposing the Monitor module" || all_passed=1
-    assert_true "[[ \$compact_overview_command == *'Navigate[/][bold#f59e0b]1[/]overview'* && \$compact_overview_command == *'[bold#f59e0b]2[/]monitor'* && \$compact_overview_command == *'ThisView[/][bold#f59e0b]o[/]roster'* && \$compact_overview_command == *'[bold#f59e0b]k[/]validateconfig'* ]]" "dashboard overview command rail exposes monitor navigation plus core actions" || all_passed=1
-    assert_true "[[ \$compact_command == *'Navigate[/][bold#f59e0b]1[/]overview'* && \$compact_command == *'[bold#f59e0b]2[/]monitor'* && \$compact_command == *'[bold#f59e0b]6[/]ops'* && \$compact_command == *'Global[/][bold#f59e0b]r[/]refresh'* && \$compact_command == *'ThisView[/][bold#f59e0b]h[/]schedulemaintenance'* && \$compact_command == *'[bold#f59e0b]j[/]cancelschedule'* && \$compact_command == *'[bold#f59e0b]P[/]updateplan'* && \$compact_command == *'[bold#f59e0b]l[/]rotatelogs'* ]]" "dashboard command rail provides the canonical contextual action surface across six modules" || all_passed=1
+    assert_true "[[ \$compact_overview_command == *'Navigate[/][bold#f59e0b]1[/]overview'* && \$compact_overview_command == *'[bold#f59e0b]2[/]monitor'* && \$compact_overview_command == *'[bold#f59e0b]6[/]logs'* && \$compact_overview_command == *'[bold#f59e0b]7[/]ops'* && \$compact_overview_command == *'ThisView[/][bold#f59e0b]o[/]roster'* && \$compact_overview_command == *'[bold#f59e0b]k[/]validateconfig'* ]]" "dashboard overview command rail exposes the expanded seven-module navigation plus core actions" || all_passed=1
+    assert_true "[[ \$compact_logs_command == *'Navigate[/]'* && \$compact_logs_command == *'[bold#f59e0b]6[/]logs'* && \$compact_logs_command == *'[bold#f59e0b]7[/]ops'* && \$compact_logs_command == *'ThisView[/][bold#f59e0b]f[/]filters'* ]]" "dashboard logs command rail exposes dedicated logs navigation and filter controls" || all_passed=1
+    assert_true "[[ \$compact_command == *'Navigate[/][bold#f59e0b]1[/]overview'* && \$compact_command == *'[bold#f59e0b]2[/]monitor'* && \$compact_command == *'[bold#f59e0b]6[/]logs'* && \$compact_command == *'[bold#f59e0b]7[/]ops'* && \$compact_command == *'Global[/][bold#f59e0b]r[/]refresh'* && \$compact_command == *'ThisView[/][bold#f59e0b]h[/]maintenance'* && \$compact_command == *'[bold#f59e0b]j[/]removetask'* && \$compact_command == *'[bold#f59e0b]P[/]plan'* && \$compact_command == *'[bold#f59e0b]T[/]testconfig'* && \$compact_command == *'[bold#f59e0b]l[/]rotate'* ]]" "dashboard command rail provides the canonical contextual action surface across seven modules without clipped operations labels" || all_passed=1
     assert_true "[[ \$compact_metrics == *'HostMetrics'* && \$compact_metrics == *'Hostpressureandcapacityataglance.'* && \$compact_metrics == *'Window[/]4samples/~6s'* && \$compact_metrics == *'CPU[/][bold#22c55e]31.5%/8c'* && \$compact_metrics == *'Memory[/][bold#22c55e]48.0%/3.0G/6.0G'* && \$compact_metrics == *'Load[/][bold#22c55e]1m0.62/5m0.55'* && \$compact_metrics == *'Disk[/][bold#22c55e]24.0%/6.0Gfree'* && \$compact_metrics == *'I/O[/][bold#22c55e]33.0%/1.4:2.6rw'* && \$compact_metrics == *'█[/][#cbd5e1]░░░░░░░'* && \$compact_metrics != *'Players[/]'* && \$compact_metrics != *'Logs[/]'* ]]" "dashboard metrics panel stays scoped to host pressure and capacity without leaking non-host data" || all_passed=1
     assert_true "[[ \$compact_monitor_pressure == *'PressureDeck'* && \$compact_monitor_pressure == *'CPU,memory,load,disk,andI/Opressure.'* && \$compact_monitor_pressure == *'CPU[/][bold#22c55e]ok[/]31.5%/8cores'* && \$compact_monitor_pressure == *'Memory[/][bold#22c55e]ok[/]48.0%/3.0GBof6.0GB'* && \$compact_monitor_pressure == *'Load[/][bold#22c55e]ok[/]1m0.625m0.5515m0.44'* && \$compact_monitor_pressure == *'peak[/]0.62'* && \$compact_monitor_pressure == *'Disk[/][bold#22c55e]ok[/]24.0%used/6.0GBfree'* && \$compact_monitor_pressure == *'I/O[/][bold#22c55e]ok[/]33.0%util/1.4:2.6ops'* && \$compact_monitor_pressure == *'█[/][#cbd5e1]░░░░░░░░░░░░░░░░░░░░░░░'* && \$compact_monitor_pressure != *'Players[/]'* ]]" "dashboard monitor pressure panel presents denser host diagnostics without leaking non-monitor data" || all_passed=1
     assert_true "[[ \$load_warning_percent == '50.0' && \$load_critical_percent == '100.0' ]]" "dashboard load meters align to backend warning and critical thresholds" || all_passed=1
@@ -2193,16 +2314,18 @@ PY
     assert_true "[[ \$compact_monitor_trends == *'TrendLedger'* && \$compact_monitor_trends == *'Comparecurrentvalue,peakwindow,anddirectionataglance.'* && \$compact_monitor_trends == *'CPU[/][#cbd5e1]now[/]31.5%'* && \$compact_monitor_trends == *'peak[/]31.5%'* && \$compact_monitor_trends == *'Memory[/][#cbd5e1]now[/]48.0%'* && \$compact_monitor_trends == *'I/O[/][#cbd5e1]now[/]33.0%'* ]]" "dashboard monitor trends panel compares live values against the recent window" || all_passed=1
     assert_true "[[ \$compact_monitor_storage == *'StorageandDevice'* && \$compact_monitor_storage == *'FS[/]n/a[#cbd5e1]used[/]24%'* && \$compact_monitor_storage == *'Device[/]sda'* && \$compact_monitor_storage == *'Ops/s[/]read1.4write2.6'* && \$compact_monitor_storage == *'Await[/]0ms'* && \$compact_monitor_storage == *'I/O[/][bold#22c55e]ok[/]'* ]]" "dashboard monitor storage panel exposes device-level detail when iostat data is present" || all_passed=1
     assert_true "[[ \$compact_monitor_storage_missing == *'I/O[/][bold#94a3b8]unavailable[/]'* && \$compact_monitor_storage_missing == *'install[bold#f59e0b]sysstat/iostat[/]toexposeliveread/writeratesanddiskwait.'* ]]" "dashboard monitor storage panel degrades cleanly when optional iostat data is absent" || all_passed=1
-    assert_true "[[ \$compact_player_pulse == *'PlayerPulse'* && \$compact_player_pulse == *'OnlineNow[/][bold#f59e0b]1[/]'* && \$compact_player_pulse == *'Mix[/]players=0staff=1'* && \$compact_player_pulse == *'GMCoverage[/]1GM/1online'* && \$compact_player_pulse == *'GMsOnline[/]1'* && \$compact_player_pulse == *'Drilldown[/][bold#f59e0b]o[/]onlineroster'* && \$compact_player_pulse != *'Roster[/]'* ]]" "dashboard player pulse focuses on operator-facing summary stats instead of roster sampling" || all_passed=1
-    assert_true "[[ \$compact_alerts == *'AlertsandEvents'* && \$compact_alerts == *'Overall[/][bold#34d399]healthy[/][#cbd5e1]active[/]0'* && \$compact_alerts == *'Noactivealerts'* && \$compact_alerts == *'Honorqueuerefreshed'* ]]" "dashboard alerts panel surfaces recent operator-relevant events with explicit active-alert count" || all_passed=1
-    assert_true "[[ \$compact_backups == *'BackupReadiness'* && \$compact_backups == *'Protection[/][bold#34d399]healthy[/]'* && \$compact_backups == *'TimerState'* && \$compact_backups == *'Daily[/]'* && \$compact_backups == *'daily04:00'* && \$compact_backups == *'Readyfor[/]verifyorrestoredry-runfromthisselection.'* ]]" "dashboard backups panel centers protection posture and selected backup readiness" || all_passed=1
-    assert_true "[[ \$compact_config == *'ConfigurationWiring'* && \$compact_config == *'RealmWiring'* && \$compact_config == *'DatabaseWiring'* && \$compact_config == *'DBSecret[/]inlinevaluemasked'* && \$compact_config == *'Read-only[/]validateandreviewwiringhere;editmanager.confand.dbpassintheshell.'* && \$compact_config != *'ConfigPreview'* ]]" "dashboard config panel is regrouped into clearer wiring sections without exposing secrets" || all_passed=1
+    assert_true "[[ \$compact_player_pulse == *'PlayerPulse'* && \$compact_player_pulse == *'OnlineNow[/][bold#f59e0b]1[/]'* && \$compact_player_pulse == *'Mix[/]players=0staff=1'* && \$compact_player_pulse == *'GMCoverage[/]1GM/1online'* && \$compact_player_pulse == *'GMsOnline[/]1'* && \$compact_player_pulse == *'Roster[/]1visible[#cbd5e1]mode[/]onlineroster'* && \$compact_player_pulse == *'Drilldown[/][bold#f59e0b]o[/]onlineroster'* ]]" "dashboard player pulse keeps summary stats aligned with roster visibility context" || all_passed=1
+    assert_true "[[ \$compact_alerts == *'AlertsandEvents'* && \$compact_alerts == *'Activerisksignalsplusrecentrealm-sideeventsworthnoticing.'* && \$compact_alerts == *'Overall[/][bold#34d399]healthy[/][#cbd5e1]active[/]0'* && \$compact_alerts == *'Noactivealerts'* && \$compact_alerts == *'Honorqueuerefreshed'* ]]" "dashboard alerts panel stays scoped to risks and recent realm-side events" || all_passed=1
+    assert_true "[[ \$compact_backups == *'BackupReadiness'* && \$compact_backups == *'Protection[/][bold#34d399]healthy[/]'* && \$compact_backups == *'TimerState'* && \$compact_backups == *'Daily[/]'* && \$compact_backups == *'daily04:00'* && \$compact_backups == *'Readyfor[/]verifyorrestoredry-runfromthisselection.'* && \$compact_backups == *'Boundary[/]dry-runrestoreherefirst;liverestorestaysintheCLIonpurpose.'* ]]" "dashboard backups panel centers protection posture and selected backup readiness with an explicit CLI restore boundary" || all_passed=1
+    assert_true "[[ \$compact_config == *'ConfigurationWiring'* && \$compact_config == *'RealmWiring'* && \$compact_config == *'DatabaseWiring'* && \$compact_config == *'DBSecret[/]inlinevaluemasked'* && \$compact_config == *'Read-only[/]inspectandvalidatewiringhere;editmanager.confand.dbpassintheshell.'* && \$compact_config != *'ConfigPreview'* ]]" "dashboard config panel is regrouped into clearer wiring sections without exposing secrets" || all_passed=1
     assert_true "[[ \$compact_player == *'SelectedPlayer'* && \$compact_player == *'Selected[/][bold#2dd4bf]PLAYERONE'* && \$compact_player != *'Playersnow'* && \$compact_player == *'Nextstep[/]open[bold#f59e0b]Accounts[/]forpassword,GM,ban,andunbanactions.'* ]]" "dashboard player details stay scoped to the selected player workflow" || all_passed=1
     assert_true "[[ \$compact_empty_player != *'Onlinenow'* && \$compact_empty_player == *'chooseaplayerrowtoinspectthataccount.'* ]]" "dashboard empty player state stays item-scoped" || all_passed=1
-    assert_true "[[ \$compact_logs == *'ChangeWindowReadiness'* && \$compact_logs == *'Canthishostsafelyabsorbscheduledmaintenancerightnow?'* && \$compact_logs == *'Overall[/][bold#34d399]healthy[/]'* && \$compact_logs == *'Queue[/]1scheduledtask'* && \$compact_logs == *'ScheduleHere[/][bold#f59e0b]h[/]maintenance'* && \$compact_logs == *'Support[/][bold#f59e0b]T[/]testlogs'* ]]" "dashboard operations support panel answers change-window readiness and points to maintenance creation paths" || all_passed=1
-    assert_true "[[ \$compact_schedule_intro == *'ScheduleHere[/][bold#f59e0b]h[/]maintenance'* && \$compact_schedule_intro == *'QueueSource[/]schedulesappearhereafterdashboardschedulingorthematching[bold#f59e0b]schedule[/]CLIcommands.'* && \$compact_schedule_intro == *'Now[/]1scheduledtaskinthequeue.'* ]]" "dashboard scheduled-maintenance intro explains creation paths and queue provenance" || all_passed=1
-    assert_true "[[ \$compact_update == *'UpdateReadiness'* && \$compact_update == *'Repositorydriftanddatabaseimpactbeforeriskycodechanges.'* && \$compact_update == *'Assessment[/][bold#f59e0b]schemamigrationspending'* && \$compact_update == *'PlanSnapshot'* && \$compact_update == *'Next[/]vmangos-managerbackupnow--verify'* ]]" "dashboard update panel stays focused on preflight readiness and plan steps" || all_passed=1
-    assert_true "[[ \$compact_schedule == *'SelectedSchedule'* && \$compact_schedule == *'Origin,cadence,andnextactionforthehighlightedschedule.'* && \$compact_schedule == *'Queue[/]1scheduledtask'* && \$compact_schedule == *'ScheduleID[/]20260413220000-1111'* && \$compact_schedule == *'Type[/]restart'* && \$compact_schedule == *'Origin[/]schedulerestart->serverrestartworkflow'* && \$compact_schedule == *'ScheduleMore[/][bold#f59e0b]h[/]maintenance'* && \$compact_schedule == *'NextAction[/][bold#f59e0b]j[/]removethisscheduleifitisnolongerdesired.'* && \$compact_schedule != *'OpsResult'* ]]" "dashboard selected-job details stay scoped to queue inspection, origin, and next action" || all_passed=1
+    assert_true "[[ \$compact_realm_logs == *'RealmLogs'* && \$compact_realm_logs == *'Recentauth/worldactivityforlivetroubleshooting.'* && \$compact_realm_logs == *'source=allwindow=15mseverity=warninglimit=25'* && \$compact_realm_logs == *'Events[/]2visible'* && \$compact_realm_logs == *'HotPath[/]error=1warning=1'* && \$compact_realm_logs == *'SourceMix[/]auth=1world=1'* && \$compact_realm_logs == *'Coverage[/]backing=journald'* && \$compact_realm_logs == *'Adjust[/][bold#f59e0b]f[/]filters'* && \$compact_realm_logs == *'Escalate[/]stayhereforevidence'* ]]" "dashboard logs summary leads with investigation facts and makes the Logs-to-Ops handoff explicit" || all_passed=1
+    assert_true "[[ \$compact_log_detail == *'SelectedEvent'* && \$compact_log_detail == *'Window[/]2visibleevents'* && \$compact_log_detail == *'Source[/]world'* && \$compact_log_detail == *'Severity[/][bold#ef4444]error[/]'* && \$compact_log_detail == *'Identifier[/]mangosd'* && \$compact_log_detail == *'Worldcrashedwhileloadingmap'* ]]" "dashboard log details stay scoped to the highlighted event for shell-free investigation" || all_passed=1
+    assert_true "[[ \$compact_logs == *'MaintenanceReadiness'* && \$compact_logs == *'Logrotation,filehygiene,anddiskheadroomthatcanmakeorbreakacleanmaintenancewindow.'* && \$compact_logs == *'Overall[/][bold#34d399]healthy[/]'* && \$compact_logs == *'Queue[/]1scheduledtask'* && \$compact_logs == *'Create[/][bold#f59e0b]h[/]maintenance'* && \$compact_logs == *'Support[/][bold#f59e0b]T[/]testlogconfig'* && \$compact_logs == *'Boundary[/]inspectrealmeventsinLogs;usethispanelforreadinessbeforescheduledwork.'* ]]" "dashboard maintenance readiness panel stays honest about scheduled-work prep and cross-view boundaries" || all_passed=1
+    assert_true "[[ \$compact_schedule_intro == *'Create[/][bold#f59e0b]h[/]maintenance'* && \$compact_schedule_intro == *'Source[/]tasksappearhereafteryoucreatetheminOperationsorwiththematchingscheduleCLIcommands.'* && \$compact_schedule_intro == *'Queue[/]1scheduledtaskreadyforreview.'* ]]" "dashboard scheduled-task intro explains creation paths and queue provenance" || all_passed=1
+    assert_true "[[ \$compact_update == *'ChangeWindowReadiness'* && \$compact_update == *'Repositorydrift,DBimpact,andnext-stepplanningbeforeriskycodechanges.'* && \$compact_update == *'Assessment[/][bold#f59e0b]schemamigrationspending'* && \$compact_update == *'PlanSnapshot'* && \$compact_update == *'Next[/]vmangos-managerbackupnow--verify'* && \$compact_update == *'Boundary'* ]]" "dashboard update panel stays focused on change-window preflight and makes the CLI boundary explicit" || all_passed=1
+    assert_true "[[ \$compact_schedule == *'SelectedTask'* && \$compact_schedule == *'Origin,cadence,andnextactionforthehighlightedscheduledtask.'* && \$compact_schedule == *'Queue[/]1scheduledtask'* && \$compact_schedule == *'TaskID[/]20260413220000-1111'* && \$compact_schedule == *'Type[/]restart'* && \$compact_schedule == *'Origin[/]restartwindowscheduledbyManager'* && \$compact_schedule == *'Create[/][bold#f59e0b]h[/]maintenance'* && \$compact_schedule == *'NextAction[/][bold#f59e0b]j[/]removethistaskifitisnolongerdesired.'* && \$compact_schedule != *'OpsResult'* ]]" "dashboard selected-task details stay scoped to queue inspection, origin, and next action" || all_passed=1
 
     return $all_passed
 }
@@ -2857,6 +2980,78 @@ test_logs_test_config_runs_debug_validation() {
 
     assert_true "[[ \$(cat \"$command_log\") == *'-d'* && \$(cat \"$command_log\") != *'-f'* ]]" "logs test-config runs logrotate in debug mode" || all_passed=1
     assert_true "[[ \$output == *'Logrotate configuration is valid'* ]]" "logs test-config reports successful validation" || all_passed=1
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_logs_recent_json_filters_realm_events() {
+    # shellcheck source=../lib/logs.sh
+    source "$LIB_DIR/logs.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir config_file install_root mock_dir auth_fixture world_fixture journal_log output compact_output
+    temp_dir=$(mktemp -d)
+    install_root="$temp_dir/install"
+    config_file="$temp_dir/manager.conf"
+    mock_dir="$temp_dir/mockbin"
+    auth_fixture="$temp_dir/auth.jsonl"
+    world_fixture="$temp_dir/world.jsonl"
+    journal_log="$temp_dir/journalctl.log"
+
+    mkdir -p "$mock_dir"
+    create_test_config "$config_file" "$install_root"
+    setup_logs_recent_mock_bin "$mock_dir"
+
+    cat > "$auth_fixture" << 'EOF'
+{"__REALTIME_TIMESTAMP":"1776117720000000","PRIORITY":"4","MESSAGE":"Auth rejected invalid login","_SYSTEMD_UNIT":"auth.service","SYSLOG_IDENTIFIER":"realmd"}
+{"__REALTIME_TIMESTAMP":"1776117600000000","PRIORITY":"6","MESSAGE":"Auth ready for connections","_SYSTEMD_UNIT":"auth.service","SYSLOG_IDENTIFIER":"realmd"}
+EOF
+
+    cat > "$world_fixture" << 'EOF'
+{"__REALTIME_TIMESTAMP":"1776117780000000","PRIORITY":"3","MESSAGE":"World crashed while loading map","_SYSTEMD_UNIT":"world.service","SYSLOG_IDENTIFIER":"mangosd"}
+{"__REALTIME_TIMESTAMP":"1776117540000000","PRIORITY":"6","MESSAGE":"World startup complete","_SYSTEMD_UNIT":"world.service","SYSLOG_IDENTIFIER":"mangosd"}
+EOF
+
+    CONFIG_FILE="$config_file"
+    LOGS_CONFIG_LOADED=""
+
+    output=$(PATH="$mock_dir:$PATH" LOGS_JOURNALCTL_BIN="$mock_dir/journalctl" LOGS_TEST_JOURNALCTL_AUTH_FILE="$auth_fixture" LOGS_TEST_JOURNALCTL_WORLD_FILE="$world_fixture" LOGS_TEST_JOURNALCTL_LOG="$journal_log" logs_recent_json all 15m warning 5)
+    compact_output=$(printf '%s' "$output" | tr -d '[:space:]')
+
+    assert_true "[[ \$compact_output == *'\"success\":true'* && \$compact_output == *'\"source\":\"all\"'* && \$compact_output == *'\"severity\":\"warning\"'* && \$compact_output == *'\"limit\":5'* ]]" "logs recent json reports the requested filter set" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"events_returned\":2'* && \$compact_output == *'\"source_counts\":{'* && \$compact_output == *'\"auth\":1'* && \$compact_output == *'\"world\":1'* ]]" "logs recent json returns filtered auth/world events only" || all_passed=1
+    assert_true "[[ \$compact_output == *'Authrejectedinvalidlogin'* && \$compact_output == *'Worldcrashedwhileloadingmap'* && \$compact_output != *'Worldstartupcomplete'* ]]" "logs recent json filters out lower-severity events" || all_passed=1
+    assert_true "[[ \$compact_output == *'\"severity_filter_supported\":true'* && \$compact_output == *'\"time_window_supported\":true'* ]]" "logs recent json advertises journald-backed filter capabilities" || all_passed=1
+    assert_true "[[ \$(cat \"$journal_log\") == *'-u auth'* && \$(cat \"$journal_log\") == *'-u world'* && \$(cat \"$journal_log\") == *'-p warning..alert'* ]]" "logs recent queries journald per source with the expected priority filter" || all_passed=1
+
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_cli_logs_recent_watch_single_iteration() {
+    local all_passed=0
+    local temp_dir config_file install_root mock_dir auth_fixture world_fixture output
+    temp_dir=$(mktemp -d)
+    install_root="$temp_dir/install"
+    config_file="$temp_dir/manager.conf"
+    mock_dir="$temp_dir/mockbin"
+    auth_fixture="$temp_dir/auth.jsonl"
+    world_fixture="$temp_dir/world.jsonl"
+
+    mkdir -p "$mock_dir"
+    create_test_config "$config_file" "$install_root"
+    setup_logs_recent_mock_bin "$mock_dir"
+
+    : > "$auth_fixture"
+    cat > "$world_fixture" << 'EOF'
+{"__REALTIME_TIMESTAMP":"1776117780000000","PRIORITY":"3","MESSAGE":"World crashed while loading map","_SYSTEMD_UNIT":"world.service","SYSLOG_IDENTIFIER":"mangosd"}
+EOF
+
+    output=$(PATH="$mock_dir:$PATH" MANAGER_CONFIG="$config_file" LOGS_JOURNALCTL_BIN="$mock_dir/journalctl" LOGS_TEST_JOURNALCTL_AUTH_FILE="$auth_fixture" LOGS_TEST_JOURNALCTL_WORLD_FILE="$world_fixture" LOGS_WATCH_MAX_ITERATIONS=1 bash "$MANAGER_DIR/bin/vmangos-manager" logs recent --source world --window 1h --severity error --limit 1 --watch --interval 1 2>/dev/null)
+
+    assert_true "[[ \$output == *'VMANGOS Realm Log Watch'* && \$output == *'World crashed while loading map'* && \$output == *'Stopped log watch.'* ]]" "CLI logs recent watch renders a single watched iteration and exits cleanly in tests" || all_passed=1
 
     rm -rf "$temp_dir"
     return $all_passed
@@ -3644,7 +3839,9 @@ main() {
     run_test "Logs: Status JSON" test_logs_status_json_reports_counts_and_permission_drift
     run_test "Logs: Rotate force" test_logs_rotate_force_runs_logrotate_and_hardens_permissions
     run_test "Logs: Test config" test_logs_test_config_runs_debug_validation
+    run_test "Logs: Recent JSON" test_logs_recent_json_filters_realm_events
     run_test "CLI: Logs status JSON" test_cli_logs_status_json_with_generated_config
+    run_test "CLI: Logs recent watch" test_cli_logs_recent_watch_single_iteration
     run_test "Schedule: Honor requires backend" test_schedule_honor_requires_backend_command
     run_test "Schedule: Honor create" test_schedule_honor_creates_timer_and_metadata
     run_test "Schedule: Restart warnings" test_schedule_restart_creates_warning_timers

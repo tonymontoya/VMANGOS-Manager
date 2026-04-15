@@ -21,9 +21,15 @@ STATUS_COLORS = {
     "warning": "#f59e0b",
     "degraded": "#fbbf24",
     "missing": "#f59e0b",
+    "notice": "#7dd3fc",
+    "info": "#7dd3fc",
+    "debug": "#94a3b8",
     "stopped": "#f59e0b",
     "inactive": "#f59e0b",
     "critical": "#f87171",
+    "error": "#ef4444",
+    "alert": "#ef4444",
+    "emergency": "#ef4444",
     "failed": "#ef4444",
     "crash-loop": "#fb7185",
     "unreachable": "#fb7185",
@@ -39,11 +45,11 @@ ACCENT_GREEN = "#34d399"
 ACCENT_BLUE = "#3b82f6"
 
 ACTION_STYLES = {
-    "info": ("LIVE", ACCENT_SKY),
-    "running": ("WORKING", ACCENT_GOLD),
-    "success": ("READY", ACCENT_GREEN),
-    "warning": ("CHECK", ACCENT_GOLD),
-    "error": ("ERROR", ACCENT_ROSE),
+    "info": ("Action", ACCENT_SKY),
+    "running": ("Running", ACCENT_GOLD),
+    "success": ("Complete", ACCENT_GREEN),
+    "warning": ("Attention", ACCENT_GOLD),
+    "error": ("Failed", ACCENT_ROSE),
 }
 
 VIEW_TITLES = {
@@ -52,6 +58,7 @@ VIEW_TITLES = {
     "accounts": "Accounts",
     "backups": "Backups",
     "config": "Config",
+    "logs": "Logs",
     "operations": "Operations",
 }
 
@@ -61,7 +68,8 @@ VIEW_SUMMARIES = {
     "accounts": "Work the selected-account admin flow for provisioning, access, and moderation.",
     "backups": "Check protection posture, then act on the selected archive with confidence.",
     "config": "Confirm Manager's wiring view before you trust higher-level automation.",
-    "operations": "Review the maintenance queue and preflight risky change windows.",
+    "logs": "Inspect recent realm events by source, severity, and time window without leaving Manager.",
+    "operations": "Work the maintenance and change-window flow: readiness, scheduled tasks, and update planning.",
 }
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9]{2,32}$")
@@ -73,6 +81,10 @@ WEEKLY_SCHEDULE_PATTERN = re.compile(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) ([0-1][0-9
 SCHEDULE_TYPE_PATTERN = re.compile(r"^(daily|weekly)$", re.IGNORECASE)
 DAY_NAME_PATTERN = re.compile(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$")
 WARNINGS_PATTERN = re.compile(r"^[1-9][0-9]*(,[1-9][0-9]*)*$")
+LOG_WINDOW_PATTERN = re.compile(r"^[1-9][0-9]*[mhd]$")
+LOG_SEVERITY_PATTERN = re.compile(r"^(all|debug|info|notice|warning|error|critical|alert)$", re.IGNORECASE)
+LOG_SOURCE_PATTERN = re.compile(r"^(all|auth|world)$", re.IGNORECASE)
+LOG_LIMIT_PATTERN = re.compile(r"^[1-9][0-9]{0,2}$")
 
 TREND_HISTORY_LIMIT = 24
 SPARKLINE_BARS = "▁▂▃▄▅▆▇█"
@@ -477,6 +489,49 @@ def normalize_form_values(values: dict[str, Any] | None) -> dict[str, str]:
     return normalized
 
 
+def normalize_logs_query(values: dict[str, Any] | None = None) -> dict[str, str]:
+    normalized = normalize_form_values(values)
+    return {
+        "source": (normalized.get("source") or "all").lower(),
+        "window": (normalized.get("window") or "15m").lower(),
+        "severity": (normalized.get("severity") or "all").lower(),
+        "limit": normalized.get("limit") or "25",
+    }
+
+
+def player_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
+    server = snapshot.get("server", {})
+    server_data = server.get("data", {}) if server.get("ok") else {}
+    player_state = server_data.get("players", {})
+    roster = snapshot.get("players", [])
+    online_count = clamp_int(player_state.get("online", len(roster)))
+    gm_players = [player for player in roster if clamp_int(player.get("gm_level", 0)) > 0]
+    gm_names = [str(player.get("username", "")).strip() for player in gm_players if str(player.get("username", "")).strip()]
+    gm_summary = ", ".join(gm_names[:3]) if gm_names else "none"
+    if len(gm_names) > 3:
+        gm_summary = f"{gm_summary} +{len(gm_names) - 3}"
+    staff_count = len(gm_players)
+    player_count = max(online_count - staff_count, 0)
+
+    if roster:
+        roster_source = "online roster"
+    elif online_count > 0:
+        roster_source = "count-only"
+    else:
+        roster_source = "empty roster"
+
+    return {
+        "online_count": online_count,
+        "count_source": str(player_state.get("source", "unavailable") or "unavailable"),
+        "roster_count": len(roster),
+        "roster_source": roster_source,
+        "gm_names": gm_names,
+        "gm_summary": gm_summary,
+        "staff_count": staff_count,
+        "player_count": player_count,
+    }
+
+
 def find_selected_account(snapshot: dict[str, Any], selected_account_id: str) -> dict[str, Any] | None:
     accounts = snapshot.get("all_accounts", [])
     if selected_account_id:
@@ -500,6 +555,25 @@ def find_selected_schedule(snapshot: dict[str, Any], selected_schedule_id: str) 
     if selected_schedule_id:
         for entry in entries:
             if str(entry.get("id", "")) == selected_schedule_id:
+                return entry
+    return entries[0] if entries else None
+
+
+def log_entry_key(entry: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            str(entry.get("timestamp", "") or ""),
+            str(entry.get("source", "") or ""),
+            str(entry.get("message", "") or ""),
+        ]
+    )
+
+
+def find_selected_log_entry(snapshot: dict[str, Any], selected_log_key: str) -> dict[str, Any] | None:
+    entries = snapshot.get("log_events", [])
+    if selected_log_key:
+        for entry in entries:
+            if log_entry_key(entry) == selected_log_key:
                 return entry
     return entries[0] if entries else None
 
@@ -536,15 +610,17 @@ def view_command_tokens(active_view: str) -> list[tuple[str, str]]:
         ]
     if active_view == "operations":
         return [
-            ("h", "schedule maintenance"),
-            ("m", "schedule restart"),
-            ("j", "cancel schedule"),
-            ("P", "update plan"),
-            ("T", "test logs"),
-            ("l", "rotate logs"),
+            ("h", "maintenance"),
+            ("m", "restart"),
+            ("j", "remove task"),
+            ("P", "plan"),
+            ("T", "test config"),
+            ("l", "rotate"),
         ]
     if active_view == "config":
         return [("k", "validate config")]
+    if active_view == "logs":
+        return [("f", "filters")]
     return [
         ("o", "roster"),
         ("s", "start"),
@@ -564,7 +640,8 @@ def render_command_rail(active_view: str) -> str:
             ("3", "accounts"),
             ("4", "backups"),
             ("5", "config"),
-            ("6", "ops"),
+            ("6", "logs"),
+            ("7", "ops"),
         ]
     )
     global_actions = format_command_tokens([("r", "refresh"), ("t", "theme"), ("q", "quit")])
@@ -604,6 +681,11 @@ def build_dashboard_action_request(
             "env": {"VMANGOS_PASSWORD": password},
             "refresh_after": True,
             "view": "accounts",
+            "feedback": {
+                "success_receipt": f"Created account {username}.",
+                "success_next": "Stay in Accounts to set GM access, reset the password again, or ban the account if needed.",
+                "failure_next": "Check username policy and auth DB connectivity, then retry from Accounts.",
+            },
         }
 
     if action_name == "config_validate":
@@ -613,6 +695,11 @@ def build_dashboard_action_request(
             "env": {},
             "refresh_after": True,
             "view": "config",
+            "feedback": {
+                "success_receipt": "Revalidated Manager's configuration wiring against the current host.",
+                "success_next": "If validation still looks wrong, fix manager.conf or .dbpass in the shell and re-run validation here.",
+                "failure_next": "Review manager.conf and .dbpass in the shell, then validate again from Config.",
+            },
         }
 
     if action_name == "logs_rotate":
@@ -622,6 +709,11 @@ def build_dashboard_action_request(
             "env": {},
             "refresh_after": True,
             "view": "operations",
+            "feedback": {
+                "success_receipt": "Requested a log rotation cycle for the realm host.",
+                "success_next": "Review Maintenance Readiness after refresh to confirm rotation posture and disk headroom.",
+                "failure_next": "Check logrotate wiring and permissions, then retry from Operations.",
+            },
         }
 
     if action_name == "logs_test_config":
@@ -631,6 +723,11 @@ def build_dashboard_action_request(
             "env": {},
             "refresh_after": False,
             "view": "operations",
+            "feedback": {
+                "success_receipt": "Validated the current log rotation configuration.",
+                "success_next": "If readiness still looks risky here, inspect log config in the shell before the next maintenance window.",
+                "failure_next": "Fix log rotation config in the shell, then rerun the test from Operations.",
+            },
         }
 
     account = find_selected_account(snapshot, selected_account_id)
@@ -654,6 +751,11 @@ def build_dashboard_action_request(
                 "env": {"VMANGOS_PASSWORD": password},
                 "refresh_after": True,
                 "view": "accounts",
+                "feedback": {
+                    "success_receipt": f"Reset the password for {username}.",
+                    "success_next": "Deliver the new credential out-of-band, then use the selected account row to confirm other access state if needed.",
+                    "failure_next": f"Retry the password reset for {username} from Accounts after correcting the input or auth DB issue.",
+                },
             }
 
         if action_name == "account_setgm":
@@ -666,6 +768,11 @@ def build_dashboard_action_request(
                 "env": {},
                 "refresh_after": True,
                 "view": "accounts",
+                "feedback": {
+                    "success_receipt": f"Set GM level {gm_level} for {username}.",
+                    "success_next": "Let the Accounts table refresh, then confirm the new GM level in the selected row.",
+                    "failure_next": f"Review the selected account and GM level input for {username}, then retry from Accounts.",
+                },
             }
 
         if action_name == "account_ban":
@@ -681,6 +788,11 @@ def build_dashboard_action_request(
                 "env": {},
                 "refresh_after": True,
                 "view": "accounts",
+                "feedback": {
+                    "success_receipt": f"Banned {username} for {duration}.",
+                    "success_next": "Let Accounts refresh, then confirm the banned state before moving on to other moderation work.",
+                    "failure_next": f"Review the duration and reason for {username}, then retry the ban from Accounts.",
+                },
             }
 
         if action_name == "account_unban":
@@ -690,6 +802,11 @@ def build_dashboard_action_request(
                 "env": {},
                 "refresh_after": True,
                 "view": "accounts",
+                "feedback": {
+                    "success_receipt": f"Removed active bans for {username}.",
+                    "success_next": "Let Accounts refresh, then confirm the banned flag is cleared for the selected account.",
+                    "failure_next": f"Retry the unban for {username} from Accounts after checking auth DB connectivity.",
+                },
             }
 
     if action_name.startswith("backup_"):
@@ -710,6 +827,11 @@ def build_dashboard_action_request(
                 "env": {},
                 "refresh_after": False,
                 "view": "backups",
+                "feedback": {
+                    "success_receipt": f"Completed a restore dry-run for {backup_file}.",
+                    "success_next": "Review the selected backup here; live restore stays in the CLI and should only be run during an approved recovery window.",
+                    "failure_next": "Inspect the archive path and backup health, then retry the dry-run from Backups.",
+                },
             }
 
         if action_name == "backup_schedule_daily":
@@ -722,6 +844,11 @@ def build_dashboard_action_request(
                 "env": {},
                 "refresh_after": True,
                 "view": "backups",
+                "feedback": {
+                    "success_receipt": f"Updated the daily backup schedule for {daily_time}.",
+                    "success_next": "Review Timer State after refresh to confirm the next run and overall protection posture.",
+                    "failure_next": "Check the requested time and timer permissions, then retry from Backups.",
+                },
             }
 
         if action_name == "backup_schedule_weekly":
@@ -734,6 +861,11 @@ def build_dashboard_action_request(
                 "env": {},
                 "refresh_after": True,
                 "view": "backups",
+                "feedback": {
+                    "success_receipt": f"Updated the weekly backup schedule for {weekly_schedule}.",
+                    "success_next": "Review Timer State after refresh to confirm the next weekly run and protection posture.",
+                    "failure_next": "Check the requested weekly schedule format and retry from Backups.",
+                },
             }
 
     if action_name in ("schedule_honor_create", "schedule_restart_create"):
@@ -778,21 +910,33 @@ def build_dashboard_action_request(
             "env": {},
             "refresh_after": True,
             "view": "operations",
+            "feedback": {
+                "success_receipt": (
+                    f"Scheduled a {'maintenance task' if action_name == 'schedule_honor_create' else 'restart window'} for {cadence} {timezone_value}".strip()
+                ),
+                "success_next": "Review Scheduled Tasks after refresh so you can confirm the queue entry, next run, and warnings.",
+                "failure_next": "Check the cadence, time, timezone, and warning inputs, then retry from Operations.",
+            },
         }
 
     if action_name == "schedule_cancel":
         schedule = find_selected_schedule(snapshot, selected_schedule_id)
         if schedule is None:
-            return {"error": "schedule cancel skipped: no job selected"}
+            return {"error": "task removal skipped: no task selected"}
         schedule_id = str(schedule.get("id", "")).strip()
         if not schedule_id:
-            return {"error": "schedule cancel skipped: selected schedule has no id"}
+            return {"error": "task removal skipped: selected task has no id"}
         return {
-            "label": f"schedule cancel {schedule_id}",
+            "label": f"remove task {schedule_id}",
             "command": ["schedule", "cancel", schedule_id],
             "env": {},
             "refresh_after": True,
             "view": "operations",
+            "feedback": {
+                "success_receipt": f"Removed scheduled task {schedule_id}.",
+                "success_next": "Review the queue after refresh before you create or approve more maintenance work.",
+                "failure_next": f"Retry removing {schedule_id} from Operations after checking the selected task.",
+            },
         }
 
     return {"error": f"unsupported dashboard action: {action_name}"}
@@ -834,6 +978,7 @@ def empty_snapshot(error_message: str) -> dict[str, Any]:
         "config_path": "",
         "server": {"ok": False, "data": {}, "error": error_message},
         "logs": {"ok": False, "data": {}, "error": error_message},
+        "realm_logs": {"ok": False, "data": {}, "error": error_message},
         "schedule_list": {"ok": False, "data": {}, "error": error_message},
         "update_check": {"ok": False, "data": {}, "error": error_message},
         "update_inspect": {"ok": False, "data": {}, "error": error_message},
@@ -848,6 +993,7 @@ def empty_snapshot(error_message: str) -> dict[str, Any]:
         "backups": {"entries": [], "summary": {}},
         "players": [],
         "all_accounts": [],
+        "log_events": [],
         "schedules": [],
     }
 
@@ -883,7 +1029,8 @@ def extract_seed_metric_history(snapshot: dict[str, Any]) -> list[dict[str, Any]
     return history[-TREND_HISTORY_LIMIT:]
 
 
-def build_snapshot(manager_bin: str, config_path: str) -> dict[str, Any]:
+def build_snapshot(manager_bin: str, config_path: str, logs_query: dict[str, Any] | None = None) -> dict[str, Any]:
+    query = normalize_logs_query(logs_query)
     server = run_manager_command(
         manager_bin,
         config_path,
@@ -895,6 +1042,24 @@ def build_snapshot(manager_bin: str, config_path: str) -> dict[str, Any]:
         manager_bin,
         config_path,
         ["logs", "status"],
+        parser_mode="envelope",
+        use_global_json=True,
+    )
+    realm_logs = run_manager_command(
+        manager_bin,
+        config_path,
+        [
+            "logs",
+            "recent",
+            "--source",
+            query["source"],
+            "--window",
+            query["window"],
+            "--severity",
+            query["severity"],
+            "--limit",
+            query["limit"],
+        ],
         parser_mode="envelope",
         use_global_json=True,
     )
@@ -970,6 +1135,7 @@ def build_snapshot(manager_bin: str, config_path: str) -> dict[str, Any]:
     backup_entries = backups["data"] if backups["ok"] and isinstance(backups["data"], list) else []
     players = online_accounts["data"].get("accounts", []) if online_accounts["ok"] else []
     all_accounts = accounts["data"].get("accounts", []) if accounts["ok"] else []
+    log_events = realm_logs["data"].get("events", []) if realm_logs["ok"] else []
     schedule_entries = schedules["data"].get("schedules", []) if schedules["ok"] else []
     backup_dir = config_values.get("backup.backup_dir", "")
     password_file = str(config_values.get("database.password_file", "") or "")
@@ -995,6 +1161,7 @@ def build_snapshot(manager_bin: str, config_path: str) -> dict[str, Any]:
         "config_path": config_path,
         "server": server,
         "logs": logs,
+        "realm_logs": realm_logs,
         "schedule_list": schedules,
         "update_check": update_check,
         "update_inspect": update_inspect,
@@ -1012,6 +1179,7 @@ def build_snapshot(manager_bin: str, config_path: str) -> dict[str, Any]:
         },
         "players": players,
         "all_accounts": all_accounts,
+        "log_events": log_events,
         "schedules": schedule_entries,
     }
 
@@ -1022,21 +1190,30 @@ def render_action_banner(
     last_action: str,
     action_tone: str,
     refresh_interval: int,
+    action_receipt: str = "",
+    action_next_step: str = "",
+    action_view_context: str | None = None,
 ) -> str:
     tone_label, tone_color = ACTION_STYLES.get(action_tone, ACTION_STYLES["info"])
     captured_at = iso_to_display(snapshot.get("captured_at"))
     message = escape_markup(truncate_text(last_action or "dashboard started", 140))
+    receipt = escape_markup(truncate_text(action_receipt or "", 140))
+    next_step = escape_markup(truncate_text(action_next_step or "", 140))
     view_title = VIEW_TITLES.get(active_view, active_view.title())
     view_summary = VIEW_SUMMARIES.get(active_view, "Operate the realm from one console.")
-    return "\n".join(
-        [
-            f"[bold {ACCENT_GOLD}]VMaNGOS Manager[/]  [{ACCENT_MUTED}]realm console[/]  [bold {ACCENT_SKY}]{view_title}[/]  [{ACCENT_MUTED}]refresh[/] {refresh_interval}s",
-            f"[{ACCENT_MUTED}]last refresh[/] {captured_at}  [{ACCENT_MUTED}]status[/] [bold {tone_color}]{tone_label}[/]",
-            "",
-            f"[bold {ACCENT_SKY}]This View[/] {escape_markup(view_summary)}",
-            f"[{ACCENT_MUTED}]Last action[/] {message}",
-        ]
-    )
+    show_follow_up = not action_view_context or active_view == action_view_context
+    lines = [
+        f"[bold {ACCENT_GOLD}]VMaNGOS Manager[/]  [{ACCENT_MUTED}]realm console[/]  [bold {ACCENT_SKY}]{view_title}[/]  [{ACCENT_MUTED}]refresh[/] {refresh_interval}s",
+        f"[{ACCENT_MUTED}]last refresh[/] {captured_at}  [{ACCENT_MUTED}]action state[/] [bold {tone_color}]{tone_label}[/]",
+        "",
+        f"[bold {ACCENT_SKY}]This View[/] {escape_markup(view_summary)}",
+        f"[{ACCENT_MUTED}]Last action[/] {message}",
+    ]
+    if show_follow_up and receipt:
+        lines.append(f"[{ACCENT_MUTED}]Receipt[/] {receipt}")
+    if show_follow_up and next_step:
+        lines.append(f"[{ACCENT_MUTED}]Next[/] {next_step}")
+    return "\n".join(lines)
 
 
 def render_sidebar(active_view: str, last_action: str, snapshot: dict[str, Any], refresh_interval: int) -> str:
@@ -1046,7 +1223,8 @@ def render_sidebar(active_view: str, last_action: str, snapshot: dict[str, Any],
         ("accounts", "3", "Accounts"),
         ("backups", "4", "Backups"),
         ("config", "5", "Config"),
-        ("operations", "6", "Ops"),
+        ("logs", "6", "Logs"),
+        ("operations", "7", "Ops"),
     ]
 
     server = snapshot.get("server", {})
@@ -1055,7 +1233,7 @@ def render_sidebar(active_view: str, last_action: str, snapshot: dict[str, Any],
     auth = services.get("auth", {})
     world = services.get("world", {})
     backups = snapshot.get("backups", {}).get("summary", {})
-    players_online = len(snapshot.get("players", []))
+    players = player_summary(snapshot)
 
     lines = [
         f"[bold {ACCENT_GOLD}]VMaNGOS Manager[/]",
@@ -1075,7 +1253,7 @@ def render_sidebar(active_view: str, last_action: str, snapshot: dict[str, Any],
             f"[bold {ACCENT_SKY}]Realm Pulse[/]",
             f"[{ACCENT_MUTED}]Updated[/]  {iso_to_clock(snapshot.get('captured_at'))}",
             f"[{ACCENT_MUTED}]Refresh[/]  {refresh_interval}s",
-            f"[{ACCENT_MUTED}]Players[/]  {players_online} online",
+            f"[{ACCENT_MUTED}]Players[/]  {players.get('online_count', 0)} online",
             f"[{ACCENT_MUTED}]Backups[/]  {backups.get('count', 0)} known",
             f"[{ACCENT_MUTED}]Auth[/]     {format_state(auth.get('health', auth.get('state', 'unavailable')))}",
             f"[{ACCENT_MUTED}]World[/]    {format_state(world.get('health', world.get('state', 'unavailable')))}",
@@ -1464,20 +1642,13 @@ def render_player_pulse(
     refresh_interval: int = 2,
 ) -> str:
     metric_history = metric_history or []
-    server = snapshot.get("server", {})
-    server_data = server.get("data", {}) if server.get("ok") else {}
-    player_state = server_data.get("players", {})
     players = snapshot.get("players", [])
-    online_now = clamp_int(player_state.get("online", len(players)))
+    summary = player_summary(snapshot)
+    online_now = int(summary.get("online_count", 0))
     player_history = history_values(metric_history, "players")
     peak_window = int(max(player_history)) if player_history else online_now
-    gm_players = [player for player in players if clamp_int(player.get("gm_level", 0)) > 0]
-    gm_names = [str(player.get("username", "")).strip() for player in gm_players if str(player.get("username", "")).strip()]
-    gm_summary = ", ".join(gm_names[:3]) if gm_names else "none"
-    if len(gm_names) > 3:
-        gm_summary = f"{gm_summary} +{len(gm_names) - 3}"
-    staff_count = len(gm_players)
-    player_count = max(online_now - staff_count, 0)
+    staff_count = int(summary.get("staff_count", 0))
+    player_count = int(summary.get("player_count", 0))
     if staff_count > 0:
         coverage = max(int(round(online_now / staff_count)), 1)
         coverage_text = f"1 GM / {coverage} online"
@@ -1491,10 +1662,11 @@ def render_player_pulse(
             "",
             f"[{ACCENT_MUTED}]Online Now[/]   [bold {ACCENT_GOLD}]{online_now}[/]  [{ACCENT_MUTED}]trend[/] {describe_trend(player_history, 'players')}",
             f"[{ACCENT_MUTED}]Peak Window[/] {peak_window}  [{ACCENT_MUTED}]window[/] {history_window_label(metric_history, refresh_interval)}",
-            f"[{ACCENT_MUTED}]Count Source[/] {escape_markup(player_state.get('source', 'unavailable'))}",
+            f"[{ACCENT_MUTED}]Count Source[/] {escape_markup(str(summary.get('count_source', 'unavailable')))}",
             f"[{ACCENT_MUTED}]Mix[/]          players={player_count}  staff={staff_count}",
             f"[{ACCENT_MUTED}]GM Coverage[/]  {escape_markup(coverage_text)}",
-            f"[{ACCENT_MUTED}]GMs Online[/]   {staff_count}  [{ACCENT_MUTED}]names[/] {escape_markup(truncate_text(gm_summary, 36))}",
+            f"[{ACCENT_MUTED}]GMs Online[/]   {staff_count}  [{ACCENT_MUTED}]names[/] {escape_markup(truncate_text(summary.get('gm_summary', 'none'), 36))}",
+            f"[{ACCENT_MUTED}]Roster[/]       {summary.get('roster_count', len(players))} visible  [{ACCENT_MUTED}]mode[/] {escape_markup(str(summary.get('roster_source', 'unknown')))}",
             "",
             f"[{ACCENT_MUTED}]Drilldown[/]   [bold {ACCENT_GOLD}]o[/] online roster  [bold {ACCENT_GOLD}]2[/] accounts",
         ]
@@ -1534,7 +1706,7 @@ def render_account_details(account: dict[str, Any] | None, total_accounts: int) 
 
 def render_alerts_panel(snapshot: dict[str, Any]) -> str:
     server = snapshot["server"]
-    lines = [f"[bold {ACCENT_GOLD}]Alerts and Events[/]", f"[{ACCENT_MUTED}]Recent risk signals and maintenance events.[/]", ""]
+    lines = [f"[bold {ACCENT_GOLD}]Alerts and Events[/]", f"[{ACCENT_MUTED}]Active risk signals plus recent realm-side events worth noticing.[/]", ""]
 
     if not server["ok"]:
         lines.append(f"[bold {ACCENT_ROSE}]Alerts unavailable:[/] {server['error']}")
@@ -1623,6 +1795,7 @@ def render_backups_summary(snapshot: dict[str, Any], selected_backup: dict[str, 
                 f"[{ACCENT_MUTED}]Created By[/]  {escape_markup(selected_backup.get('created_by', 'n/a'))}",
                 "",
                 f"[{ACCENT_MUTED}]Ready for[/]   verify or restore dry-run from this selection.",
+                f"[{ACCENT_MUTED}]Boundary[/]    dry-run restore here first; live restore stays in the CLI on purpose.",
             ]
         )
     else:
@@ -1630,6 +1803,7 @@ def render_backups_summary(snapshot: dict[str, Any], selected_backup: dict[str, 
             [
                 "",
                 f"[{ACCENT_MUTED}]Selection[/]   choose a backup row to inspect, verify, or dry-run restore.",
+                f"[{ACCENT_MUTED}]Boundary[/]    verify and dry-run here; live restore stays in the CLI.",
             ]
         )
 
@@ -1672,8 +1846,8 @@ def render_config_panel(snapshot: dict[str, Any]) -> str:
             f"[{ACCENT_MUTED}]DB Secret[/]     {escape_markup(secret_label)}",
             f"[{ACCENT_MUTED}]DB Names[/]      auth={summary.get('auth_db', 'n/a')} world={summary.get('world_db', 'n/a')} chars={summary.get('characters_db', 'n/a')} logs={summary.get('logs_db', 'n/a')}",
             "",
-            f"[bold {ACCENT_SKY}]Dashboard Role[/]",
-            f"[{ACCENT_MUTED}]Read-only[/]     validate and review wiring here; edit manager.conf and .dbpass in the shell.",
+            f"[bold {ACCENT_SKY}]Boundary[/]",
+            f"[{ACCENT_MUTED}]Read-only[/]     inspect and validate wiring here; edit manager.conf and .dbpass in the shell.",
             f"[{ACCENT_MUTED}]CLI[/]           [bold {ACCENT_GOLD}]config detect[/], [bold {ACCENT_GOLD}]config validate[/], [bold {ACCENT_GOLD}]config show[/]",
             f"[{ACCENT_MUTED}]Action[/]        [bold {ACCENT_GOLD}]k[/] validate config",
         ]
@@ -1698,6 +1872,25 @@ def format_update_assessment(value: Any) -> str:
     return f"[bold {ACCENT_MUTED}]{label}[/]"
 
 
+def summarize_named_counts(counts: dict[str, Any], preferred_order: list[str] | None = None) -> str:
+    if not isinstance(counts, dict) or not counts:
+        return "none"
+
+    ordered_keys: list[str] = []
+    preferred = preferred_order or []
+    for key in preferred:
+        if key in counts:
+            ordered_keys.append(key)
+    for key in sorted(counts.keys()):
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+
+    parts: list[str] = []
+    for key in ordered_keys:
+        parts.append(f"{key}={counts.get(key, 0)}")
+    return "  ".join(parts)
+
+
 def maintenance_window_state(logs_data: dict[str, Any]) -> str:
     config = logs_data.get("config", {})
     log_counts = logs_data.get("logs", {})
@@ -1714,13 +1907,108 @@ def maintenance_window_state(logs_data: dict[str, Any]) -> str:
     return "healthy"
 
 
+def render_realm_logs_summary(snapshot: dict[str, Any]) -> str:
+    realm_logs = snapshot.get("realm_logs", {})
+    lines = [
+        f"[bold {ACCENT_GOLD}]Realm Logs[/]",
+        "",
+        f"[{ACCENT_MUTED}]Recent auth/world activity for live troubleshooting. This view follows the current filters on each refresh.[/]",
+        "",
+    ]
+
+    if not realm_logs.get("ok"):
+        lines.extend(
+            [
+                f"[bold {ACCENT_ROSE}]Log view unavailable:[/] {format_error_text(realm_logs.get('error', 'unknown error'))}",
+                "",
+                f"[{ACCENT_MUTED}]Next[/] verify logs recent works from the CLI, then retry [bold {ACCENT_GOLD}]r[/] refresh.",
+                f"[{ACCENT_MUTED}]Filters[/] [bold {ACCENT_GOLD}]f[/] adjust source, window, severity, and limit",
+            ]
+        )
+        return "\n".join(lines)
+
+    data = realm_logs.get("data", {})
+    filters = data.get("filters", {})
+    summary = data.get("summary", {})
+    capabilities = data.get("capabilities", {})
+    source_counts = summarize_named_counts(summary.get("source_counts", {}), ["auth", "world"])
+    severity_counts = summarize_named_counts(
+        summary.get("severity_counts", {}),
+        ["critical", "error", "warning", "notice", "info", "debug"],
+    )
+    available_sources = ", ".join(summary.get("available_sources", [])) or "none"
+    events_returned = clamp_int(summary.get("events_returned", 0))
+    top_severity = summarize_named_counts(summary.get("severity_counts", {}), ["critical", "error", "warning"])
+    if top_severity == "none":
+        top_severity = "none"
+    latest_event = snapshot.get("log_events", [None])[0]
+    latest_summary = "none in current window"
+    if latest_event:
+        latest_summary = (
+            f"{iso_to_clock(latest_event.get('timestamp'))} "
+            f"{latest_event.get('source', 'unknown')}: "
+            f"{truncate_text(latest_event.get('message', ''), 40)}"
+        )
+
+    lines.extend(
+        [
+            f"[{ACCENT_MUTED}]Filters[/]      source={filters.get('source', 'all')}  window={filters.get('window', '15m')}  severity={filters.get('severity', 'all')}  limit={filters.get('limit', 25)}",
+            f"[{ACCENT_MUTED}]Events[/]       {events_returned} visible  [{ACCENT_MUTED}]latest[/] {escape_markup(latest_summary)}",
+            f"[{ACCENT_MUTED}]Hot Path[/]     {escape_markup(top_severity)}",
+            f"[{ACCENT_MUTED}]Source Mix[/]   {escape_markup(source_counts)}",
+            f"[{ACCENT_MUTED}]Severity Mix[/] {escape_markup(severity_counts)}",
+            f"[{ACCENT_MUTED}]Coverage[/]     backing={escape_markup(str(summary.get('backing', 'unavailable')))}  sources={summary.get('sources_available', 0)}/{summary.get('sources_requested', 0)}  available={escape_markup(available_sources)}",
+            f"[{ACCENT_MUTED}]Follow[/]       refresh={str(capabilities.get('follow_via_refresh', False)).lower()}  severity_filter={str(capabilities.get('severity_filter_supported', False)).lower()}  window_filter={str(capabilities.get('time_window_supported', False)).lower()}",
+            "",
+            f"[{ACCENT_MUTED}]Adjust[/]       [bold {ACCENT_GOLD}]f[/] filters  [{ACCENT_MUTED}]Follow[/] automatic on refresh",
+            f"[{ACCENT_MUTED}]Escalate[/]     stay here for evidence  [bold {ACCENT_GOLD}]7[/] Ops when this becomes maintenance or change-window work",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_log_event_details(entry: dict[str, Any] | None, total_count: int) -> str:
+    lines = [
+        f"[bold {ACCENT_GOLD}]Selected Event[/]",
+        "",
+        f"[{ACCENT_MUTED}]Inspect the highlighted log entry here before dropping to shell tools.[/]",
+        "",
+        f"[{ACCENT_MUTED}]Window[/] {total_count} visible event{'s' if total_count != 1 else ''}",
+    ]
+
+    if entry is None:
+        lines.extend(
+            [
+                "",
+                f"[{ACCENT_MUTED}]No event selected. Use [bold {ACCENT_GOLD}]f[/] to widen the filter or wait for the next refresh.[/]",
+            ]
+        )
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "",
+            f"[{ACCENT_MUTED}]Time[/]       {iso_to_display(entry.get('timestamp'))}",
+            f"[{ACCENT_MUTED}]Source[/]     {escape_markup(str(entry.get('source', 'unknown')))}",
+            f"[{ACCENT_MUTED}]Severity[/]   {format_state(entry.get('severity', 'info'))}",
+            f"[{ACCENT_MUTED}]Service[/]    {escape_markup(str(entry.get('service', 'n/a')))}",
+            f"[{ACCENT_MUTED}]Unit[/]       {escape_markup(str(entry.get('unit', 'n/a')))}",
+            f"[{ACCENT_MUTED}]Identifier[/] {escape_markup(str(entry.get('identifier', 'n/a')))}",
+            "",
+            f"[bold {ACCENT_SKY}]Message[/]",
+            f"{escape_markup(str(entry.get('message', '')))}",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def render_logs_panel(snapshot: dict[str, Any]) -> str:
     logs = snapshot.get("logs", {})
     queue_count = len(snapshot.get("schedules", []))
     lines = [
-        f"[bold {ACCENT_GOLD}]Change Window Readiness[/]",
+        f"[bold {ACCENT_GOLD}]Maintenance Readiness[/]",
         "",
-        f"[{ACCENT_MUTED}]Can this host safely absorb scheduled maintenance right now?[/]",
+        f"[{ACCENT_MUTED}]Log rotation, file hygiene, and disk headroom that can make or break a clean maintenance window.[/]",
         "",
     ]
 
@@ -1741,15 +2029,16 @@ def render_logs_panel(snapshot: dict[str, Any]) -> str:
         [
             f"[{ACCENT_MUTED}]Overall[/]       {format_state(readiness)}",
             f"[{ACCENT_MUTED}]Queue[/]         {queue_count} scheduled task{'s' if queue_count != 1 else ''}",
-            f"[{ACCENT_MUTED}]Logs[/]          {format_state(data.get('status', 'unavailable'))}",
+            f"[{ACCENT_MUTED}]Log Health[/]    {format_state(data.get('status', 'unavailable'))}",
             f"[{ACCENT_MUTED}]Rotation[/]      {format_state(config_state)}  present={config.get('present', False)}  in_sync={config.get('in_sync', False)}",
             f"[{ACCENT_MUTED}]Sensitive[/]     {format_state(sensitive_state)}  perms_ok={log_counts.get('sensitive_permissions_ok', False)}",
             f"[{ACCENT_MUTED}]Files[/]         active={log_counts.get('active_files', 0)}  rotated={log_counts.get('rotated_files', 0)}",
             f"[{ACCENT_MUTED}]Headroom[/]      {disk.get('used_percent', 0)}% used  free {format_gb_from_kb(disk.get('available_kb', 0))}",
             f"[{ACCENT_MUTED}]Retention[/]     max={policy.get('max_size', 'n/a')}  min={policy.get('min_size', 'n/a')}",
             "",
-            f"[{ACCENT_MUTED}]Schedule Here[/] [bold {ACCENT_GOLD}]h[/] maintenance  [bold {ACCENT_GOLD}]m[/] restart",
-            f"[{ACCENT_MUTED}]Support[/]       [bold {ACCENT_GOLD}]T[/] test logs  [bold {ACCENT_GOLD}]l[/] rotate logs",
+            f"[{ACCENT_MUTED}]Create[/]        [bold {ACCENT_GOLD}]h[/] maintenance  [bold {ACCENT_GOLD}]m[/] restart",
+            f"[{ACCENT_MUTED}]Support[/]       [bold {ACCENT_GOLD}]T[/] test log config  [bold {ACCENT_GOLD}]l[/] rotate logs",
+            f"[{ACCENT_MUTED}]Boundary[/]      inspect realm events in Logs; use this panel for readiness before scheduled work.",
         ]
     )
     return "\n".join(lines)
@@ -1759,9 +2048,9 @@ def render_update_panel(snapshot: dict[str, Any], update_plan_data: dict[str, An
     check = snapshot.get("update_check", {})
     inspect = snapshot.get("update_inspect", {})
     lines = [
-        f"[bold {ACCENT_GOLD}]Update Readiness[/]",
+        f"[bold {ACCENT_GOLD}]Change Window Readiness[/]",
         "",
-        f"[{ACCENT_MUTED}]Repository drift and database impact before risky code changes.[/]",
+        f"[{ACCENT_MUTED}]Repository drift, DB impact, and next-step planning before risky code changes.[/]",
         "",
     ]
 
@@ -1816,6 +2105,15 @@ def render_update_panel(snapshot: dict[str, Any], update_plan_data: dict[str, An
             ]
         )
 
+    lines.extend(
+        [
+            "",
+            f"[bold {ACCENT_SKY}]Boundary[/]",
+            f"[{ACCENT_MUTED}]Dashboard[/]     inspect readiness and build the plan here.",
+            f"[{ACCENT_MUTED}]CLI[/]           run update apply or source-tree work from the shell after backup and maintenance prep.",
+        ]
+    )
+
     return "\n".join(lines)
 
 
@@ -1833,19 +2131,19 @@ def schedule_label(schedule: dict[str, Any]) -> str:
 def schedule_origin_label(schedule: dict[str, Any]) -> str:
     job_type = str(schedule.get("job_type", "") or "").strip().lower()
     if job_type == "honor":
-        return "schedule honor -> maintenance.honor_command"
+        return "maintenance task scheduled by Manager"
     if job_type == "restart":
-        return "schedule restart -> server restart workflow"
-    return "manager scheduler backend"
+        return "restart window scheduled by Manager"
+    return "scheduled by Manager"
 
 
 def render_schedule_intro(schedules: list[dict[str, Any]]) -> str:
     count = len(schedules)
     return "\n".join(
         [
-            f"[{ACCENT_MUTED}]Schedule Here[/] [bold {ACCENT_GOLD}]h[/] maintenance  [bold {ACCENT_GOLD}]m[/] restart",
-            f"[{ACCENT_MUTED}]Queue Source[/]  schedules appear here after dashboard scheduling or the matching [bold {ACCENT_GOLD}]schedule[/] CLI commands.",
-            f"[{ACCENT_MUTED}]Now[/]           {count} scheduled task{'s' if count != 1 else ''} in the queue.",
+            f"[{ACCENT_MUTED}]Create[/]        [bold {ACCENT_GOLD}]h[/] maintenance  [bold {ACCENT_GOLD}]m[/] restart",
+            f"[{ACCENT_MUTED}]Source[/]        tasks appear here after you create them in Operations or with the matching schedule CLI commands.",
+            f"[{ACCENT_MUTED}]Queue[/]         {count} scheduled task{'s' if count != 1 else ''} ready for review.",
         ]
     )
 
@@ -1858,15 +2156,15 @@ def render_schedule_details(
     if not schedule:
         return "\n".join(
             [
-                f"[bold {ACCENT_GOLD}]Selected Schedule[/]",
-                f"[{ACCENT_MUTED}]Origin, cadence, and next action for the highlighted schedule.[/]",
+                f"[bold {ACCENT_GOLD}]Selected Task[/]",
+                f"[{ACCENT_MUTED}]Origin, cadence, and next action for the highlighted scheduled task.[/]",
                 "",
                 f"[{ACCENT_MUTED}]Selection[/]     choose a job row from the queue to inspect or cancel it.",
                 f"[{ACCENT_MUTED}]Queue[/]         {queue_label}",
                 "",
-                f"[{ACCENT_MUTED}]Schedule Here[/] [bold {ACCENT_GOLD}]h[/] maintenance  [bold {ACCENT_GOLD}]m[/] restart",
-                f"[{ACCENT_MUTED}]CLI Path[/]      [bold {ACCENT_GOLD}]schedule honor[/] or [bold {ACCENT_GOLD}]schedule restart[/]",
-                f"[{ACCENT_MUTED}]Next Action[/]   [bold {ACCENT_GOLD}]j[/] cancel the selected schedule once one is highlighted.",
+                f"[{ACCENT_MUTED}]Create[/]        [bold {ACCENT_GOLD}]h[/] maintenance  [bold {ACCENT_GOLD}]m[/] restart",
+                f"[{ACCENT_MUTED}]Boundary[/]      queue entries can be created here or from the CLI; inspect and cancel them here either way.",
+                f"[{ACCENT_MUTED}]Next Action[/]   [bold {ACCENT_GOLD}]j[/] cancel the selected task once one is highlighted.",
             ]
         )
 
@@ -1874,11 +2172,11 @@ def render_schedule_details(
     announce_message = str(schedule.get("announce_message", "") or "none")
     return "\n".join(
         [
-            f"[bold {ACCENT_GOLD}]Selected Schedule[/]",
-            f"[{ACCENT_MUTED}]Origin, cadence, and next action for the highlighted schedule.[/]",
+            f"[bold {ACCENT_GOLD}]Selected Task[/]",
+            f"[{ACCENT_MUTED}]Origin, cadence, and next action for the highlighted scheduled task.[/]",
             "",
             f"[{ACCENT_MUTED}]Queue[/]         {queue_label}",
-            f"[{ACCENT_MUTED}]Schedule ID[/]   {escape_markup(schedule.get('id', 'n/a'))}",
+            f"[{ACCENT_MUTED}]Task ID[/]       {escape_markup(schedule.get('id', 'n/a'))}",
             f"[{ACCENT_MUTED}]Type[/]          {escape_markup(schedule_job_type_label(schedule.get('job_type', 'n/a')))}",
             f"[{ACCENT_MUTED}]Origin[/]        {escape_markup(schedule_origin_label(schedule))}",
             f"[{ACCENT_MUTED}]Cadence[/]       {escape_markup(schedule.get('schedule_type', 'n/a'))}",
@@ -1887,8 +2185,8 @@ def render_schedule_details(
             f"[{ACCENT_MUTED}]Warnings[/]      {escape_markup(warnings)}",
             f"[{ACCENT_MUTED}]Announce[/]      {escape_markup(announce_message)}",
             "",
-            f"[{ACCENT_MUTED}]Schedule More[/] [bold {ACCENT_GOLD}]h[/] maintenance  [bold {ACCENT_GOLD}]m[/] restart",
-            f"[{ACCENT_MUTED}]Next Action[/]   [bold {ACCENT_GOLD}]j[/] remove this schedule if it is no longer desired.",
+            f"[{ACCENT_MUTED}]Create[/]        [bold {ACCENT_GOLD}]h[/] maintenance  [bold {ACCENT_GOLD}]m[/] restart",
+            f"[{ACCENT_MUTED}]Next Action[/]   [bold {ACCENT_GOLD}]j[/] remove this task if it is no longer desired.",
         ]
     )
 
@@ -2357,6 +2655,37 @@ def create_app(
             height: 1fr;
         }
 
+        #realm-logs-layout {
+            height: 1fr;
+            layout: vertical;
+        }
+
+        #realm-logs-summary {
+            height: 12;
+            margin-bottom: 1;
+        }
+
+        #realm-logs-body {
+            height: 1fr;
+        }
+
+        #realm-logs-table-layout {
+            width: 1fr;
+            height: 1fr;
+            margin-right: 1;
+        }
+
+        #realm-logs-table {
+            height: 1fr;
+            margin-top: 1;
+        }
+
+        #realm-log-details {
+            width: 42;
+            min-width: 36;
+            height: 1fr;
+        }
+
         CommandFormScreen {
             align: center middle;
             background: rgba(6, 17, 29, 0.78);
@@ -2513,21 +2842,23 @@ def create_app(
             ("n", "ban_account", "Ban"),
             ("u", "unban_account", "Unban"),
             ("l", "rotate_logs", "Rotate Logs"),
-            ("T", "test_logs_config", "Test Logs"),
+            ("T", "test_logs_config", "Test Config"),
             ("h", "create_honor_schedule", "Schedule Maintenance"),
             ("m", "create_restart_schedule", "Schedule Restart"),
             ("P", "refresh_update_plan", "Update Plan"),
             ("d", "restore_selected_backup_dry_run", "Dry Run"),
             ("y", "schedule_daily_backup", "Daily"),
             ("w", "schedule_weekly_backup", "Weekly"),
-            ("j", "cancel_selected_schedule", "Cancel Schedule"),
+            ("j", "cancel_selected_schedule", "Remove Task"),
             ("k", "validate_config", "Validate"),
+            ("f", "filter_logs", "Filters"),
             ("1", "show_overview", "Overview"),
             ("2", "show_monitor", "Monitor"),
             ("3", "show_accounts", "Accounts"),
             ("4", "show_backups", "Backups"),
             ("5", "show_config", "Config"),
-            ("6", "show_operations", "Ops"),
+            ("6", "show_logs", "Logs"),
+            ("7", "show_operations", "Ops"),
             ("t", "toggle_theme", "Theme"),
         ]
 
@@ -2543,12 +2874,17 @@ def create_app(
             self.screenshot_pending = False
             self.active_view = initial_view if initial_view in VIEW_TITLES else "overview"
             self.last_action = "loading dashboard data..."
+            self.last_action_receipt = ""
+            self.last_action_next_step = ""
+            self.last_action_view = self.active_view
             self.action_tone = "info"
             self.snapshot = empty_snapshot("waiting for first refresh")
             self.metric_history: list[dict[str, Any]] = []
             self.selected_account_id = ""
             self.selected_backup_file = ""
+            self.selected_log_key = ""
             self.selected_schedule_id = ""
+            self.logs_query = normalize_logs_query()
             self.update_plan_data: dict[str, Any] | None = None
             self.refresh_inflight = False
             self.action_inflight = False
@@ -2586,13 +2922,21 @@ def create_app(
                                     yield DataTable(id="backups-table", classes="detail-table")
                         with Container(id="config-view", classes="view hidden"):
                             yield Static("", id="config-pane", classes="panel hero-panel")
+                        with Container(id="logs-view", classes="view hidden"):
+                            with Vertical(id="realm-logs-layout"):
+                                yield Static("", id="realm-logs-summary", classes="panel hero-panel")
+                                with Horizontal(id="realm-logs-body"):
+                                    with Vertical(classes="panel table-panel", id="realm-logs-table-layout"):
+                                        yield Static("[b]Recent Events[/b]", classes="table-detail-title")
+                                        yield DataTable(id="realm-logs-table", classes="detail-table")
+                                    yield Static("", id="realm-log-details", classes="panel accent-panel")
                         with Container(id="operations-view", classes="view hidden"):
                             with Vertical(id="operations-layout"):
                                 with Horizontal(id="operations-summary"):
                                     yield Static("", id="logs-pane", classes="panel accent-panel")
                                     yield Static("", id="update-pane", classes="panel hero-panel")
                                 with Vertical(classes="panel table-panel table-detail", id="schedules-layout"):
-                                    yield Static("[b]Scheduled Maintenance[/b]", classes="table-detail-title")
+                                    yield Static("[b]Scheduled Tasks[/b]", classes="table-detail-title")
                                     yield Static("", id="schedule-intro")
                                     with Horizontal(classes="table-detail-body"):
                                         yield DataTable(id="schedules-table", classes="detail-table")
@@ -2609,6 +2953,11 @@ def create_app(
             backups_table.cursor_type = "row"
             backups_table.zebra_stripes = True
             backups_table.add_columns("Timestamp", "Size", "File", "Created By")
+
+            realm_logs_table = self.query_one("#realm-logs-table", DataTable)
+            realm_logs_table.cursor_type = "row"
+            realm_logs_table.zebra_stripes = True
+            realm_logs_table.add_columns("Time", "Source", "Severity", "Message")
 
             schedules_table = self.query_one("#schedules-table", DataTable)
             schedules_table.cursor_type = "row"
@@ -2627,7 +2976,7 @@ def create_app(
             self.add_class(f"theme-{self.theme_name}")
 
         def apply_view_state(self) -> None:
-            for view_name in ("overview", "monitor", "accounts", "backups", "config", "operations"):
+            for view_name in ("overview", "monitor", "accounts", "backups", "config", "logs", "operations"):
                 widget = self.query_one(f"#{view_name}-view", Container)
                 if view_name == self.active_view:
                     widget.remove_class("hidden")
@@ -2639,6 +2988,8 @@ def create_app(
                 self.set_focus(self.query_one("#accounts-table", DataTable))
             elif self.active_view == "backups":
                 self.set_focus(self.query_one("#backups-table", DataTable))
+            elif self.active_view == "logs":
+                self.set_focus(self.query_one("#realm-logs-table", DataTable))
             elif self.active_view == "operations":
                 self.set_focus(self.query_one("#schedules-table", DataTable))
 
@@ -2653,6 +3004,9 @@ def create_app(
                     self.last_action,
                     self.action_tone,
                     self.refresh_interval,
+                    self.last_action_receipt,
+                    self.last_action_next_step,
+                    self.last_action_view,
                 )
             )
             self.query_one("#command-rail", Static).update(render_command_rail(self.active_view))
@@ -2668,7 +3022,7 @@ def create_app(
                 if self.snapshot_file:
                     snapshot = load_snapshot_fixture(self.snapshot_file)
                 else:
-                    snapshot = build_snapshot(self.manager_bin, self.config_path)
+                    snapshot = build_snapshot(self.manager_bin, self.config_path, self.logs_query)
             except Exception as exc:
                 snapshot = empty_snapshot(f"snapshot refresh failed: {exc}")
             self.call_from_thread(self.apply_snapshot, snapshot)
@@ -2691,10 +3045,12 @@ def create_app(
             self.query_one("#monitor-trends-pane", Static).update(render_monitor_trends(snapshot, self.metric_history, self.refresh_interval))
             self.query_one("#monitor-storage-pane", Static).update(render_monitor_storage(snapshot))
             self.query_one("#config-pane", Static).update(render_config_panel(snapshot))
+            self.query_one("#realm-logs-summary", Static).update(render_realm_logs_summary(snapshot))
             self.query_one("#logs-pane", Static).update(render_logs_panel(snapshot))
             self.query_one("#update-pane", Static).update(render_update_panel(snapshot, self.update_plan_data))
             self.refresh_accounts(snapshot.get("all_accounts", []))
             self.refresh_backups(snapshot.get("backups", {}).get("entries", []))
+            self.refresh_logs(snapshot.get("log_events", []))
             self.refresh_schedules(snapshot.get("schedules", []))
             self.refresh_chrome()
             if self.screenshot_path and not self.screenshot_taken and not self.screenshot_pending:
@@ -2711,6 +3067,9 @@ def create_app(
 
         def selected_backup(self) -> dict[str, Any] | None:
             return find_selected_backup(self.snapshot, self.selected_backup_file)
+
+        def selected_log_entry(self) -> dict[str, Any] | None:
+            return find_selected_log_entry(self.snapshot, self.selected_log_key)
 
         def selected_schedule(self) -> dict[str, Any] | None:
             return find_selected_schedule(self.snapshot, self.selected_schedule_id)
@@ -2773,6 +3132,37 @@ def create_app(
                 render_backups_summary(snapshot=self.snapshot, selected_backup=selected_entry)
             )
 
+        def refresh_logs(self, entries: list[dict[str, Any]]) -> None:
+            table = self.query_one("#realm-logs-table", DataTable)
+            table.clear(columns=False)
+
+            selected_entry: dict[str, Any] | None = None
+            selected_index = 0
+            for index, entry in enumerate(entries):
+                entry_key = log_entry_key(entry)
+                if self.selected_log_key and entry_key == self.selected_log_key:
+                    selected_index = index
+                    selected_entry = entry
+                table.add_row(
+                    iso_to_display(entry.get("timestamp")),
+                    str(entry.get("source", "")),
+                    str(entry.get("severity", "")),
+                    truncate_text(entry.get("message", ""), 84),
+                    key=entry_key,
+                )
+
+            if entries:
+                if selected_entry is None:
+                    selected_entry = entries[selected_index]
+                self.selected_log_key = log_entry_key(selected_entry)
+                table.move_cursor(row=selected_index, column=0, animate=False)
+            else:
+                self.selected_log_key = ""
+
+            self.query_one("#realm-log-details", Static).update(
+                render_log_event_details(selected_entry, len(entries))
+            )
+
         def refresh_schedules(self, schedules: list[dict[str, Any]]) -> None:
             table = self.query_one("#schedules-table", DataTable)
             table.clear(columns=False)
@@ -2829,6 +3219,15 @@ def create_app(
                 render_backups_summary(snapshot=self.snapshot, selected_backup=entry)
             )
 
+        def update_selected_log(self, row_key: Any) -> None:
+            key_value = player_key_value(row_key)
+            entries = self.snapshot.get("log_events", [])
+            entry = next((candidate for candidate in entries if log_entry_key(candidate) == key_value), None)
+            if entry is None and entries:
+                entry = entries[0]
+            self.selected_log_key = log_entry_key(entry) if entry else ""
+            self.query_one("#realm-log-details", Static).update(render_log_event_details(entry, len(entries)))
+
         def update_selected_schedule(self, row_key: Any) -> None:
             key_value = player_key_value(row_key)
             schedules = self.snapshot.get("schedules", [])
@@ -2882,6 +3281,7 @@ def create_app(
                 list(request["command"]),
                 refresh_after=bool(request.get("refresh_after", True)),
                 env=dict(request.get("env", {})),
+                feedback=dict(request.get("feedback", {})),
             )
 
         def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
@@ -2889,6 +3289,8 @@ def create_app(
                 self.update_selected_account(event.row_key)
             elif event.data_table.id == "backups-table":
                 self.update_selected_backup(event.row_key)
+            elif event.data_table.id == "realm-logs-table":
+                self.update_selected_log(event.row_key)
             elif event.data_table.id == "schedules-table":
                 self.update_selected_schedule(event.row_key)
 
@@ -2897,6 +3299,8 @@ def create_app(
                 self.update_selected_account(event.row_key)
             elif event.data_table.id == "backups-table":
                 self.update_selected_backup(event.row_key)
+            elif event.data_table.id == "realm-logs-table":
+                self.update_selected_log(event.row_key)
             elif event.data_table.id == "schedules-table":
                 self.update_selected_schedule(event.row_key)
 
@@ -2920,29 +3324,65 @@ def create_app(
             self.active_view = "config"
             self.apply_view_state()
 
+        def action_show_logs(self) -> None:
+            self.active_view = "logs"
+            self.apply_view_state()
+
         def action_show_operations(self) -> None:
             self.active_view = "operations"
             self.apply_view_state()
 
         def action_manual_refresh(self) -> None:
-            self.set_action_result(f"manual refresh requested at {datetime.now().strftime('%H:%M:%S')}", tone="info")
+            self.set_action_result(
+                f"manual refresh requested at {datetime.now().strftime('%H:%M:%S')}",
+                tone="info",
+                receipt="Requested a fresh dashboard snapshot from Manager.",
+            )
             self.request_snapshot_refresh()
 
         def action_toggle_theme(self) -> None:
             self.theme_name = "light" if self.theme_name == "dark" else "dark"
             self.apply_theme()
-            self.set_action_result(f"theme set to {self.theme_name}", tone="success")
+            self.set_action_result(
+                f"theme set to {self.theme_name}",
+                tone="success",
+                receipt=f"Switched the dashboard theme to {self.theme_name}.",
+            )
             self.apply_view_state()
             self.query_one("#service-pane", Static).update(render_service_panel(self.snapshot, self.active_view))
 
         def action_start_server(self) -> None:
-            self.request_command_action("start", ["server", "start", "--wait", "--timeout", "60"])
+            self.request_command_action(
+                "start",
+                ["server", "start", "--wait", "--timeout", "60"],
+                feedback={
+                    "success_receipt": "Requested a realm start.",
+                    "success_next": "Stay in Overview or Logs until auth and world both settle healthy.",
+                    "failure_next": "Inspect service health and recent logs, then retry the start when the host is ready.",
+                },
+            )
 
         def action_stop_server(self) -> None:
-            self.request_command_action("stop", ["server", "stop", "--timeout", "60"])
+            self.request_command_action(
+                "stop",
+                ["server", "stop", "--timeout", "60"],
+                feedback={
+                    "success_receipt": "Requested a realm stop.",
+                    "success_next": "Confirm auth and world settle inactive before backups, updates, or maintenance work.",
+                    "failure_next": "Inspect service health and logs, then retry the stop when the host is ready.",
+                },
+            )
 
         def action_restart_server(self) -> None:
-            self.request_command_action("restart", ["server", "restart", "--timeout", "60"])
+            self.request_command_action(
+                "restart",
+                ["server", "restart", "--timeout", "60"],
+                feedback={
+                    "success_receipt": "Requested a realm restart.",
+                    "success_next": "Use Overview and Logs to confirm the realm settles cleanly after the restart.",
+                    "failure_next": "Inspect service health and recent logs, then retry the restart when the host is ready.",
+                },
+            )
 
         def handle_online_roster_result(self, account_id: str | None) -> None:
             if not account_id:
@@ -2962,7 +3402,15 @@ def create_app(
         def action_backup_now(self) -> None:
             self.active_view = "backups"
             self.apply_view_state()
-            self.request_command_action("backup", ["backup", "now", "--verify"])
+            self.request_command_action(
+                "backup",
+                ["backup", "now", "--verify"],
+                feedback={
+                    "success_receipt": "Started a fresh backup with verification enabled.",
+                    "success_next": "Stay in Backups after refresh to review the new archive and protection posture.",
+                    "failure_next": "Review backup directory access and DB connectivity, then retry from Backups.",
+                },
+            )
 
         def action_verify_selected_backup(self) -> None:
             backups = self.snapshot.get("backups", {})
@@ -2973,7 +3421,16 @@ def create_app(
                 return
 
             backup_path = f"{backup_dir.rstrip('/')}/{self.selected_backup_file}"
-            self.request_command_action("verify", ["backup", "verify", backup_path, "--level", "1"], refresh_after=False)
+            self.request_command_action(
+                "verify",
+                ["backup", "verify", backup_path, "--level", "1"],
+                refresh_after=False,
+                feedback={
+                    "success_receipt": f"Verified backup {self.selected_backup_file}.",
+                    "success_next": "If you need recovery planning, use restore dry-run here; live restore stays in the CLI.",
+                    "failure_next": "Inspect the selected archive and retry verification from Backups.",
+                },
+            )
 
         def action_create_account(self) -> None:
             self.active_view = "accounts"
@@ -2987,7 +3444,7 @@ def create_app(
                     {"name": "password", "label": "Password", "password": True},
                     {"name": "confirm_password", "label": "Confirm Password", "password": True},
                 ],
-                "Create a VMaNGOS account using the existing Manager CLI backend.",
+                "Create a new VMaNGOS account from the dashboard account workflow.",
             )
 
         def action_reset_account_password(self) -> None:
@@ -3048,7 +3505,7 @@ def create_app(
                     {"name": "duration", "label": "Duration", "placeholder": "7d"},
                     {"name": "reason", "label": "Reason", "placeholder": "Abuse"},
                 ],
-                f"Ban {username} with the existing account CLI workflow.",
+                f"Ban {username} from the dashboard moderation workflow.",
             )
 
         def action_unban_account(self) -> None:
@@ -3095,6 +3552,54 @@ def create_app(
         def action_validate_config(self) -> None:
             self.dispatch_dashboard_action("config_validate")
 
+        def handle_logs_filter_result(self, result: dict[str, str] | None) -> None:
+            if result is None:
+                return
+
+            query = normalize_logs_query(result)
+            if not LOG_SOURCE_PATTERN.fullmatch(query["source"]):
+                self.set_action_result("logs filter skipped: source must be all, auth, or world", tone="warning")
+                return
+            if not LOG_WINDOW_PATTERN.fullmatch(query["window"]):
+                self.set_action_result("logs filter skipped: window must look like 15m, 1h, or 1d", tone="warning")
+                return
+            if not LOG_SEVERITY_PATTERN.fullmatch(query["severity"]):
+                self.set_action_result("logs filter skipped: severity must be all, debug, info, notice, warning, error, critical, or alert", tone="warning")
+                return
+            if not LOG_LIMIT_PATTERN.fullmatch(query["limit"]) or int(query["limit"]) > 200:
+                self.set_action_result("logs filter skipped: limit must be between 1 and 200", tone="warning")
+                return
+
+            self.logs_query = query
+            self.selected_log_key = ""
+            self.active_view = "logs"
+            self.apply_view_state()
+            self.set_action_result(
+                f"logs filters set: {query['source']} {query['window']} {query['severity']} limit {query['limit']}",
+                tone="info",
+                receipt=f"Focused the realm event feed on source={query['source']}, window={query['window']}, severity={query['severity']}, limit={query['limit']}.",
+                next_step="Inspect Selected Event here, then move to Operations only if the incident becomes maintenance or change-window work.",
+            )
+            self.request_snapshot_refresh()
+
+        def action_filter_logs(self) -> None:
+            self.active_view = "logs"
+            self.apply_view_state()
+            self.push_screen(
+                CommandFormScreen(
+                    title="Log Filters",
+                    submit_label="Apply",
+                    fields=[
+                        {"name": "source", "label": "Source (all|auth|world)", "value": self.logs_query["source"], "placeholder": "all"},
+                        {"name": "window", "label": "Window (15m|1h|1d)", "value": self.logs_query["window"], "placeholder": "15m"},
+                        {"name": "severity", "label": "Severity", "value": self.logs_query["severity"], "placeholder": "all"},
+                        {"name": "limit", "label": "Limit", "value": self.logs_query["limit"], "placeholder": "25"},
+                    ],
+                    intro="Tune the realm log feed shown in this module. The dashboard will keep following the current filters on each refresh.",
+                ),
+                self.handle_logs_filter_result,
+            )
+
         def action_rotate_logs(self) -> None:
             self.active_view = "operations"
             self.apply_view_state()
@@ -3118,7 +3623,7 @@ def create_app(
                     {"name": "time", "label": "Time (HH:MM)", "value": "06:00", "placeholder": "06:00"},
                     {"name": "timezone", "label": "Timezone", "value": "UTC", "placeholder": "UTC"},
                 ],
-                "Schedule the configured maintenance job backend. This uses maintenance.honor_command under the hood.",
+                "Create a scheduled maintenance task using Manager's configured maintenance command.",
             )
 
         def action_create_restart_schedule(self) -> None:
@@ -3136,7 +3641,7 @@ def create_app(
                     {"name": "warnings", "label": "Warnings", "value": "30,15,5,1", "placeholder": "30,15,5,1"},
                     {"name": "announce", "label": "Announcement", "value": "Weekly maintenance", "placeholder": "Weekly maintenance"},
                 ],
-                "Create a scheduled restart with warning timers via the existing Manager scheduler backend.",
+                "Create a scheduled restart window with warning timers.",
             )
 
         def action_refresh_update_plan(self) -> None:
@@ -3147,15 +3652,15 @@ def create_app(
         def action_cancel_selected_schedule(self) -> None:
             schedule = self.selected_schedule()
             if schedule is None:
-                self.set_action_result("schedule cancel skipped: no job selected", tone="warning")
+                self.set_action_result("task removal skipped: no task selected", tone="warning")
                 return
             schedule_id = str(schedule.get("id", "selected schedule")).strip()
             self.active_view = "operations"
             self.apply_view_state()
             self.open_command_form(
                 "schedule_cancel",
-                "Cancel Schedule",
-                "Cancel Schedule",
+                "Remove Scheduled Task",
+                "Remove Task",
                 [],
                 f"Remove scheduled task {schedule_id} from Manager and systemd.",
             )
@@ -3165,36 +3670,54 @@ def create_app(
                 self.set_action_result("another dashboard action is already running", tone="warning")
                 return
             self.action_inflight = True
-            self.set_action_result("update plan running...", tone="running")
-            threading.Thread(target=self.run_update_plan_action, daemon=True).start()
+            view_context = self.active_view
+            self.set_action_result(
+                "update plan running...",
+                tone="running",
+                receipt="Checking repo drift and DB impact for the next change window.",
+                view_context=view_context,
+            )
+            threading.Thread(target=self.run_update_plan_action, args=(view_context,), daemon=True).start()
 
-        def run_update_plan_action(self) -> None:
+        def run_update_plan_action(self, view_context: str) -> None:
             try:
                 full_command = [self.manager_bin, "-c", self.config_path, "-f", "json", "update", "plan", "--include-db"]
                 completed = subprocess.run(full_command, capture_output=True, text=True, check=False)
                 if completed.returncode != 0:
                     output = (completed.stderr or completed.stdout or "").strip().splitlines()
                     message = output[-1] if output else f"update plan exited with code {completed.returncode}"
-                    self.call_from_thread(self.set_action_result, f"update plan failed: {message}", "error")
+                    self.call_from_thread(self.set_action_result, f"update plan failed: {message}", "error", "", "", view_context)
                     return
 
                 try:
                     data = parse_manager_json(completed.stdout)
                 except (json.JSONDecodeError, RuntimeError) as exc:
-                    self.call_from_thread(self.set_action_result, f"update plan failed: {exc}", "error")
+                    self.call_from_thread(self.set_action_result, f"update plan failed: {exc}", "error", "", "", view_context)
                     return
 
-                self.call_from_thread(self.apply_update_plan_data, data)
+                self.call_from_thread(self.apply_update_plan_data, data, view_context)
             finally:
                 self.action_inflight = False
 
-        def apply_update_plan_data(self, data: dict[str, Any]) -> None:
+        def apply_update_plan_data(self, data: dict[str, Any], view_context: str | None = None) -> None:
             self.update_plan_data = data
             warning_text = str(data.get("warning", "") or "")
             if warning_text:
-                self.set_action_result(f"update plan refreshed: {warning_text}", tone="warning")
+                self.set_action_result(
+                    f"update plan refreshed: {warning_text}",
+                    tone="warning",
+                    receipt="Generated a change-window plan and flagged follow-up work before code changes.",
+                    next_step="Review Change Window Readiness, then confirm backups and maintenance timing before any CLI update apply step.",
+                    view_context=view_context,
+                )
             else:
-                self.set_action_result("update plan refreshed", tone="success")
+                self.set_action_result(
+                    "update plan refreshed",
+                    tone="success",
+                    receipt="Generated a fresh change-window plan with current repo and DB impact.",
+                    next_step="Review the plan snapshot here, then continue the actual update workflow from the CLI after backup and maintenance prep.",
+                    view_context=view_context,
+                )
             self.query_one("#update-pane", Static).update(render_update_panel(self.snapshot, self.update_plan_data))
 
         def request_command_action(
@@ -3204,15 +3727,20 @@ def create_app(
             *,
             refresh_after: bool = True,
             env: dict[str, str] | None = None,
+            feedback: dict[str, str] | None = None,
         ) -> None:
             if self.action_inflight:
                 self.set_action_result("another dashboard action is already running", tone="warning")
                 return
             self.action_inflight = True
-            self.set_action_result(f"{label} running...", tone="running")
+            view_context = self.active_view
+            running_receipt = ""
+            if feedback:
+                running_receipt = feedback.get("running_receipt", feedback.get("success_receipt", ""))
+            self.set_action_result(f"{label} running...", tone="running", receipt=running_receipt, view_context=view_context)
             threading.Thread(
                 target=self.run_command_action,
-                args=(label, command, refresh_after, env or {}),
+                args=(label, command, refresh_after, env or {}, feedback or {}, view_context),
                 daemon=True,
             ).start()
 
@@ -3222,6 +3750,8 @@ def create_app(
             command: list[str],
             refresh_after: bool,
             env: dict[str, str],
+            feedback: dict[str, str],
+            view_context: str,
         ) -> None:
             try:
                 full_command = [self.manager_bin, "-c", self.config_path, *command]
@@ -3231,16 +3761,44 @@ def create_app(
                 output = (completed.stdout or completed.stderr or "").strip().splitlines()
                 message = output[-1] if output else f"{label} exited with code {completed.returncode}"
                 if completed.returncode == 0:
-                    self.call_from_thread(self.set_action_result, f"{label}: {message}", "success")
+                    receipt = feedback.get("success_receipt", "")
+                    next_step = feedback.get("success_next", "")
+                    self.call_from_thread(
+                        self.set_action_result,
+                        f"{label}: {message}",
+                        "success",
+                        receipt,
+                        next_step,
+                        view_context,
+                    )
                     if refresh_after:
                         self.call_from_thread(self.request_snapshot_refresh)
                 else:
-                    self.call_from_thread(self.set_action_result, f"{label} failed: {message}", "error")
+                    receipt = feedback.get("failure_receipt", "")
+                    next_step = feedback.get("failure_next", "")
+                    self.call_from_thread(
+                        self.set_action_result,
+                        f"{label} failed: {message}",
+                        "error",
+                        receipt,
+                        next_step,
+                        view_context,
+                    )
             finally:
                 self.action_inflight = False
 
-        def set_action_result(self, message: str, tone: str = "info") -> None:
+        def set_action_result(
+            self,
+            message: str,
+            tone: str = "info",
+            receipt: str = "",
+            next_step: str = "",
+            view_context: str | None = None,
+        ) -> None:
             self.last_action = message
+            self.last_action_receipt = receipt
+            self.last_action_next_step = next_step
+            self.last_action_view = view_context or self.active_view
             self.action_tone = tone
             self.refresh_chrome()
             self.query_one("#service-pane", Static).update(render_service_panel(self.snapshot, self.active_view))

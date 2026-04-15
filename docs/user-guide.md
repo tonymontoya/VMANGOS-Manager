@@ -72,22 +72,39 @@ Then launch the operator console:
 sudo /opt/mangos/manager/bin/vmangos-manager dashboard --refresh 2
 ```
 
-The dashboard is organized into six views:
+The dashboard is organized into seven views:
 
 - `Overview`
 - `Monitor`
 - `Accounts`
 - `Backups`
 - `Config`
+- `Logs`
 - `Ops`
 
 The command rail shows the most important actions for the active screen, while the sidebar keeps navigation and realm pulse visible at all times.
+
+## Start With The Task
+
+If you are unsure which screen to open first, use this quick map:
+
+| Operator task | Start in | Finish in |
+| --- | --- | --- |
+| Confirm the realm is healthy right now | `Overview` | stay in `Overview` or escalate to `Monitor` / `Logs` |
+| Explain CPU, memory, load, disk, or I/O pressure | `Monitor` | stay in `Monitor` until you understand the pressure source |
+| Create or moderate a player account | `Accounts` | stay in `Accounts` until the selected account state refreshes |
+| Confirm protection before risky work | `Backups` | stay in `Backups` for verify or restore dry-run |
+| Investigate recent auth/world failures | `Logs` | stay in `Logs` for evidence, then move to `Ops` only if it becomes maintenance work |
+| Schedule maintenance or a restart window | `Ops` | stay in `Ops` until the new task appears in `Scheduled Tasks` |
+| Prepare for a risky code or DB change | `Ops` | use `Ops` plus `Backups`, then continue the actual apply path in the CLI |
+| Validate install paths, service names, or DB wiring | `Config` | stay in `Config` until the wiring view looks correct |
 
 ## How To Read The Screen
 
 The dashboard works best when each region has a clear job:
 
-- the top banner tells you the active view, why that view exists, and the result of the last action
+- the top banner tells you the active view, why that view exists, and the state of the last action
+- the top banner also carries the action receipt and recommended next step for higher-impact workflows
 - the sidebar is always-on navigation plus realm pulse
 - the command rail is the single action surface for navigation, refresh, and view-specific work
 - the main panels are where view-specific work happens
@@ -106,7 +123,8 @@ If you are new to Manager, the best first pass is simple:
 3. Visit `Config` and verify Manager is reading the right install root, service names, and databases.
 4. Visit `Backups` and confirm the protection story before you trust any update or maintenance workflow.
 5. Visit `Accounts` so you know where user actions live before you need them under pressure.
-6. Finish in `Ops` and review the maintenance queue plus change-window readiness.
+6. Visit `Logs` when you need recent auth/world evidence without leaving Manager.
+7. Finish in `Ops` and review scheduled work plus change-window readiness.
 
 ## Overview View
 
@@ -132,8 +150,8 @@ Panel roles in this view:
 
 - `Realm Services` is the fast service and DB pulse plus per-service footprint
 - `Host Metrics` is the machine-level headline pressure panel only, using compact numeric summaries plus small capacity meters
-- `Player Pulse` is the summary-first population panel: online count, trend, player/staff mix, and GM coverage
-- `Alerts and Events` is the fast-read maintenance and risk panel
+- `Player Pulse` is the summary-first population panel: online count, trend, player/staff mix, GM coverage, and roster visibility context
+- `Alerts and Events` is the fast-read risk and recent-realm-events panel
 
 If `Overview` tells you something is off but not why, switch to `Monitor`. That split is intentional: `Overview` stays summary-first, while `Monitor` carries the denser diagnostic surface.
 
@@ -225,7 +243,7 @@ Still handled in the shell:
 - `Backup Readiness` is the summary and selected-backup decision panel
 - `Backup Inventory` is the archive list you browse and act from
 - creating or replacing daily and weekly backup timers is available in the dashboard
-- cleanup policy changes, timer removal, and deeper backup surgery still live in the CLI or systemd today
+- real restore, cleanup policy changes, timer removal, and deeper backup surgery still live in the CLI or systemd today
 
 ## Config View
 
@@ -251,42 +269,75 @@ Still handled in the shell:
 - this view is intentionally read-only
 - edit `manager.conf` and `.dbpass` in the shell, then return here to validate the result
 
-The panel is grouped into `Realm Wiring`, `Database Wiring`, and `Dashboard Role` so it is easier to spot whether the problem is host wiring, DB targeting, or a workflow misunderstanding.
+The panel is grouped into `Realm Wiring`, `Database Wiring`, and `Boundary` so it is easier to spot whether the problem is host wiring, DB targeting, or a workflow misunderstanding.
 
 If the configuration wiring view looks wrong, fix that before you trust any higher-level workflow.
+
+## Logs View
+
+![Logs view](assets/dashboard-logs.svg)
+
+Logs is the realm troubleshooting screen. It exists so you can inspect recent `auth` and `world` activity without turning Manager into a generic OS log browser.
+
+Use it to:
+
+- inspect recent realm events and failures by source
+- narrow the feed by source, time window, severity, and result count
+- keep following the filtered feed as the dashboard refreshes
+- inspect a selected event in detail before you drop to shell tools
+
+Read the summary panel in this order:
+
+1. `Events` tells you how much evidence is currently on screen and what happened most recently.
+2. `Hot Path` and the source/severity mix tell you whether the problem is concentrated in `auth`, `world`, warnings, or hard failures.
+3. `Coverage` and follow/filter support tell you how trustworthy the current feed is before you widen the investigation.
+
+Recommended flow:
+
+1. Move to `Logs` with `6`.
+2. Press `f` and set the source, window, severity, and limit that match the investigation.
+3. Let the screen auto-refresh while you keep the selected event highlighted in the detail pane.
+4. Jump to `Ops` only when the issue turns into maintenance or update work instead of log investigation.
+
+The important scope rule is simple:
+
+- `Logs` is for realm-relevant troubleshooting evidence
+- `Ops` is for maintenance readiness, scheduled tasks, and change-window planning
+
+That separation keeps the troubleshooting surface honest and stops the maintenance screen from carrying too many unrelated jobs.
 
 ## Operations View
 
 ![Operations view](assets/dashboard-operations.svg)
 
-Operations is the maintenance scheduling and change-window screen.
+Operations is the maintenance and change-window workflow screen.
 
 Use it for:
 
-- deciding whether the host is ready for scheduled maintenance
-- scheduling maintenance tasks or restart windows from the Ops surface
-- seeing what maintenance is already queued
-- inspecting or canceling a selected schedule
-- reviewing update readiness and DB impact before risky source changes
+- deciding whether log rotation, file hygiene, and disk headroom are in a good state before maintenance
+- creating maintenance tasks or restart windows from the Ops surface
+- seeing what scheduled work is already queued
+- inspecting or canceling the selected task
+- reviewing change-window readiness and DB impact before risky source changes
 
 Read it in this order:
 
-1. Start with `Change Window Readiness` to confirm logs, storage, and queue state look safe enough for maintenance work.
-2. Use the on-screen schedule paths to create a maintenance task or scheduled restart from the Ops surface.
-3. Review `Scheduled Maintenance` to confirm what is already queued and when it will fire.
-4. Use `Selected Schedule` to inspect origin, cadence, warnings, and cancellation impact for the highlighted item.
-5. Use `Update Readiness` when the next change involves source pulls or database movement.
+1. Start with `Maintenance Readiness` to confirm storage headroom, queue state, and log-rotation posture are not warning about avoidable maintenance friction.
+2. Use the on-screen create actions to add a maintenance task or scheduled restart from the Ops surface.
+3. Review `Scheduled Tasks` to confirm what is already queued and when it will fire.
+4. Use `Selected Task` to inspect origin, cadence, warnings, and cancellation impact for the highlighted item.
+5. Use `Change Window Readiness` when the next change involves source pulls or database movement.
 
 Recommended flow before a realm update:
 
-1. Review `Change Window Readiness` so you know whether the host and log posture are healthy enough for the window.
-2. Review `Scheduled Maintenance` so you know whether any restart work is already timed near the window.
-3. Review `Update Readiness` and the DB-impact summary.
+1. Review `Maintenance Readiness` so you know whether log rotation, permissions, and storage headroom look healthy enough for the window.
+2. Review `Scheduled Tasks` so you know whether any restart work is already timed near the window.
+3. Review `Change Window Readiness` and the DB-impact summary.
 4. Generate or refresh the update plan.
 5. Take and verify a backup.
-6. Only then move into a real update workflow.
+6. Only then move into a real update workflow from the CLI.
 
-Jobs shown in `Scheduled Maintenance` come from the Ops scheduling actions in the dashboard or the matching `schedule` CLI commands. The command rail still mirrors those paths, but the screen now calls out where maintenance gets created so the queue does not feel detached from the workflow.
+Tasks shown in `Scheduled Tasks` come from the Ops create actions in the dashboard or the matching `schedule` CLI commands. The screen makes that origin explicit so the queue does not feel detached from the workflow.
 
 ## Updates Workflow
 
@@ -294,8 +345,8 @@ Manager treats updates like an operator workflow, not a blind pull-and-pray even
 
 Use this sequence:
 
-1. Open `Ops` and start with the maintenance queue so you understand what is already scheduled.
-2. Check `Update Readiness` to see whether the change is code-only or likely to include database work.
+1. Open `Ops` and start with `Scheduled Tasks` so you understand what is already queued.
+2. Check `Change Window Readiness` to see whether the change is code-only or likely to include database work.
 3. Create and verify a backup before you touch the source tree.
 4. Run the update plan so the work is visible as explicit steps.
 5. Execute the update during a maintenance window instead of improvising live.
@@ -315,9 +366,10 @@ If you want a stable realm without living in the CLI all day, this is a good def
 1. Open `Overview` and confirm services, players, and host pressure look sane.
 2. Use `Monitor` when `Overview` shows pressure and you need the deeper host or process explanation.
 3. Check `Backups` and make sure recent protection exists before risky work.
-4. Visit `Operations` when you need to understand queued maintenance or preflight a risky change window.
-5. Use `Accounts` for user-facing admin changes instead of one-off SQL.
-6. Use `Config` whenever the host wiring changes or Manager behavior looks suspicious.
+4. Visit `Logs` when a player issue or service wobble needs recent auth/world evidence.
+5. Visit `Operations` when you need to understand queued maintenance or preflight a risky change window.
+6. Use `Accounts` for user-facing admin changes instead of one-off SQL.
+7. Use `Config` whenever the host wiring changes or Manager behavior looks suspicious.
 
 ## When To Drop To The CLI
 
@@ -339,7 +391,8 @@ Use the dashboard for everyday operation, then drop to the CLI for the narrower 
 | Accounts | account inventory, create, password reset, GM changes, ban, unban, account visibility | scripted bulk workflows |
 | Backups | backup readiness, inventory, backup now, verify, restore dry-run, timer visibility, daily/weekly timer create | cleanup, timer removal, live restore |
 | Config | validation plus read-only configuration wiring summary | config creation, detect, show, and file editing |
-| Operations | maintenance queue, maintenance/restart scheduling, schedule cancel, logs guardrails, update planning visibility | update apply and other source-tree workflows |
+| Logs | filtered realm-log investigation, selected event detail, and live follow via dashboard refresh | raw JSON output, CLI watch mode, and custom shell pipelines |
+| Operations | maintenance readiness, scheduled task creation/review, task removal, change-window planning visibility | update apply and other source-tree workflows |
 
 Use these supporting docs when you need that lower-level surface:
 
