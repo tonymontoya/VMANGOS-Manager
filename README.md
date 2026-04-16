@@ -5,7 +5,7 @@
 ![Release](https://img.shields.io/badge/release-v0.2.0-0f766e)
 ![Interface](https://img.shields.io/badge/interface-Textual%20TUI-0f172a)
 
-A terminal-native administration suite for VMANGOS private servers. One installer, one CLI, and a live SSH-native dashboard for everything from provisioning to backups.
+An SSH terminal-native administration suite for VMANGOS private servers optimized for performance and security. 
 
 ![VMANGOS Manager Dashboard](docs/assets/dashboard-overview.svg)
 
@@ -13,38 +13,50 @@ A terminal-native administration suite for VMANGOS private servers. One installe
 
 ---
 
-## 🏰 Why VMANGOS Manager?
+## Why VMANGOS Manager?
 
 - **One-Shot Provisioning** — Go from blank Ubuntu 22.04 to a running realm with a single script
-- **SSH-Native Dashboard** — A real Textual TUI that runs directly on the server over SSH
-- **No More Shell Scraps** — Account admin, backups, logs, scheduling, and updates from one CLI
+- **SSH-Native Dashboard** — A text-based UI that runs directly on the server ore remotely over SSH
+- **No More Shell Scripts** — Account admin, backups, logs, scheduling, and updates from one CLI
 - **Adopts Existing Realms** — Detects your current VMANGOS install instead of forcing a rebuild
 - **Built For Operators** — Every dashboard view maps to a real `vmangos-manager` command you can script
 
 ---
 
-## ✨ What's Included
+## Documentation
 
-| Component | What It Does | Status |
-|---|---|---|
-| 🖥️ **Dashboard** | 7-view Textual TUI for live server ops | ✅ Shipped |
-| 🚀 **Auto-Installer** | `auto_install.sh` + `vmangos_setup.sh` for Ubuntu 22.04 | ✅ Shipped |
-| 🎮 **Server Control** | Start, stop, restart, and health-check `auth` + `world` | ✅ Shipped |
-| 👤 **Account Admin** | Create, ban/unban, set GM level, password reset | ✅ Shipped |
-| 💾 **Backups** | SQL dumps, verify integrity, dry-run restore, timer scheduling | ✅ Shipped |
-| 📝 **Logs** | Filtered `auth`/`world` log investigation via `journald` | ✅ Shipped |
-| ⏰ **Scheduling** | `systemd` timer generation for restarts and maintenance | ✅ Shipped |
-| 🔄 **Update Planning** | Check, inspect, plan, and apply core + DB updates | ✅ Shipped |
+| Doc | What You'll Find |
+|---|---|
+| [🚀 User Guide](docs/user-guide.md) | End-to-end walkthrough of install, dashboard views, and daily rhythm |
+| [🔧 Install Automation](docs/install-automation.md) | Deep dive into `auto_install.sh` and `vmangos_setup.sh` |
+| [📋 CLI Reference](docs/cli-reference.md) | Complete command reference |
+| [🛡️ Security Notes](docs/security.md) | Password handling, DB model, and update safety |
+| [🔍 Troubleshooting](docs/troubleshooting.md) | Common problems and diagnostic commands |
 
 ---
 
-## 🚀 Quick Start
+## What's Included
+
+| Component | What It Does | Status |
+|---|---|---|
+| 🖥️ **Dashboard** | 7-view Textual TUI for live server ops |
+| 🚀 **Auto-Installer** | `auto_install.sh` + `vmangos_setup.sh` for Ubuntu 22.04 |
+| 🎮 **Server Control** | Start, stop, restart, and health-check `auth` + `world` |
+| 👤 **Account Admin** | Create, ban/unban, set GM level, password reset |
+| 💾 **Backups** | SQL dumps, verify integrity, dry-run restore, timer scheduling |
+| 📝 **Logs** | Filtered `auth`/`world` log investigation via `journald` |
+| ⏰ **Scheduling** | `systemd` timer generation for restarts and maintenance |
+| 🔄 **Update Planning** | Check, inspect, plan, and apply core + DB updates |
+
+---
+
+## Quick Start
 
 ### Prerequisites
 
 - Ubuntu 22.04 LTS (fresh or existing)
 - Root access (`sudo`)
-- WoW 1.12.1 client data (for extraction — optional but recommended)
+- WoW 1.12.1 client data (for extraction)
 
 ### Option A — Fresh Host
 
@@ -78,42 +90,9 @@ sudo /opt/mangos/manager/bin/vmangos-manager dashboard --refresh 2
 
 ---
 
-## 🏗️ Architecture
+## The Dashboard
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Textual Dashboard                       │
-│              (Python / Textual TUI over SSH)                │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    vmangos-manager CLI                      │
-│  (Bash entry point: server / account / backup / logs /      │
-│   schedule / config / update / dashboard)                   │
-└─────────────────────────────────────────────────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  systemd      │    │  MariaDB      │    │  logrotate    │
-│  (auth/world) │    │  (auth/char/  │    │  (realm logs) │
-│               │    │  world/logs)  │    │               │
-└───────────────┘    └───────────────┘    └───────────────┘
-```
-
-**Stack:**
-- **CLI:** Bash 4+, `shellcheck`-clean modules
-- **Dashboard:** Python 3, Textual
-- **Databases:** MariaDB / MySQL
-- **Init:** `systemd` services and timers
-- **Target OS:** Ubuntu 22.04 LTS
-
----
-
-## 🖥️ The Dashboard
-
-Launch the TUI in two commands:
+Launch the UI in two commands:
 
 ```bash
 sudo /opt/mangos/manager/bin/vmangos-manager dashboard --bootstrap  # one-time
@@ -134,7 +113,7 @@ sudo /opt/mangos/manager/bin/vmangos-manager dashboard --refresh 2  # run
 
 ---
 
-## 🛠️ Everyday CLI
+## Everyday CLI
 
 ```bash
 # Server control
@@ -158,19 +137,7 @@ sudo /opt/mangos/manager/bin/vmangos-manager schedule restart --time 04:00 --wee
 
 ---
 
-## 📚 Documentation
-
-| Doc | What You'll Find |
-|---|---|
-| [🚀 User Guide](docs/user-guide.md) | End-to-end walkthrough of install, dashboard views, and daily rhythm |
-| [🔧 Install Automation](docs/install-automation.md) | Deep dive into `auto_install.sh` and `vmangos_setup.sh` |
-| [📋 CLI Reference](docs/cli-reference.md) | Complete command reference |
-| [🛡️ Security Notes](docs/security.md) | Password handling, DB model, and update safety |
-| [🔍 Troubleshooting](docs/troubleshooting.md) | Common problems and diagnostic commands |
-
----
-
-## 🛡️ Security & Safety
+## Security & Safety
 
 - **No positional passwords** — Passwords are accepted via interactive prompt, `--password-file`, or `--password-env` only
 - **File permissions enforced** — Password files must be mode `600` and owned by a trusted user
@@ -181,7 +148,7 @@ See [Security Notes](docs/security.md) for full details.
 
 ---
 
-## 💬 Community & Resources
+## Community & Resources
 
 - [VMANGOS Core](https://github.com/vmangos/core)
 - [VMANGOS Database](https://github.com/brotalnia/database)
@@ -190,10 +157,6 @@ See [Security Notes](docs/security.md) for full details.
 
 ---
 
-## ⚖️ License & Disclaimer
+## License & Disclaimer
 
 This project is for educational purposes. Running a private WoW server may violate Blizzard's Terms of Service. Use at your own risk.
-
----
-
-**Built for realm operators who want their tools to feel like software, not glue.**
