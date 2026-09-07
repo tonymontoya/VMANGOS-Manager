@@ -29,13 +29,18 @@
 #   kill-reattach   kill the viewer session, verify the unit keeps running
 #   failure-retry   force a failure, drive the runner's retry, VERIFY resume:
 #                   same checkpoint advancing, no completed phase re-ran
-#   watch           stream markers until the install ends
+#   watch            stream markers until the install ends
 #   completion      verify auth/world active + completion marker + realmlist
+#                   row verified against the database (not just the marker)
 #   name-recreation re-create the unit name through the runner after a
 #                   completed run, then stop it again
 #   flake-watch     re-run the viewer async suite; capture the known flake
 #                   (#113) without failing on it; unknown failures fail
 #   teardown        remove the container (keep the client-data cache)
+#
+# Iterating: a full clean install can exceed 4h. To re-run later phases
+# without reinstalling, snapshot the container after the source phase
+# (docker commit) so re-smokes start from SOURCE_DONE; see the README.
 #
 # Usage:
 #   tests/smoke/wizard_smoke.sh [--phase NAME] [--keep] [--client-data PATH]
@@ -565,7 +570,26 @@ phase_completion() {
     auth_port="$(grep -oE 'auth_port=[^ ]+' <<<"$latest" | cut -d= -f2)"
     world_port="$(grep -oE 'world_port=[^ ]+' <<<"$latest" | cut -d= -f2)"
     log "realmlist target: world=$world_port server_ip=$server_ip (auth=$auth_port)"
-    pass "completion: terminal marker + auth+world active + realmlist fields"
+    # Verify the realmlist row against the database itself, not just against
+    # the marker the installer wrote: the realm address must match the
+    # marker's server_ip and the realm port must match its world_port.
+    # Root connects over the local socket inside the container.
+    local realm_row realm_addr realm_port
+    realm_row="$(docker_exec "
+        set -u
+        [ -f $SECRETS_FILE ] && . $SECRETS_FILE
+        mysql -u root -N -B -e \"SELECT address, port FROM \${AUTHDB:-auth}.realmlist WHERE id=1;\"
+    " 2>/dev/null | tail -n1 || true)"
+    realm_addr="$(cut -f1 <<<"$realm_row")"
+    realm_port="$(cut -f2 <<<"$realm_row")"
+    [[ -n "$realm_addr" && -n "$realm_port" ]] \
+        || fail "realmlist query returned no row (got: '$realm_row')"
+    [[ "$realm_addr" == "$server_ip" ]] \
+        || fail "realmlist address ($realm_addr) does not match the marker's server_ip ($server_ip)"
+    [[ "$realm_port" == "$world_port" ]] \
+        || fail "realmlist port ($realm_port) does not match the marker's world_port ($world_port)"
+    log "realmlist row verified: address=$realm_addr port=$realm_port matches the marker"
+    pass "completion: terminal marker + auth+world active + realmlist row verified"
 }
 
 # After a completed run the unit is collected (its name is free again). The

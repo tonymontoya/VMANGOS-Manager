@@ -91,7 +91,7 @@ secrets or calls the runner directly on the launch path.
 | `kill-reattach` | Kill the viewer's journal session; the unit **keeps running**; re-attach works. |
 | `failure-retry` | Stop the unit after the first phase checkpoint; the runner's retry path (`installer_unit_stop` + `installer_unit_start` — what the FailureScreen's Retry runs) restarts it. Resume is **verified three ways**: the retried invocation logs `Resuming from checkpoint: <captured>`, no completed phase re-ran (prerequisites never starts again), and the checkpoint then advances past the captured one. |
 | `watch` | Markers stream until the terminal `phase=install event=done` marker. |
-| `completion` | Terminal marker present; `auth` + `world` services active; realmlist fields (`server_ip`/`auth_port`/`world_port`) present. |
+| `completion` | Terminal marker present; `auth` + `world` services active; the `realmlist` row is **queried from the database inside the container** and its address/port must match the marker's `server_ip`/`world_port` (the marker alone is the installer grading its own homework). |
 | `name-recreation` | After a completed run, the runner re-creates the unit name (`installer_unit_start`) and the unit runs our installer; it is stopped again via `installer_unit_stop` (a real re-install goes through the wizard's gate — this exercises the `--collect` name edge). |
 | `flake-watch` | The viewer async suite is re-run N times (`SMOKE_FLAKE_RUNS`, default 5). A reproduction of the known unit-state detection race (#113 — both `test_viewer_detects_unit_failure_without_markers` and its sibling `..._unit_ended_without_completion`) is captured — log + traceback — and **tolerated**; any other failure is unknown and fails the smoke. |
 
