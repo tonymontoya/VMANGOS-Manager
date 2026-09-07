@@ -926,7 +926,10 @@ phase_build() {
         fail_marker build "Failed to enter the installation directory $INSTALLROOT" "Check the directory permissions, then re-run the installer"
         return 1
     }
-    CPU=$(nproc)
+    CPU=$(nproc) || {
+        fail_marker build "Failed to count the available CPU cores" "Check that nproc is available, then re-run the installer"
+        return 1
+    }
     
     log_info "====================================================================="
     log_info "COMPILING VMANGOS - THIS WILL TAKE 1-2 HOURS"
@@ -1042,6 +1045,19 @@ phase_build() {
     set_checkpoint "BUILD_DONE"
 }
 
+# config_edit <setting> <file> <sed-expr>: one guarded config edit. sed -i
+# succeeds even when the pattern matches nothing; this catches execution
+# failures (unwritable file, no space left), which under set -e would
+# otherwise exit the script with the phase stuck at event=start.
+config_edit() {
+    local setting="$1" file="$2" expr="$3"
+    if ! sed -i "$expr" "$file"; then
+        fail_marker config "Failed to update $setting in $(basename "$file")" \
+            "Check free disk space and the permissions of $file, then re-run the installer"
+        return 1
+    fi
+}
+
 phase_config_setup() {
     log_section "PHASE: Configuration Setup"
     log_marker config start
@@ -1069,33 +1085,46 @@ phase_config_setup() {
     # the realmlist entry and BindIP below.
     # The config format is: LoginDatabaseInfo = "host;port;user;pass;db"
     # Use more flexible sed patterns that handle variations in spacing
-    sed -i "s|LoginDatabaseInfo.*=.*\"127\.0\.0\.1;3306;mangos;.*;realmd\"|LoginDatabaseInfo = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$AUTHDB\"|" "$INSTALLROOT/run/etc/realmd.conf"
-    sed -i "s|BindIP.*=.*\"0\.0\.0\.0\"|BindIP = \"$SERVERIP\"|" "$INSTALLROOT/run/etc/realmd.conf"
+    config_edit "LoginDatabaseInfo" "$INSTALLROOT/run/etc/realmd.conf" \
+        "s|LoginDatabaseInfo.*=.*\"127\.0\.0\.1;3306;mangos;.*;realmd\"|LoginDatabaseInfo = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$AUTHDB\"|" || return 1
+    config_edit "BindIP" "$INSTALLROOT/run/etc/realmd.conf" \
+        "s|BindIP.*=.*\"0\.0\.0\.0\"|BindIP = \"$SERVERIP\"|" || return 1
 
     log_info "Configuring mangosd.conf..."
 
     # Update World server config - handle both old and new format
     # New format uses dots: LoginDatabase.Info, WorldDatabase.Info, etc.
     # Use flexible patterns that match the actual config file format
-    sed -i "s|LoginDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|LoginDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$AUTHDB\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|WorldDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|WorldDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$WORLDDB\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|CharacterDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|CharacterDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$CHARACTERDB\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|LogsDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|LogsDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$LOGSDB\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    
+    config_edit "LoginDatabase.Info" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|LoginDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|LoginDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$AUTHDB\"|" || return 1
+    config_edit "WorldDatabase.Info" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|WorldDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|WorldDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$WORLDDB\"|" || return 1
+    config_edit "CharacterDatabase.Info" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|CharacterDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|CharacterDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$CHARACTERDB\"|" || return 1
+    config_edit "LogsDatabase.Info" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|LogsDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|LogsDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$LOGSDB\"|" || return 1
+
     # Update DataDir to point to installation root
-    sed -i "s|DataDir = \"\.\"|DataDir = \"$INSTALLROOT\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    
+    config_edit "DataDir" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|DataDir = \"\.\"|DataDir = \"$INSTALLROOT\"|" || return 1
+
     # Update log directories
-    sed -i "s|LogsDir = \"\"|LogsDir = \"$INSTALLROOT/logs/mangosd/\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|HonorDir = \"\"|HonorDir = \"$INSTALLROOT/logs/honor/\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    
+    config_edit "LogsDir" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|LogsDir = \"\"|LogsDir = \"$INSTALLROOT/logs/mangosd/\"|" || return 1
+    config_edit "HonorDir" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|HonorDir = \"\"|HonorDir = \"$INSTALLROOT/logs/honor/\"|" || return 1
+
     # Update BindIP for world server
-    sed -i "s|BindIP = \"0.0.0.0\"|BindIP = \"$SERVERIP\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    
+    config_edit "BindIP" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|BindIP = \"0.0.0.0\"|BindIP = \"$SERVERIP\"|" || return 1
+
     # Disable VMaps by default (they're optional and extraction takes hours)
-    sed -i "s|vmap.enableLOS = 1|vmap.enableLOS = 0|" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|vmap.enableHeight = 1|vmap.enableHeight = 0|" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|vmap.enableIndoorCheck = 1|vmap.enableIndoorCheck = 0|" "$INSTALLROOT/run/etc/mangosd.conf"
+    config_edit "vmap.enableLOS" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|vmap.enableLOS = 1|vmap.enableLOS = 0|" || return 1
+    config_edit "vmap.enableHeight" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|vmap.enableHeight = 1|vmap.enableHeight = 0|" || return 1
+    config_edit "vmap.enableIndoorCheck" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|vmap.enableIndoorCheck = 1|vmap.enableIndoorCheck = 0|" || return 1
     
     if installer_should_provision_manager; then
         local manager_root manager_config_dir manager_config_file manager_password_file
@@ -1187,24 +1216,24 @@ EOF
         }
         # Runtime lock dir is on tmpfs: recreate it group-writable at boot.
         mkdir -p /etc/tmpfiles.d || {
-            fail_marker config "Failed to create /etc/tmpfiles.d" "Check the install log for the failing step, then re-run the installer"
+            fail_marker config "Failed to create /etc/tmpfiles.d" "Check that the installer runs as root, then re-run the installer"
             return 1
         }
         printf 'd /run/vmangos-manager 0775 root %s -\n' "$MANGOSOSUSER" > /etc/tmpfiles.d/vmangos-manager.conf || {
-            fail_marker config "Failed to write the manager tmpfiles rule" "Check the install log for the failing step, then re-run the installer"
+            fail_marker config "Failed to write the manager tmpfiles rule" "Check free disk space and that the installer runs as root, then re-run the installer"
             return 1
         }
         systemd-tmpfiles --create /etc/tmpfiles.d/vmangos-manager.conf 2>/dev/null || true
         mkdir -p /var/run/vmangos-manager || {
-            fail_marker config "Failed to create /var/run/vmangos-manager" "Check the install log for the failing step, then re-run the installer"
+            fail_marker config "Failed to create /var/run/vmangos-manager" "Check that the installer runs as root, then re-run the installer"
             return 1
         }
         chgrp "$MANGOSOSUSER" /var/run/vmangos-manager || {
-            fail_marker config "Failed to set the manager runtime directory group" "Check the install log for the failing step, then re-run the installer"
+            fail_marker config "Failed to set the manager runtime directory group" "Check that the installer runs as root, then re-run the installer"
             return 1
         }
         chmod 775 /var/run/vmangos-manager || {
-            fail_marker config "Failed to set the manager runtime directory permissions" "Check the install log for the failing step, then re-run the installer"
+            fail_marker config "Failed to set the manager runtime directory permissions" "Check that the installer runs as root, then re-run the installer"
             return 1
         }
         log_info "Manager config written to $manager_config_file"
@@ -1275,7 +1304,10 @@ phase_data_extraction() {
     # A resumed install re-enters this phase without re-running
     # check_client_data, so make sure the service account exists (this phase
     # chowns and sudo -us to it) and derive the extraction root on demand.
-    ensure_service_account
+    ensure_service_account || {
+        fail_marker extraction "Failed to set up the service account $MANGOSOSUSER" "Check that the user name is available and that useradd succeeded"
+        return 1
+    }
     prepare_extraction_root
 
     # Copy extractors (handle both lowercase and capitalized names)
@@ -1292,7 +1324,10 @@ phase_data_extraction() {
         cp "$INSTALLROOT/run/bin/Extractors/MoveMapGenerator" "$INSTALLROOT/MoveMapGen" 2>/dev/null || true
     
     if [ -f "$INSTALLROOT/source/contrib/mmap/offmesh.txt" ]; then
-        cp "$INSTALLROOT/source/contrib/mmap/offmesh.txt" "$INSTALLROOT/"
+        # Optional input for the (already soft-failing) mmaps step: warn and
+        # continue instead of failing the phase.
+        cp "$INSTALLROOT/source/contrib/mmap/offmesh.txt" "$INSTALLROOT/" || \
+            warn_marker extraction "Failed to copy offmesh.txt; mmaps will run without it"
     fi
     
     # Create directories
@@ -1385,10 +1420,16 @@ phase_data_extraction() {
     
     if [ $EXTRACTION_FAILED -eq 0 ] && [ $VMAPS_FAILED -eq 0 ] && [ -f ./vmap_assembler ]; then
         log_info "Starting vmap_assembler..."
-        mkdir -p "$INSTALLROOT/vmaps"
+        mkdir -p "$INSTALLROOT/vmaps" || {
+            fail_marker extraction "Failed to create the vmaps directory" "Check the permissions under $INSTALLROOT, then re-run the installer"
+            return 1
+        }
         # The assembler runs as $MANGOSOSUSER and must write into vmaps;
         # mkdir ran as root, so hand the directory over first.
-        chown "$MANGOSOSUSER:$MANGOSOSUSER" "$INSTALLROOT/vmaps"
+        chown "$MANGOSOSUSER:$MANGOSOSUSER" "$INSTALLROOT/vmaps" || {
+            fail_marker extraction "Failed to hand the vmaps directory to $MANGOSOSUSER" "Check that the installer runs as root, then re-run the installer"
+            return 1
+        }
         # Assemble from the Buildings dir vmapextractor wrote to $INSTALLROOT,
         # not from the raw client data. --silent skips its "press enter" prompt.
         sudo -u "$MANGOSOSUSER" bash -c "cd '$INSTALLROOT' && ./vmap_assembler --silent '$INSTALLROOT/Buildings' '$INSTALLROOT/vmaps'" 2>&1 | tee -a "$INSTALL_LOG"
@@ -1507,7 +1548,10 @@ phase_data_extraction() {
         
         # Create versioned directory structure (e.g., 5875 for WoW 1.12.1)
         log_info "Creating versioned data directory structure..."
-        mkdir -p "$INSTALLROOT/5875"
+        mkdir -p "$INSTALLROOT/5875" || {
+            fail_marker extraction "Failed to create the versioned data directory" "Check the permissions under $INSTALLROOT, then re-run the installer"
+            return 1
+        }
         
         # Create symlinks for dbc and maps in the versioned directory
         if [ -d "$INSTALLROOT/dbc" ]; then
@@ -1581,12 +1625,22 @@ phase_database_import() {
             # Check if file is valid (non-zero size)
             if [ -s "$DB_FILENAME" ]; then
                 log_info "Extracting world database..."
-                
-                # Extract based on file extension
+
+                # Extract based on file extension. The extractor's exit code
+                # must come through the tee (PIPESTATUS), or a corrupt
+                # download is only ever discovered as "no SQL found".
+                local EXTRACT_RC=0
                 if [[ "$DB_FILENAME" == *.zip ]]; then
                     unzip -o "$DB_FILENAME" 2>&1 | tee -a "$INSTALL_LOG"
+                    EXTRACT_RC="${PIPESTATUS[0]}"
                 elif [[ "$DB_FILENAME" == *.7z ]]; then
                     7z x "$DB_FILENAME" -aoa 2>&1 | tee -a "$INSTALL_LOG"
+                    EXTRACT_RC="${PIPESTATUS[0]}"
+                fi
+                if [ "$EXTRACT_RC" -ne 0 ]; then
+                    warn_marker db-import "Failed to extract the world database archive $DB_FILENAME (exit $EXTRACT_RC); trying the next source"
+                    rm -f "$DB_FILENAME"
+                    continue
                 fi
                 
                 # Check for mysql-dump directory structure (from vmangos releases)
@@ -1647,7 +1701,7 @@ phase_database_import() {
                         log_info "World database imported successfully"
                         WORLD_DB_DOWNLOADED=true
                     else
-                        log_warn "No SQL file found after extraction"
+                        warn_marker db-import "No SQL file found after extracting $DB_FILENAME"
                     fi
                 fi
                 
@@ -1747,7 +1801,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
     then
-        fail_marker services "Failed to write the auth service unit" "Check the install log for the failing step, then re-run the installer"
+        fail_marker services "Failed to write the auth service unit" "Check free disk space and that the installer runs as root, then re-run the installer"
         return 1
     fi
 
@@ -1773,7 +1827,7 @@ TTYVHangup=yes
 WantedBy=multi-user.target
 EOF
     then
-        fail_marker services "Failed to write the world service unit" "Check the install log for the failing step, then re-run the installer"
+        fail_marker services "Failed to write the world service unit" "Check free disk space and that the installer runs as root, then re-run the installer"
         return 1
     fi
 

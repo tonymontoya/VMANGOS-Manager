@@ -1224,9 +1224,14 @@ exec "$@"
 EOF
     cat > "$tmp_dir/bin/id" <<'EOF'
 #!/usr/bin/env bash
+[[ "${ID_MODE:-ok}" == "missing" ]] && exit 1
 exit 0
 EOF
-    chmod +x "$tmp_dir/bin/sudo" "$tmp_dir/bin/id"
+    cat > "$tmp_dir/bin/useradd" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "$tmp_dir/bin/sudo" "$tmp_dir/bin/id" "$tmp_dir/bin/useradd"
 
     # Scenario A: client data is unreadable by the service user, so the
     # staging copy runs and its chown (stubbed to fail) is guarded.
@@ -1288,6 +1293,226 @@ EOF
     assert_equals "1" \
         "$(printf '%s\n' "$markers" | grep -c 'phase=extraction event=error msg="Failed to hand the installation directory to mangos"' || true)" \
         "the installation chown death path emits the extraction error marker" || failed=1
+
+    # Scenario C: the service account cannot be created (id and useradd both
+    # fail), so the re-entry guard fails the phase instead of dying bare.
+    SUDO_READ=allow ID_MODE=missing INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        CLIENT_DATA="'"$client"'"
+        MANGOSOSUSER="mangos"
+        set +e
+        phase_data_extraction
+        rc=$?
+        set -e
+        printf "ACCOUNT_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase-c.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase-c.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^ACCOUNT_RC=//p' "$tmp_dir/phase-c.out")" \
+        "a failing service-account setup fails the extraction phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=extraction event=error msg="Failed to set up the service account mangos"' || true)" \
+        "the service-account death path emits the extraction error marker" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_config_phase_sed_guards() {
+    local tmp_dir root failed=0 markers
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$tmp_dir/bin" "$root/run/etc" "$root/manager/config"
+
+    cat > "$root/run/etc/realmd.conf.dist" <<'EOF'
+LoginDatabaseInfo = "127.0.0.1;3306;mangos;mangos;realmd"
+BindIP = "0.0.0.0"
+EOF
+    cat > "$root/run/etc/mangosd.conf.dist" <<'EOF'
+LoginDatabase.Info = "127.0.0.1;3306;mangos;mangos;realmd"
+WorldDatabase.Info = "127.0.0.1;3306;mangos;mangos;mangos"
+CharacterDatabase.Info = "127.0.0.1;3306;mangos;mangos;characters"
+LogsDatabase.Info = "127.0.0.1;3306;mangos;mangos;logs"
+DataDir = "."
+LogsDir = ""
+HonorDir = ""
+vmap.enableLOS = 1
+BindIP = "0.0.0.0"
+EOF
+
+    # The config edits are forced to fail by stubbing sed; the phase must die
+    # at the first guarded edit with the config error marker.
+    cat > "$tmp_dir/bin/sed" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "$tmp_dir/bin/sed"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        SERVERIP="10.0.5.5"
+        MANGOSDBUSER="mangos"
+        MANGOSDBPASS="sekrit"
+        MANGOSOSUSER="mangos"
+        AUTHDB="auth"
+        WORLDDB="world"
+        CHARACTERDB="characters"
+        LOGSDB="logs"
+        set +e
+        phase_config_setup
+        rc=$?
+        set -e
+        printf "SED_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^SED_RC=//p' "$tmp_dir/phase.out")" \
+        "a failing config edit fails the config phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=config event=error msg="Failed to update LoginDatabaseInfo in realmd.conf"' || true)" \
+        "the sed death path emits the config error marker" || failed=1
+    assert_equals "1" "$(printf '%s\n' "$markers" | grep -c 'hint=' || true)" \
+        "the config-edit guard marker carries a hint" || failed=1
+    assert_equals "0" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=config event=done' || true)" \
+        "the failed config run never emits done" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_build_phase_nproc_guard() {
+    local tmp_dir root failed=0 markers
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$tmp_dir/bin" "$root"
+
+    cat > "$tmp_dir/bin/nproc" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "$tmp_dir/bin/nproc"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        set +e
+        phase_build
+        rc=$?
+        set -e
+        printf "NPROC_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^NPROC_RC=//p' "$tmp_dir/phase.out")" \
+        "a failing nproc fails the build phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=build event=error msg="Failed to count the available CPU cores"' || true)" \
+        "the nproc death path emits the build error marker" || failed=1
+    assert_equals "0" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=build event=done' || true)" \
+        "the failed build run never emits done" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_db_import_extraction_guard() {
+    local tmp_dir root failed=0 markers
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$tmp_dir/bin" "$root"
+
+    # wget serves the release API (down: only the fallback URL is kept) and
+    # "downloads" a non-empty corrupt archive for any -O target.
+    cat > "$tmp_dir/bin/wget" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+    case "$arg" in
+        *api.github.com*)
+            [[ "${API_MODE:-ok}" == "ok" ]] && exit 0
+            exit 1
+            ;;
+    esac
+done
+out=""
+prev=""
+for arg in "$@"; do
+    if [[ "$prev" == "-O" ]]; then out="$arg"; fi
+    prev="$arg"
+done
+if [[ -n "$out" ]]; then
+    printf 'not a real zip archive\n' > "$out"
+    exit 0
+fi
+exit 1
+EOF
+    cat > "$tmp_dir/bin/unzip" <<'EOF'
+#!/usr/bin/env bash
+echo "unzip: cannot find zipfile directory"
+exit 9
+EOF
+    cat > "$tmp_dir/bin/mysql" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+    *"SELECT COUNT"*) printf '1\n' ;;
+esac
+exit 0
+EOF
+    chmod +x "$tmp_dir/bin/wget" "$tmp_dir/bin/unzip" "$tmp_dir/bin/mysql"
+
+    API_MODE=down INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        SERVERIP="10.0.5.5"
+        AUTHDB="auth"
+        WORLDDB="world"
+        CHARACTERDB="characters"
+        LOGSDB="logs"
+        set +e
+        phase_database_import
+        rc=$?
+        set -e
+        printf "ZIP_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "0" "$(sed -n 's/^ZIP_RC=//p' "$tmp_dir/phase.out")" \
+        "a corrupt world database archive does not fail the phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=db-import event=warn msg="Failed to extract the world database archive db-810fef8.zip (exit 9); trying the next source"' || true)" \
+        "the corrupt archive leaves a warn marker instead of silence" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=db-import event=done' || true)" \
+        "the phase still completes through the fallback path" || failed=1
+    assert_equals "0" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=db-import event=error' || true)" \
+        "a corrupt archive is a warning, not an error" || failed=1
+    assert_equals "ok" \
+        "$(test ! -e "$root/db-810fef8.zip" && printf ok || printf left)" \
+        "the corrupt archive is removed before trying the next source" || failed=1
 
     rm -rf "$tmp_dir"
     return "$failed"
@@ -1559,6 +1784,9 @@ main() {
     run_test "Installer: Config manager provision guards" test_config_phase_manager_provision_guards
     run_test "Installer: Services unit write guard" test_services_phase_unit_write_guard
     run_test "Installer: Extraction chown guards" test_extraction_phase_chown_guards
+    run_test "Installer: Config sed guards" test_config_phase_sed_guards
+    run_test "Installer: Build nproc guard" test_build_phase_nproc_guard
+    run_test "Installer: db-import extraction guard" test_db_import_extraction_guard
 
     echo ""
     echo "========================================"

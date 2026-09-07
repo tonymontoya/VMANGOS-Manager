@@ -601,8 +601,9 @@ class MarkerTracker:
 def render_checklist(tracker: MarkerTracker) -> str:
     """The phase checklist: done / running / failed / pending, in order.
 
-    Warnings (non-fatal failures) are appended under the phases so a phase
-    that "done"-ed with a swallowed failure never looks clean.
+    Warnings (non-fatal failures) are appended after the full phase list,
+    each prefixed with its phase, so a phase that "done"-ed with a swallowed
+    failure never looks clean.
     """
     marks = {"done": "\u2713", "running": "\u25b6", "failed": "\u2717", "pending": "\u00b7"}
     suffix = {"running": "  in progress", "failed": "  FAILED", "pending": "  pending"}
