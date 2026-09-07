@@ -750,14 +750,32 @@ phase_snapshot() {
     (( rank >= 1 )) \
         || die "snapshot: unknown checkpoint '$after' (SMOKE_SNAPSHOT_AFTER)"
     tag="${SNAPSHOT_TAG:-$(snapshot_default_tag "$after")}"
-    if unit_running; then
-        log "snapshot: install unit running — waiting for checkpoint $after..."
-        cp="$(wait_checkpoint_past $(( rank - 1 )) "$TIMEOUT_INSTALL")" \
-            || fail "snapshot: the checkpoint never passed $after within ${TIMEOUT_INSTALL}s"
-    else
-        cp="$(checkpoint_read)"
+    cp="$(checkpoint_read)"
+    if [[ -z "$cp" ]] || (( $(checkpoint_rank "$cp") < rank )); then
+        # The checkpoint does not satisfy the target yet. Three honest
+        # states: the install is running (wait for it to advance), it has
+        # not started yet (a parallel smoke still setting up — wait for
+        # the first checkpoint), or it ended without reaching the target
+        # (fail fast: a dead install never advances).
+        if [[ -z "$cp" ]] && ! unit_running \
+            && (( $(journal_count 'phase=install event=done') > 0 )); then
+            fail "snapshot: the install already completed (checkpoints cleared) — a finished container cannot be snapshotted"
+        fi
+        log "snapshot: waiting for checkpoint $after (currently: ${cp:-not started}, unit $(unit_state))..."
+        local deadline=$(( $(date +%s) + TIMEOUT_INSTALL ))
+        while (( $(date +%s) < deadline )); do
+            cp="$(checkpoint_read)"
+            if [[ -n "$cp" ]]; then
+                if (( $(checkpoint_rank "$cp") >= rank )); then
+                    break
+                fi
+                unit_running \
+                    || fail "snapshot: the install ended at checkpoint $cp (below $after) — nothing to snapshot"
+            fi
+            sleep 5
+        done
         [[ -n "$cp" && "$(checkpoint_rank "$cp")" -ge "$rank" ]] \
-            || fail "snapshot: unit not running and checkpoint '${cp:-none}' has not passed $after"
+            || fail "snapshot: the checkpoint never passed $after within ${TIMEOUT_INSTALL}s (last: ${cp:-none})"
     fi
     log "snapshot: checkpoint $cp passed $after — committing $CONTAINER_NAME as $tag"
     docker commit "$CONTAINER_NAME" "$tag" >/dev/null
