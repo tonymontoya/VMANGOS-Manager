@@ -769,10 +769,19 @@ phase_snapshot() {
                 if (( $(checkpoint_rank "$cp") >= rank )); then
                     break
                 fi
-                unit_running \
-                    || fail "snapshot: the install ended at checkpoint $cp (below $after) — nothing to snapshot"
+                if ! unit_running; then
+                    # The unit may be mid-retry — the failure-retry scenario
+                    # deliberately stops and restarts it. Only call the
+                    # install ended once it stays down.
+                    sleep 30
+                    unit_running \
+                        || fail "snapshot: the install ended at checkpoint $cp (below $after) — nothing to snapshot"
+                else
+                    sleep 5
+                fi
+            else
+                sleep 5
             fi
-            sleep 5
         done
         [[ -n "$cp" && "$(checkpoint_rank "$cp")" -ge "$rank" ]] \
             || fail "snapshot: the checkpoint never passed $after within ${TIMEOUT_INSTALL}s (last: ${cp:-none})"
