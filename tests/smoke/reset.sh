@@ -7,14 +7,20 @@
 # the host, so the next run re-mounts the same MPQ files and the long extraction
 # / db-import work is reproducible without re-downloading anything.
 #
+# Snapshot images (vmangos-smoke-snap-*, #116) are also KEPT by default —
+# they exist so re-smokes skip the expensive phases; remove them explicitly
+# with --snapshots.
+#
 # Usage:
 #   tests/smoke/reset.sh [--container NAME] [--image NAME] [--keep-image]
+#                        [--snapshots]
 #
 set -euo pipefail
 
 CONTAINER_NAME="${SMOKE_CONTAINER_NAME:-vmangos-wizard-smoke}"
 IMAGE_NAME="${SMOKE_IMAGE_NAME:-vmangos-smoke-base}"
 KEEP_IMAGE=0
+REMOVE_SNAPSHOTS=0
 
 log() { printf '[reset] %s\n' "$*" >&2; }
 
@@ -23,6 +29,7 @@ while [[ $# -gt 0 ]]; do
         --container)  CONTAINER_NAME="${2:-}"; shift 2 ;;
         --image)      IMAGE_NAME="${2:-}"; shift 2 ;;
         --keep-image) KEEP_IMAGE=1; shift ;;
+        --snapshots)  REMOVE_SNAPSHOTS=1; shift ;;
         -h|--help)    grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)            log "unknown arg: $1"; exit 2 ;;
     esac
@@ -38,6 +45,15 @@ if (( KEEP_IMAGE )); then
 else
     log "removing image $IMAGE_NAME (if present)"
     docker rmi "$IMAGE_NAME" >/dev/null 2>&1 || true
+fi
+
+if (( REMOVE_SNAPSHOTS )); then
+    log "removing snapshot images (vmangos-smoke-snap-*)"
+    docker images --format '{{.Repository}}:{{.Tag}}' \
+        | grep -E '^vmangos-smoke-snap-[a-z-]+$' \
+        | xargs -r docker rmi >/dev/null 2>&1 || true
+else
+    log "keeping snapshot images (vmangos-smoke-snap-*); remove with --snapshots"
 fi
 
 log "done. The client-data cache on the host is untouched; re-run wizard_smoke.sh for a fresh smoke."

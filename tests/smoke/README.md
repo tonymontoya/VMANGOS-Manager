@@ -57,10 +57,15 @@ tests/smoke/wizard_smoke.sh --phase watch
 tests/smoke/wizard_smoke.sh --phase completion
 tests/smoke/wizard_smoke.sh --phase name-recreation
 tests/smoke/wizard_smoke.sh --phase flake-watch
+tests/smoke/wizard_smoke.sh --phase snapshot
+tests/smoke/wizard_smoke.sh --phase resume-install
 tests/smoke/wizard_smoke.sh --phase teardown
 
 # Keep the container for inspection (skip teardown):
 tests/smoke/wizard_smoke.sh --keep
+
+# Re-smoke from a snapshot image instead of a clean run (~10 min; below):
+tests/smoke/wizard_smoke.sh --from-snapshot vmangos-smoke-snap-data
 ```
 
 Tear down and prepare for a fresh run (keeps the client-data cache):
@@ -95,6 +100,8 @@ secrets or calls the runner directly on the launch path.
 | `completion` | Terminal marker present; `auth` + `world` services active; the `realmlist` row is **queried from the database inside the container** and its address/port must match the marker's `server_ip`/`world_port` (the marker alone is the installer grading its own homework). |
 | `name-recreation` | After a completed run, the runner re-creates the unit name (`installer_unit_start`) and the unit runs our installer; it is stopped again via `installer_unit_stop` (a real re-install goes through the wizard's gate — this exercises the `--collect` name edge). |
 | `flake-watch` | The viewer async suite is re-run N times (`SMOKE_FLAKE_RUNS`, default 5) as a stability gate. Any failure fails the smoke and its output is captured — the #113 unit-state race is fixed (`first_seconds` 15s window exceeds the checker's 5s query timeout), so no failure is tolerated. |
+| `snapshot` | Once the container's install checkpoint passes `SMOKE_SNAPSHOT_AFTER` (default `DATA_DONE`), the container is `docker commit`ed into a tagged snapshot image. Works in parallel with a running smoke or against a kept container whose checkpoint already satisfies the target. |
+| `resume-install` | Starts the install from the checkpoint embedded in a snapshot image via the runner (the same path Retry takes); verifies a fresh `Resuming from checkpoint: <cp>` journal line and freezes the embedded phases' start-marker counts for `completion` to check. |
 
 ## Runtime expectations
 
@@ -112,11 +119,72 @@ phase checkpoint before forcing its failure (prerequisites' real apt, ~5 min;
 `SMOKE_PREREQS_TIMEOUT`, default 25 min, and `SMOKE_ADVANCE_TIMEOUT`,
 default 15 min, bound the two waits).
 
-If you only need to re-exercise the viewer/runner (not the full build),
-snapshot the container after the source phase (`docker commit`) so a re-smoke
-can start from `SOURCE_DONE` — the build + extraction + db-import phases are
-the expensive, already-proven part. This stays a manual README-only
-optimization; the smoke itself does not automate it.
+## Snapshots: cheap re-smokes (#116)
+
+A full clean run pays ~4.5 h, dominated by MoveMapGen. Changes to the
+viewer, the completion checks, or the services never need to re-exercise
+that — so the smoke can `docker commit` the container at a checkpoint and
+re-run from the committed image instead of the base image:
+
+```sh
+# Terminal 1: any run (--keep so the container survives for the re-smoke):
+tests/smoke/wizard_smoke.sh --keep
+
+# Terminal 2, while it runs: wait for the checkpoint, commit the image.
+# Default checkpoint: DATA_DONE (everything through extraction).
+tests/smoke/wizard_smoke.sh --phase snapshot
+# -> vmangos-smoke-snap-data (the tag derives from the checkpoint)
+
+# Other checkpoints (e.g. skip only prerequisites+database+source):
+SMOKE_SNAPSHOT_AFTER=SOURCE_DONE tests/smoke/wizard_smoke.sh --phase snapshot
+# -> vmangos-smoke-snap-source
+```
+
+`--phase snapshot` also works against a `--keep`'d container after the
+run ends, as long as the checkpoint file still satisfies the target — a
+**completed** install clears its checkpoints, so a finished container can
+no longer be snapshotted.
+
+A snapshot image embeds everything the finished phases produced: the
+install root (checkpoint file, build tree, extracted DBC/maps/vmaps/mmaps),
+the databases, the installed manager, and the secrets the TUI wrote. A
+re-smoke starts a fresh container from it and resumes the install from the
+embedded checkpoint:
+
+```sh
+tests/smoke/wizard_smoke.sh --from-snapshot vmangos-smoke-snap-data
+```
+
+The re-smoke flow replaces `build-image`/`tui-launch` with `resume-install`
+(starts the install from the embedded checkpoint through the runner — the
+same path Retry takes; the wizard's gate is deliberately not clean here)
+and verifies the resume itself: the journal must show a fresh
+`Resuming from checkpoint: <cp>`, and at `completion` the start-marker
+counts of every phase embedded in the snapshot are compared against
+baselines frozen at resume time — build and extraction (and everything
+before them) must never start again. `failure-retry` runs right after the
+resume (inside the short db-import window), then `tui-attach`,
+`kill-reattach`, `watch`, `completion`, `name-recreation`, and
+`flake-watch` all run unchanged on the resumed install.
+
+Expected cost by starting checkpoint (10-core workstation):
+
+| Snapshot image | Default for | Re-smoke skips | Re-smoke cost |
+|---|---|---|---|
+| `vmangos-smoke-snap-data` | `DATA_DONE` | prerequisites + database + source + build + config + **extraction** | **~10 min** (setup+manager ~3 min, db-import ~1-2 min, services ~1 min, scenarios) |
+| `vmangos-smoke-snap-source` | `SOURCE_DONE` | prerequisites + database + source | ~3 h (still pays build + extraction) |
+
+Notes:
+
+* Committed services are captured as-is — like a power cut. MySQL recovers
+  its journals when the re-smoked container boots; the transient install
+  unit never survives (its state lives in `/run`, which is not committed).
+* The journal **does** survive inside the snapshot (`/var/log/journal`), so
+  marker counts accumulate across re-smokes — the baselines are frozen at
+  resume time, never assumed zero.
+* Teardown and `reset.sh` never delete snapshot images. Remove them
+  explicitly (`docker rmi vmangos-smoke-snap-data`) or all at once with
+  `reset.sh --snapshots`.
 
 The client-data cache (`/home/tony/Data`, ~5.2 GB of MPQs) is mounted read-only
 and kept across runs, so the extraction/db-import phases are reproducible

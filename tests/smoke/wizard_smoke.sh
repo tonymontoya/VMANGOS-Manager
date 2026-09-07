@@ -37,15 +37,23 @@
 #                   completed run, then stop it again
 #   flake-watch     re-run the viewer async suite N times; any failure
 #                   fails the smoke (the #113 race is fixed)
+#   snapshot        docker-commit the container once its checkpoint passes
+#                   SMOKE_SNAPSHOT_AFTER (default DATA_DONE) into a tagged
+#                   snapshot image for cheap re-smokes (#116)
+#   resume-install  start the install from the checkpoint embedded in a
+#                   snapshot image via the runner; verifies the resume and
+#                   freezes phase-start baselines for completion to check
 #   teardown        remove the container (keep the client-data cache)
 #
-# Iterating: a full clean install can exceed 4h. To re-run later phases
-# without reinstalling, snapshot the container after the source phase
-# (docker commit) so re-smokes start from SOURCE_DONE; see the README.
+# Iterating: a full clean install can exceed 4h. Instead of paying that on
+# every re-smoke, `--phase snapshot` commits the container at a checkpoint
+# (default DATA_DONE: everything through extraction) and `--from-snapshot
+# TAG` re-runs the late phases (~10 min) from that image; see the README.
 #
 # Usage:
 #   tests/smoke/wizard_smoke.sh [--phase NAME] [--keep] [--client-data PATH]
 #                               [--container NAME] [--image NAME] [--repo PATH]
+#                               [--from-snapshot [TAG]]
 #
 # Exit status: 0 when the requested phase(s) pass, non-zero otherwise.
 #
@@ -87,6 +95,15 @@ TIMEOUT_TUI="${SMOKE_TUI_TIMEOUT:-180}"
 # runs real apt, ~5 min) and for the resumed run to advance past it.
 TIMEOUT_PREREQS="${SMOKE_PREREQS_TIMEOUT:-1500}"
 TIMEOUT_ADVANCE="${SMOKE_ADVANCE_TIMEOUT:-900}"
+# Snapshots (#116): commit the container at a checkpoint, then re-smoke from
+# the committed image. SMOKE_SNAPSHOT_AFTER picks the checkpoint to wait for:
+# SOURCE_DONE makes re-smokes skip prerequisites+database+source; DATA_DONE
+# (the default) additionally skips build+config+extraction — the ~4h part.
+SNAPSHOT_AFTER="${SMOKE_SNAPSHOT_AFTER:-DATA_DONE}"
+SNAPSHOT_TAG="${SMOKE_SNAPSHOT_TAG:-}"
+# Start the container from a snapshot image instead of the base image
+# (--from-snapshot [TAG], or SMOKE_FROM_SNAPSHOT).
+FROM_SNAPSHOT="${SMOKE_FROM_SNAPSHOT:-}"
 
 # ---------------------------------------------------------------------------
 # Logging + helpers
@@ -167,6 +184,30 @@ checkpoint_rank() {
     esac
 }
 
+# Rank of the *_DONE checkpoint a phase writes when it completes
+# (prerequisites -> PREREQS_DONE, ..., extraction -> DATA_DONE).
+phase_done_rank() {
+    case "$1" in
+        prerequisites) echo 1 ;;
+        database)      echo 2 ;;
+        source)        echo 3 ;;
+        build)         echo 4 ;;
+        config)        echo 5 ;;
+        extraction)    echo 6 ;;
+        *)             echo -1 ;;
+    esac
+}
+
+# Default snapshot image tag for a checkpoint (SOURCE_DONE ->
+# vmangos-smoke-snap-source, DATA_DONE -> vmangos-smoke-snap-data). The
+# snap- family is distinct from the vmangos-smoke-base image so reset.sh
+# can tell them apart.
+snapshot_default_tag() { # snapshot_default_tag <CHECKPOINT>
+    local c="${1,,}"
+    c="${c%_done}"
+    printf 'vmangos-smoke-snap-%s\n' "${c//_/-}"
+}
+
 # Poll until the checkpoint exists and is past the given chain position.
 wait_checkpoint_past() {
     local rank="$1" timeout="$2"
@@ -239,16 +280,33 @@ phase_build_image() {
 phase_setup() {
     require_docker
     require_client_data
+    local image="$IMAGE_NAME"
+    if [[ -n "$FROM_SNAPSHOT" ]]; then
+        docker image inspect "$FROM_SNAPSHOT" >/dev/null 2>&1 \
+            || die "setup: snapshot image $FROM_SNAPSHOT not found (create one with --phase snapshot)"
+        image="$FROM_SNAPSHOT"
+    fi
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-    log "starting container $CONTAINER_NAME (privileged, cgroupns=host)"
+    log "starting container $CONTAINER_NAME (privileged, cgroupns=host) from $image"
     docker run -d \
         --privileged \
         --cgroupns=host \
         --name "$CONTAINER_NAME" \
         -v "$REPO_ROOT":/src:ro \
         -v "$CLIENT_DATA":/mnt/client-data:ro \
-        "$IMAGE_NAME" >/dev/null
+        "$image" >/dev/null
     wait_for_systemd
+    if [[ -n "$FROM_SNAPSHOT" ]]; then
+        # A usable snapshot embeds an in-progress install: its checkpoint
+        # and the secrets the TUI wrote when it started the original run.
+        local cp
+        cp="$(checkpoint_read)"
+        [[ -n "$cp" ]] \
+            || fail "setup: $FROM_SNAPSHOT has no install checkpoint (committed before any phase finished?)"
+        docker_exec "test -f '$SECRETS_FILE'" >/dev/null 2>&1 \
+            || fail "setup: $FROM_SNAPSHOT has no secrets file at $SECRETS_FILE"
+        log "setup: snapshot state OK — checkpoint=$cp, secrets present"
+    fi
     pass "container up, systemd is PID 1"
 }
 
@@ -583,6 +641,7 @@ phase_completion() {
     [[ "$realm_port" == "$world_port" ]] \
         || fail "realmlist port ($realm_port) does not match the marker's world_port ($world_port)"
     log "realmlist row verified: address=$realm_addr port=$realm_port matches the marker"
+    snapshot_assert_frozen_starts
     pass "completion: terminal marker + auth+world active + realmlist row verified"
 }
 
@@ -669,6 +728,108 @@ phase_flake_watch() {
     pass "flake-watch: $n runs green (no failures tolerated)"
 }
 
+# ---------------------------------------------------------------------------
+# Snapshot phases (#116)
+# ---------------------------------------------------------------------------
+
+# Commit the container into a snapshot image once its install checkpoint
+# has passed SMOKE_SNAPSHOT_AFTER. The image embeds everything the finished
+# phases produced — the install root (checkpoint, build, extracted data),
+# the databases, the installed manager, the secrets — so a re-smoke with
+# --from-snapshot resumes the install from the embedded checkpoint instead
+# of re-running them. Services are captured as-is (as after a power cut);
+# MySQL recovers on the next boot. Works in parallel with a running smoke
+# (same container name) or against a kept container whose checkpoint
+# already satisfies the target.
+phase_snapshot() {
+    require_docker
+    docker inspect "$CONTAINER_NAME" >/dev/null 2>&1 \
+        || die "snapshot: container $CONTAINER_NAME does not exist (set it up first)"
+    local after="$SNAPSHOT_AFTER" rank tag cp
+    rank="$(checkpoint_rank "$after")"
+    (( rank >= 1 )) \
+        || die "snapshot: unknown checkpoint '$after' (SMOKE_SNAPSHOT_AFTER)"
+    tag="${SNAPSHOT_TAG:-$(snapshot_default_tag "$after")}"
+    if unit_running; then
+        log "snapshot: install unit running — waiting for checkpoint $after..."
+        cp="$(wait_checkpoint_past $(( rank - 1 )) "$TIMEOUT_INSTALL")" \
+            || fail "snapshot: the checkpoint never passed $after within ${TIMEOUT_INSTALL}s"
+    else
+        cp="$(checkpoint_read)"
+        [[ -n "$cp" && "$(checkpoint_rank "$cp")" -ge "$rank" ]] \
+            || fail "snapshot: unit not running and checkpoint '${cp:-none}' has not passed $after"
+    fi
+    log "snapshot: checkpoint $cp passed $after — committing $CONTAINER_NAME as $tag"
+    docker commit "$CONTAINER_NAME" "$tag" >/dev/null
+    pass "snapshot: image $tag (checkpoint $cp) — re-smoke with --from-snapshot $tag"
+}
+
+# Freeze the journal start-marker counts of every phase completed before the
+# embedded checkpoint; completion compares against them, so a re-smoke can
+# prove build/extraction never re-ran. Counts are frozen (not assumed zero)
+# because the snapshot carries the original run's journal.
+snapshot_freeze_starts() {
+    local cp_rank p r counts=""
+    cp_rank="$(checkpoint_rank "$(checkpoint_read)")"
+    for p in prerequisites database source build config extraction; do
+        r="$(phase_done_rank "$p")"
+        (( r >= 1 && r <= cp_rank )) || continue
+        counts+="$p $(journal_count "phase=$p event=start")"$'\n'
+    done
+    mkdir -p "$EVIDENCE_DIR"
+    printf '%s' "$counts" > "$EVIDENCE_DIR/snapshot-start-baseline.txt"
+    log "resume-install: froze embedded-phase start baselines ($EVIDENCE_DIR/snapshot-start-baseline.txt)"
+}
+
+snapshot_assert_frozen_starts() {
+    [[ -n "$FROM_SNAPSHOT" ]] || return 0
+    local baseline="$EVIDENCE_DIR/snapshot-start-baseline.txt" p before after
+    [[ -f "$baseline" ]] \
+        || fail "completion: no snapshot baseline (did resume-install run?)"
+    while read -r p before; do
+        [[ -n "$p" ]] || continue
+        after="$(journal_count "phase=$p event=start")"
+        [[ "$after" == "$before" ]] \
+            || fail "completion: phase $p re-ran from the snapshot ($after start markers vs $before at resume time — the resume skipped nothing)"
+        log "snapshot check: $p never re-ran ($after start marker(s))"
+    done < "$baseline"
+}
+
+# Launch phase of the snapshot flow: start the install from the checkpoint
+# embedded in the snapshot image through the runner — the same path Retry
+# and a second `install` take. The clean flow's tui-launch is skipped here:
+# its gate must be clean, and a snapshot deliberately carries an
+# install-in-progress state.
+phase_resume_install() {
+    if unit_running; then
+        fail "resume-install precondition: an install unit is already running"
+    fi
+    local cp
+    cp="$(checkpoint_read)"
+    [[ -n "$cp" ]] \
+        || fail "resume-install: no install checkpoint in the container (start from a snapshot: --from-snapshot TAG)"
+    docker_exec "test -f '$SECRETS_FILE'" >/dev/null 2>&1 \
+        || fail "resume-install: no secrets file at $SECRETS_FILE in the container"
+    log "embedded checkpoint: $cp"
+    snapshot_freeze_starts
+    local resumed_before
+    resumed_before="$(journal_count "Resuming from checkpoint: $cp")"
+    log "starting the install via the runner (installer_unit_start)..."
+    docker_exec "
+        set -u
+        source $MANAGER_PREFIX/lib/installer.sh
+        installer_unit_start '$SECRETS_FILE' '$SETUP_SCRIPT'
+    " || fail "resume-install: the runner refused to start the unit"
+    sleep 5
+    require_unit_running "resume-install"
+    local resumed_after
+    resumed_after="$(journal_count "Resuming from checkpoint: $cp")"
+    (( resumed_after > resumed_before )) \
+        || fail "resume-install: no new 'Resuming from checkpoint: $cp' in the journal (the install restarted instead of resuming)"
+    log "journal shows 'Resuming from checkpoint: $cp'"
+    pass "resume-install: unit running from checkpoint $cp; embedded-phase baselines frozen"
+}
+
 phase_teardown() {
     log "tearing down the container (keeping the client-data cache on the host)"
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
@@ -680,7 +841,7 @@ phase_teardown() {
 # ---------------------------------------------------------------------------
 
 usage() {
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -692,6 +853,14 @@ parse_args() {
             --container)    CONTAINER_NAME="${2:-}"; shift 2 ;;
             --image)        IMAGE_NAME="${2:-}"; shift 2 ;;
             --repo)         REPO_ROOT="${2:-}"; shift 2 ;;
+            --from-snapshot)
+                # Optional value: a snapshot tag; without one, the default
+                # tag for SMOKE_SNAPSHOT_AFTER.
+                if [[ -n "${2:-}" && "${2:-}" != -* ]]; then
+                    FROM_SNAPSHOT="$2"; shift 2
+                else
+                    FROM_SNAPSHOT="$(snapshot_default_tag "$SNAPSHOT_AFTER")"; shift
+                fi ;;
             --keep)         KEEP=1; shift ;;
             -h|--help)      usage 0 ;;
             *)              usage 2 ;;
@@ -714,6 +883,8 @@ run_phase() {
         completion)      phase_completion ;;
         name-recreation) phase_name_recreation ;;
         flake-watch)     phase_flake_watch ;;
+        snapshot)        phase_snapshot ;;
+        resume-install)  phase_resume_install ;;
         teardown)        phase_teardown ;;
         *)               die "unknown phase: $name" ;;
     esac
@@ -727,7 +898,18 @@ main() {
         # The wizard TUI launches the install; the scenarios run while the
         # unit is active (viewer attach, kill/reattach, the forced failure +
         # verified retry); the blocking watch then runs to completion.
-        local phases=(build-image setup manager tui-launch tui-attach kill-reattach failure-retry watch completion name-recreation flake-watch)
+        local phases
+        if [[ -n "$FROM_SNAPSHOT" ]]; then
+            # Snapshot flow (#116): no image build (the snapshot exists) and
+            # no tui-launch (its gate must be clean; a snapshot deliberately
+            # carries an install-in-progress state) — resume-install starts
+            # the install from the embedded checkpoint instead, immediately
+            # followed by the verified-retry scenario so it lands inside the
+            # short db-import window. Everything else runs unchanged.
+            phases=(setup manager resume-install failure-retry tui-attach kill-reattach watch completion name-recreation flake-watch)
+        else
+            phases=(build-image setup manager tui-launch tui-attach kill-reattach failure-retry watch completion name-recreation flake-watch)
+        fi
         if (( KEEP )); then
             log "--keep set: skipping teardown"
         else
