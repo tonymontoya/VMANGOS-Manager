@@ -880,26 +880,19 @@ def make_fake_journalctl(tmp_path, lines, delay=0.05, args_log=None):
     return bin_dir
 
 
-def make_fake_systemctl(tmp_path, state):
-    """An executable 'systemctl' that reports a constant ActiveState.
-
-    Returns the bin dir to prepend to PATH so the viewer's unit-state polls
-    resolve to this stub. For a unit that changes state over time (active,
-    then dies) use :func:`make_fake_systemctl_transition` — a call-counted
-    sequence loses its first state whenever a poll times out under load (the
-    stub advances even though the caller never reads the result), which used
-    to make the unit-state tests flake.
-    """
-    return _write_systemctl_stub(tmp_path, f'print("ActiveState={state}")\n')
-
-
 def make_fake_systemctl_transition(tmp_path, first_state, then_state, first_seconds):
     """An executable 'systemctl' whose ActiveState depends on wall-clock time.
 
     Reports ``first_state`` until ``first_seconds`` have elapsed since the
     first poll, then ``then_state`` forever — time-based, so a poll that times
-    out under load consumes nothing: the transition lands when a caller
+    out under load consumes no *state*: the transition lands when a caller
     actually observes it, not when the Nth call happens.
+
+    ``first_seconds`` must exceed the caller's per-query timeout (the viewer's
+    checker uses ``timeout=5``) by a comfortable margin: a timed-out poll
+    still burns wall-clock, so a window no longer than the timeout could
+    expire entirely inside one stalled first poll, before any successful read
+    ever observes ``first_state``.
     """
     stamp = os.path.join(str(tmp_path), "systemctl_stamp.txt")
     body = (
@@ -1181,11 +1174,13 @@ def test_viewer_detects_unit_failure_without_markers(tmp_path, monkeypatch):
     # The stub's active window is wall-clock based and the poll interval is
     # shrunk through the module seam: under load, a poll that times out must
     # not consume the "active" observation (the old counter-based stub did,
-    # which is what made this test flake — #113).
+    # which is what made this test flake — #113). The window (15s) must also
+    # exceed the checker's 5s query timeout, or one stalled first poll could
+    # expire it before "active" is ever read.
     monkeypatch.setattr(w, "UNIT_STATE_POLL_SECONDS", 0.1)
     lines = ["plain log: doing work"]  # no markers at all
     make_fake_journalctl(tmp_path, lines, delay=0.05)
-    make_fake_systemctl_transition(tmp_path, "active", "failed", first_seconds=5.0)
+    make_fake_systemctl_transition(tmp_path, "active", "failed", first_seconds=15.0)
     fake_runner, calls = make_fake_runner(rc=0)
     app, _ = build_wizard(tmp_path, attach=True, runner=fake_runner)
 
@@ -1220,7 +1215,9 @@ def test_viewer_detects_unit_ended_without_completion(tmp_path, monkeypatch):
     monkeypatch.setattr(w, "UNIT_STATE_POLL_SECONDS", 0.1)
     lines = ["plain log: doing work", "plain log: done"]  # no completion marker
     make_fake_journalctl(tmp_path, lines, delay=0.05)
-    make_fake_systemctl_transition(tmp_path, "active", "inactive", first_seconds=5.0)
+    # first_seconds=15.0: must exceed the checker's 5s query timeout (see
+    # make_fake_systemctl_transition).
+    make_fake_systemctl_transition(tmp_path, "active", "inactive", first_seconds=15.0)
     fake_runner, calls = make_fake_runner(rc=0)
     app, _ = build_wizard(tmp_path, attach=True, runner=fake_runner)
 
