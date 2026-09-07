@@ -55,6 +55,7 @@ sudo make uninstall PREFIX=/opt/mangos/manager
 
 | Command | Purpose |
 |---|---|
+| `install` | Run the one-time install wizard; re-attach to a running install |
 | `server` | Start, stop, restart, status of auth/world services |
 | `dashboard` | Launch the Textual TUI |
 | `logs` | Rotation status, recent events, test config |
@@ -63,6 +64,24 @@ sudo make uninstall PREFIX=/opt/mangos/manager
 | `schedule` | Honor/restart schedules, list, simulate, cancel |
 | `config` | Create, detect, validate, show configuration |
 | `update` | Check, inspect, plan, apply core updates |
+
+---
+
+## 🧙 Install
+
+```bash
+sudo vmangos-manager install
+sudo vmangos-manager install --bootstrap
+```
+
+- Root-only (writes `/root/.vmangos-secrets/setup.conf` and starts a systemd unit); non-root runs print the sudo fix and exit.
+- `--bootstrap` creates the Python venv and installs Textual (one-time).
+- First run: gate → form → review → launch. The install runs as a transient systemd unit (`vmangos-install`), so closing the TUI never stops it.
+- Re-run while the unit is active: attaches the live viewer with the phase checklist. Detach with `q`.
+- A failed phase offers **Retry**, which resumes from the last completed checkpoint (finished phases are skipped).
+- Secrets file location is overridable with `VMANGOS_WIZARD_SECRETS_FILE`.
+
+See the [User Guide](user-guide.md) for the walkthrough and [Troubleshooting](troubleshooting.md) for failure-screen meanings.
 
 ---
 

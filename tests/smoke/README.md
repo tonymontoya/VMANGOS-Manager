@@ -10,7 +10,8 @@ and a real verified retry. It exercises the #104 acceptance scenarios plus
 two folded-in additions:
 
 * the **transient-unit name-recreation edge** after a completed run, and
-* **watching for the known viewer flake** (issue #113) under long runs.
+* **re-running the viewer suite for stability** under long runs (the #113
+  race is fixed; any failure fails the smoke).
 
 Everything runs inside a throwaway privileged systemd Docker container. It
 **never** touches bds (the live realm). The client-data cache is kept on the
@@ -93,7 +94,7 @@ secrets or calls the runner directly on the launch path.
 | `watch` | Markers stream until the terminal `phase=install event=done` marker. |
 | `completion` | Terminal marker present; `auth` + `world` services active; the `realmlist` row is **queried from the database inside the container** and its address/port must match the marker's `server_ip`/`world_port` (the marker alone is the installer grading its own homework). |
 | `name-recreation` | After a completed run, the runner re-creates the unit name (`installer_unit_start`) and the unit runs our installer; it is stopped again via `installer_unit_stop` (a real re-install goes through the wizard's gate — this exercises the `--collect` name edge). |
-| `flake-watch` | The viewer async suite is re-run N times (`SMOKE_FLAKE_RUNS`, default 5). A reproduction of the known unit-state detection race (#113 — both `test_viewer_detects_unit_failure_without_markers` and its sibling `..._unit_ended_without_completion`) is captured — log + traceback — and **tolerated**; any other failure is unknown and fails the smoke. |
+| `flake-watch` | The viewer async suite is re-run N times (`SMOKE_FLAKE_RUNS`, default 5) as a stability gate. Any failure fails the smoke and its output is captured — the #113 unit-state race is fixed (`first_seconds` 15s window exceeds the checker's 5s query timeout), so no failure is tolerated. |
 
 ## Runtime expectations
 
@@ -206,15 +207,26 @@ without re-downloading.
   a failure via the `event=error` marker (which works), not via
   `ActiveState=failed` (which is unobservable under `--collect`). An *unmarked*
   `set -e` death would fall through to the EndedScreen rather than the
-  FailureScreen — this is the gap tracked by #111 (error-marker gaps), which
-  closes it.
-* **Known viewer-test race (watched, not failed on):** the viewer's
-  unit-state checker thread (2 s poll) races the 0.5 s UI tick inside two
-  tests (`test_viewer_detects_unit_failure_without_markers` and
-  `test_viewer_detects_unit_ended_without_completion`). Observed
-  intermittently in review and locally during this rework; tracked by #113.
-  The smoke watches for it and captures the traceback instead of failing —
-  unknown test failures still fail the smoke.
+  FailureScreen — the gap tracked by #111 is now **closed** (PR #114 guards
+  the remaining `set -e` death paths with fail markers), and the viewer's
+  unit-state checker catches marker-less deaths regardless.
+* **Database failures are no longer silent (hardened, PR #114):** the
+  database phase's `CREATE DATABASE` / `CREATE USER` / `GRANT` statements are
+  best-effort by design, but a swallowed failure now emits a **warn marker**
+  (`phase=database event=warn`) instead of passing unnoticed —
+  `phase=database event=done` never asserts an unverified step, and the
+  import phase fails loudly if a database or grant that mattered is still
+  missing. `FLUSH PRIVILEGES` failing is a hard phase failure with its own
+  error marker.
+* **Viewer-test race (fixed by #115):** the viewer's unit-state checker
+  thread raced the UI tick inside two tests
+  (`test_viewer_detects_unit_failure_without_markers` and its sibling
+  `..._unit_ended_without_completion`) — tracked as #113. The stub's active
+  window (15s) now exceeds the checker's 5s query timeout, a timed-out poll
+  no longer consumes the "active" observation, and the wait predicates gate
+  on the rendered screen text (the blank window between `push_screen` and
+  `compose` was the flake). Verified with 6/6 consecutive pair runs plus the
+  full suite; the smoke's flake-watch no longer tolerates it.
 * **PATH-installed manager needs the setup script beside the install root
   (arranged, this branch):** the wizard resolves `vmangos_setup.sh` one
   directory above the manager prefix (the layout of a repo checkout), so a

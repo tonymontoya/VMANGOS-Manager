@@ -1,6 +1,6 @@
 # Install Automation
 
-This guide covers the two installer entry points and how to adopt Manager onto an existing VMANGOS host. If you are new to Manager, start with the [User Guide](user-guide.md) for the full product walkthrough.
+This guide covers the raw installer scripts — the **advanced/headless path** — and how to adopt Manager onto an existing VMANGOS host. The primary install story is the wizard: `sudo vmangos-manager install` (see the [User Guide](user-guide.md)). Reach for these scripts when you cannot open a TUI or are driving provisioning from automation.
 
 ---
 
