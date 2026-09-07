@@ -47,7 +47,7 @@ sudo vmangos-manager install   # re-attaches the live viewer
 The wizard resolves the setup script one directory above the manager's own location (the layout of a repo checkout). Running `./manager/bin/vmangos-manager install` from a checkout always works; a manager installed to a custom prefix needs `vmangos_setup.sh` beside that prefix's parent — link it there:
 
 ```bash
-sudo ln -sfn /path/to/VMaNGOS-Manager/vmangos_setup.sh /opt/vmangos_setup.sh
+sudo ln -sfn /path/to/VMaNGOS-Manager/vmangos_setup.sh /opt/mangos/vmangos_setup.sh
 ```
 
 ---

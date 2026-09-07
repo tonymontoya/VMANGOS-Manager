@@ -646,7 +646,7 @@ ensure_venv_pytest() {
 phase_flake_watch() {
     ensure_venv_pytest
     local n="${SMOKE_FLAKE_RUNS:-5}" i pass_count=0 rc
-    log "running the viewer async suite $n times (stability watch)..."
+    log "flake-watch: running the viewer async suite $n times (any failure fails the smoke)..."
     for (( i=1; i<=n; i++ )); do
         # The run's exit status is pytest's own (output goes to a file — a
         # pipeline's tail can never mask it again).
@@ -663,9 +663,9 @@ phase_flake_watch() {
         fi
         log "test failure in run $i — full output:"
         docker_exec "cat /root/flake-run-$i.log" >&2 || true
-        fail "stability watch: test failure in run $i (no known flakes are tolerated since #113 was fixed)"
+        fail "flake-watch: test failure in run $i (no known flakes are tolerated since #113 was fixed)"
     done
-    log "stability watch: $pass_count/$n runs green, 0 failures"
+    log "flake-watch: $pass_count/$n runs green, 0 failures"
     pass "flake-watch: $n runs green (no failures tolerated)"
 }
 
