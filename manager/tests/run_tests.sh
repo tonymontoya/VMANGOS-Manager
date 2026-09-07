@@ -4713,6 +4713,47 @@ EOF
     return $all_passed
 }
 
+test_installer_unit_start_forwards_mmaps_skip() {
+    # shellcheck source=../lib/installer.sh
+    source "$LIB_DIR/installer.sh"
+
+    local all_passed=0
+    local temp_root secrets_file setup_script systemd_run_log log
+
+    temp_root=$(mktemp -d)
+    secrets_file="$temp_root/secrets.conf"
+    setup_script="$temp_root/setup/vmangos_setup.sh"
+    systemd_run_log="$temp_root/systemd-run.log"
+    mkdir -p "$temp_root/setup"
+    printf '#!/bin/bash\nexit 0\n' > "$setup_script"
+    printf 'INSTALLROOT=/opt/mangos\nCLIENTDATA=/home/tony/Data\n' > "$secrets_file"
+
+    check_root() { :; }
+    installer_unit_active() { return 1; }
+    installer_systemd_run() {
+        local arg
+        for arg in "$@"; do
+            printf '%s\n' "$arg" >> "$systemd_run_log"
+        done
+        return 0
+    }
+
+    VMANGOS_SKIP_MMAPS=1 installer_unit_start "$secrets_file" "$setup_script" >/dev/null \
+        || all_passed=1
+    log=$(cat "$systemd_run_log" 2>/dev/null)
+    assert_true "[[ \"\$log\" == *'VMANGOS_SKIP_MMAPS=1'* ]]" \
+        "mmaps skip forwards from the invoking environment into the unit" || all_passed=1
+
+    : > "$systemd_run_log"
+    installer_unit_start "$secrets_file" "$setup_script" >/dev/null || all_passed=1
+    log=$(cat "$systemd_run_log" 2>/dev/null)
+    assert_true "[[ \"\$log\" != *'VMANGOS_SKIP_MMAPS'* ]]" \
+        "no mmaps skip variable reaches the unit when the environment does not set it" || all_passed=1
+
+    rm -rf "$temp_root"
+    return $all_passed
+}
+
 test_installer_unit_start_rejects_double_start() {
     # shellcheck source=../lib/installer.sh
     source "$LIB_DIR/installer.sh"
@@ -5268,6 +5309,7 @@ main() {
     run_test "Backup: Metadata carries real commit" test_backup_metadata_carries_real_commit
     run_test "Installer: Unit name and state queries" test_installer_unit_name_and_state_queries
     run_test "Installer: Start builds systemd-run env" test_installer_unit_start_builds_systemd_run_env
+    run_test "Installer: Start forwards mmaps skip" test_installer_unit_start_forwards_mmaps_skip
     run_test "Installer: Start rejects double start" test_installer_unit_start_rejects_double_start
     run_test "Installer: Start surfaces systemd-run failure" test_installer_unit_start_surfaces_systemd_run_failure
     run_test "Installer: Stop issues stop and reset-failed" test_installer_unit_stop_issues_stop_and_reset_failed

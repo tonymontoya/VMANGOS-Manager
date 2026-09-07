@@ -1673,7 +1673,15 @@ phase_data_extraction() {
     
     local MMAPS_FAILED=0
 
-    if [ $EXTRACTION_FAILED -eq 0 ] && [ $VMAPS_FAILED -eq 0 ] && [ -f ./MoveMapGen ]; then
+    # VMANGOS_SKIP_MMAPS=1 skips the hours-long mmaps generation entirely
+    # (a test seam for the install smoke; a normal install leaves it unset):
+    # the server runs without mmaps, so the phase still completes and the
+    # summary reports the gap like any other soft-failed mmaps step.
+    if [ "${VMANGOS_SKIP_MMAPS:-0}" = "1" ]; then
+        log_info "Skipping movement map generation (VMANGOS_SKIP_MMAPS=1)"
+        warn_marker extraction "mmaps skipped by request (VMANGOS_SKIP_MMAPS=1) - the server will run without NPC pathfinding"
+        MMAPS_FAILED=1
+    elif [ $EXTRACTION_FAILED -eq 0 ] && [ $VMAPS_FAILED -eq 0 ] && [ -f ./MoveMapGen ]; then
         # Run with a background progress heartbeat
         {
             while true; do

@@ -45,15 +45,16 @@
 #                   freezes phase-start baselines for completion to check
 #   teardown        remove the container (keep the client-data cache)
 #
-# Iterating: a full clean install can exceed 4h. Instead of paying that on
-# every re-smoke, `--phase snapshot` commits the container at a checkpoint
-# (default DATA_DONE: everything through extraction) and `--from-snapshot
-# TAG` re-runs the late phases (~10 min) from that image; see the README.
+# Iterating: a clean run with the default mmaps skip is ~30 min (MoveMapGen,
+# the ~2.5h single-threaded mmaps step, only runs with --full-extraction —
+# for changes to the extraction code). For late-phase work, `--phase
+# snapshot` + `--from-snapshot TAG` re-run only the late phases (~10 min)
+# from a committed image; see the README.
 #
 # Usage:
 #   tests/smoke/wizard_smoke.sh [--phase NAME] [--keep] [--client-data PATH]
 #                               [--container NAME] [--image NAME] [--repo PATH]
-#                               [--from-snapshot [TAG]]
+#                               [--from-snapshot [TAG]] [--full-extraction]
 #
 # Exit status: 0 when the requested phase(s) pass, non-zero otherwise.
 #
@@ -104,6 +105,14 @@ SNAPSHOT_TAG="${SMOKE_SNAPSHOT_TAG:-}"
 # Start the container from a snapshot image instead of the base image
 # (--from-snapshot [TAG], or SMOKE_FROM_SNAPSHOT).
 FROM_SNAPSHOT="${SMOKE_FROM_SNAPSHOT:-}"
+# MoveMapGen (~2.5h single-threaded) is skipped by default via the
+# VMANGOS_SKIP_MMAPS seam: the server runs without mmaps, and the full
+# extraction path is already verified by real full runs. --full-extraction
+# (or SMOKE_FULL_EXTRACTION=1) restores the complete run for changes to
+# the extraction/mmaps code. SKIP_MMAPS_VALUE (0/1) is recomputed in main
+# after flag parsing.
+FULL_EXTRACTION="${SMOKE_FULL_EXTRACTION:-0}"
+SKIP_MMAPS_VALUE=1
 
 # ---------------------------------------------------------------------------
 # Logging + helpers
@@ -234,9 +243,11 @@ tux() {
 
 # Start `vmangos-manager install` in a detached tmux session (a real pty).
 # The app's exit code lands in the given file when the session ends.
+# VMANGOS_SKIP_MMAPS rides the TUI's inherited environment through the
+# runner into the unit (see FULL_EXTRACTION above).
 tui_start() { # tui_start <session> <exit-file>
     tux new-session -d -x 140 -y 60 -s "$1" \
-        "env TERM=xterm-256color HOME=/root PATH=$MANAGER_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin vmangos-manager install; printf '%s' \"\$?\" > '$2'"
+        "env TERM=xterm-256color HOME=/root VMANGOS_SKIP_MMAPS=$SKIP_MMAPS_VALUE PATH=$MANAGER_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin vmangos-manager install; printf '%s' \"\$?\" > '$2'"
 }
 
 # Wait until the session's current screen contains the fixed string.
@@ -436,6 +447,9 @@ phase_tui_launch() {
         sleep 3
     done
     log "unit ActiveState after TUI launch: $(unit_state)"
+    # Record where this run's install started: completion asserts the mmaps
+    # skip seam only when the run actually executed the extraction phase.
+    printf 'START\n' > "$EVIDENCE_DIR/install-start-checkpoint"
     pass "tui-launch: gate -> form -> review -> launch driven in a pty; TUI wrote the secrets and started the unit"
 }
 
@@ -540,6 +554,7 @@ phase_failure_retry() {
     log "driving the retry (installer_unit_stop + installer_unit_start)..."
     docker_exec "
         set -u
+        export VMANGOS_SKIP_MMAPS=$SKIP_MMAPS_VALUE
         source $MANAGER_PREFIX/lib/installer.sh
         installer_unit_stop
         installer_unit_start '$SECRETS_FILE' '$SETUP_SCRIPT'
@@ -641,6 +656,30 @@ phase_completion() {
     [[ "$realm_port" == "$world_port" ]] \
         || fail "realmlist port ($realm_port) does not match the marker's world_port ($world_port)"
     log "realmlist row verified: address=$realm_addr port=$realm_port matches the marker"
+
+    # The mmaps skip seam must have behaved as configured — but only when
+    # this run executed the extraction phase (a snapshot resumed past
+    # DATA_DONE never re-runs it, and its journal may predate the seam).
+    local start_cp="START" start_rank skip_markers
+    if [[ -f "$EVIDENCE_DIR/install-start-checkpoint" ]]; then
+        start_cp="$(tr -d '[:space:]' < "$EVIDENCE_DIR/install-start-checkpoint")"
+    fi
+    start_rank="$(checkpoint_rank "$start_cp")"
+    if (( start_rank >= 0 && start_rank < 6 )); then
+        skip_markers="$(journal_count 'mmaps skipped by request')"
+        if (( SKIP_MMAPS_VALUE )); then
+            [[ "$skip_markers" -ge 1 ]] \
+                || fail "completion: no mmaps skip marker — VMANGOS_SKIP_MMAPS never reached the install (the runner seam is broken; a silent full extraction costs ~4h)"
+            log "mmaps skipped by request, as configured ($skip_markers marker(s))"
+        else
+            [[ "$skip_markers" -eq 0 ]] \
+                || fail "completion: mmaps were skipped despite --full-extraction"
+            log "full extraction ran, as configured"
+        fi
+    else
+        log "mmaps skip marker not asserted: the run started at ${start_cp} (extraction not executed this run)"
+    fi
+
     snapshot_assert_frozen_starts
     pass "completion: terminal marker + auth+world active + realmlist row verified"
 }
@@ -657,6 +696,7 @@ phase_name_recreation() {
     log "re-creating the unit name via the runner (installer_unit_start)"
     docker_exec "
         set -u
+        export VMANGOS_SKIP_MMAPS=$SKIP_MMAPS_VALUE
         source $MANAGER_PREFIX/lib/installer.sh
         installer_unit_start '$SECRETS_FILE' '$SETUP_SCRIPT'
     " || fail "runner refused to re-create the unit name after a completed run"
@@ -839,11 +879,13 @@ phase_resume_install() {
         || fail "resume-install: no secrets file at $SECRETS_FILE in the container"
     log "embedded checkpoint: $cp"
     snapshot_freeze_starts
+    printf '%s\n' "$cp" > "$EVIDENCE_DIR/install-start-checkpoint"
     local resumed_before
     resumed_before="$(journal_count "Resuming from checkpoint: $cp")"
     log "starting the install via the runner (installer_unit_start)..."
     docker_exec "
         set -u
+        export VMANGOS_SKIP_MMAPS=$SKIP_MMAPS_VALUE
         source $MANAGER_PREFIX/lib/installer.sh
         installer_unit_start '$SECRETS_FILE' '$SETUP_SCRIPT'
     " || fail "resume-install: the runner refused to start the unit"
@@ -868,7 +910,7 @@ phase_teardown() {
 # ---------------------------------------------------------------------------
 
 usage() {
-    sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,59p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -889,6 +931,7 @@ parse_args() {
                     FROM_SNAPSHOT="$(snapshot_default_tag "$SNAPSHOT_AFTER")"; shift
                 fi ;;
             --keep)         KEEP=1; shift ;;
+            --full-extraction) FULL_EXTRACTION=1; shift ;;
             -h|--help)      usage 0 ;;
             *)              usage 2 ;;
         esac
@@ -920,6 +963,12 @@ run_phase() {
 main() {
     parse_args "$@"
     require_docker
+    if [[ "$FULL_EXTRACTION" == "1" ]]; then
+        SKIP_MMAPS_VALUE=0
+        log "full extraction requested: MoveMapGen WILL run (~2.5h)"
+    else
+        SKIP_MMAPS_VALUE=1
+    fi
 
     if [[ "$PHASE" == "all" ]]; then
         # The wizard TUI launches the install; the scenarios run while the

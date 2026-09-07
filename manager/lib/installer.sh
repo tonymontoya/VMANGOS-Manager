@@ -175,6 +175,13 @@ installer_unit_start() {
         setenv_args+=("--setenv" "$pair")
     done <<< "$env_lines"
 
+    # Forward an explicit mmaps skip from the invoking environment (the
+    # install-wizard smoke sets it so runs skip the ~hours-long MoveMapGen;
+    # a normal install leaves it unset and gets the full extraction).
+    if [[ -n "${VMANGOS_SKIP_MMAPS:-}" ]]; then
+        setenv_args+=("--setenv" "VMANGOS_SKIP_MMAPS=$VMANGOS_SKIP_MMAPS")
+    fi
+
     if ! installer_systemd_run \
         "--unit=$INSTALLER_UNIT_NAME" \
         --description="VMaNGOS install" \
