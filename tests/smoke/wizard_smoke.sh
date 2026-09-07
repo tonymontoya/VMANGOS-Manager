@@ -11,7 +11,8 @@
 # extraction, real systemd services, real markers, real retry. It exercises
 # the claims from #104 plus two folded-in additions:
 #   * the transient-unit name-recreation edge after a completed run, and
-#   * watching for the known viewer flake under long runs (issue #113).
+#   * re-running the viewer suite for stability under long runs (the #113
+#     race is fixed; any failure fails the smoke).
 #
 # The smoke runs entirely inside a throwaway container; it NEVER touches bds.
 # The client-data cache is kept on the host and re-mounted on every run.
@@ -34,8 +35,8 @@
 #                   row verified against the database (not just the marker)
 #   name-recreation re-create the unit name through the runner after a
 #                   completed run, then stop it again
-#   flake-watch     re-run the viewer async suite; capture the known flake
-#                   (#113) without failing on it; unknown failures fail
+#   flake-watch     re-run the viewer async suite N times; any failure
+#                   fails the smoke (the #113 race is fixed)
 #   teardown        remove the container (keep the client-data cache)
 #
 # Iterating: a full clean install can exceed 4h. To re-run later phases
@@ -86,13 +87,6 @@ TIMEOUT_TUI="${SMOKE_TUI_TIMEOUT:-180}"
 # runs real apt, ~5 min) and for the resumed run to advance past it.
 TIMEOUT_PREREQS="${SMOKE_PREREQS_TIMEOUT:-1500}"
 TIMEOUT_ADVANCE="${SMOKE_ADVANCE_TIMEOUT:-900}"
-
-# The known viewer-test flake, watched (not failed on) by flake-watch. Issue
-# #113 tracks the unit-state detection race; it names
-# test_viewer_detects_unit_failure_without_markers and asks to verify the
-# sibling ..._unit_ended_without_completion for the same race (it flaked
-# locally during the #104 rework).
-KNOWN_FLAKE_TESTS="tests/test_wizard.py::test_viewer_detects_unit_failure_without_markers tests/test_wizard.py::test_viewer_detects_unit_ended_without_completion"
 
 # ---------------------------------------------------------------------------
 # Logging + helpers
@@ -645,13 +639,14 @@ ensure_venv_pytest() {
         || fail "could not install pytest into the dashboard venv"
 }
 
-# Re-run the viewer's async suite and WATCH for the known flake (#113):
-# a reproduction is captured (log + traceback) and reported, not failed on.
-# Any other failure is unknown and fails the smoke.
+# Re-run the viewer's async suite N times as a stability gate. The #113
+# unit-state race is fixed (window exceeds the checker's query timeout; the
+# wait predicates gate on the screen text), so any failure is unknown and
+# fails the smoke — its output is captured for the report.
 phase_flake_watch() {
     ensure_venv_pytest
-    local n="${SMOKE_FLAKE_RUNS:-5}" i pass_count=0 flake_count=0 rc
-    log "running the viewer async suite $n times (flake watch, issue #113)..."
+    local n="${SMOKE_FLAKE_RUNS:-5}" i pass_count=0 rc
+    log "running the viewer async suite $n times (stability watch)..."
     for (( i=1; i<=n; i++ )); do
         # The run's exit status is pytest's own (output goes to a file — a
         # pipeline's tail can never mask it again).
@@ -666,27 +661,12 @@ phase_flake_watch() {
             pass_count=$((pass_count+1))
             continue
         fi
-        local fails known=0 t
-        fails="$(docker_exec "grep -c '^FAILED ' /root/flake-run-$i.log || true")"
-        for t in $KNOWN_FLAKE_TESTS; do
-            known=$(( known + $(docker_exec "grep -c '^FAILED $t' /root/flake-run-$i.log || true") ))
-        done
-        if (( known > 0 && fails == known )); then
-            flake_count=$((flake_count+1))
-            log "known flake reproduced in run $i (issue #113) — failure detail:"
-            docker_exec "grep -B 2 -A 25 '^___ test_viewer_detects' /root/flake-run-$i.log || tail -20 /root/flake-run-$i.log" >&2 || true
-            docker_exec "grep '^FAILED ' /root/flake-run-$i.log; tail -2 /root/flake-run-$i.log" >&2 || true
-        else
-            log "UNKNOWN test failure in run $i ($fails failed, $known known-flake) — full output:"
-            docker_exec "cat /root/flake-run-$i.log" >&2 || true
-            fail "flake-watch: unknown test failure (not the known #113 flake)"
-        fi
+        log "test failure in run $i — full output:"
+        docker_exec "cat /root/flake-run-$i.log" >&2 || true
+        fail "stability watch: test failure in run $i (no known flakes are tolerated since #113 was fixed)"
     done
-    log "flake-watch: $pass_count/$n green, $flake_count reproduced the known flake (#113), 0 unknown failures"
-    if (( flake_count == 0 )); then
-        log "flake-watch: the known flake did not reproduce in $n runs (watched per issue #113)"
-    fi
-    pass "flake-watch: $n runs watched; only the known #113 flake is tolerated"
+    log "stability watch: $pass_count/$n runs green, 0 failures"
+    pass "flake-watch: $n runs green (no failures tolerated)"
 }
 
 phase_teardown() {

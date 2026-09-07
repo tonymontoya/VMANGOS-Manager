@@ -18,11 +18,32 @@ VMANGOS Manager is an **operator layer** that sits on top of your existing (or n
 
 ## 🚀 Installation Paths
 
-### Path A — Fresh Ubuntu 22.04 Host
+### Path A — Fresh Ubuntu 22.04 Host: the Install Wizard (recommended)
 
-If you are starting from scratch, the installer handles dependencies, source compilation, database creation, config generation, client data staging, and Manager provisioning.
+If you are starting from scratch, the wizard handles dependencies, source compilation, database creation, config generation, client data staging, and Manager provisioning — with you answering a few forms instead of editing variables.
 
-**Zero-touch (recommended):**
+```bash
+git clone https://github.com/tonymontoya/VMaNGOS-Manager.git
+cd VMaNGOS-Manager
+sudo ./manager/bin/vmangos-manager install --bootstrap   # one-time (Textual deps)
+sudo ./manager/bin/vmangos-manager install               # the wizard
+```
+
+**What the form asks:** install root, client data path (your WoW 1.12.1 build-5875 `Data` folder), the four database names, the DB user and password, the OS user the realm will run as, and the provision target (realm only, or realm + manager). Defaults are pre-filled; a password you leave at its generated value is crypto-random and only uses characters the server config files can carry.
+
+A **review screen** shows every choice before anything touches the disk. Confirm, and the install launches.
+
+**Closing the TUI never stops the install.** The install runs as its own transient systemd unit, not as a child of your terminal — close the window, drop the SSH session, nothing happens to it. To watch it again, just re-run `sudo vmangos-manager install`; the live viewer re-attaches and shows the phase checklist (prerequisites, database, source, build, extraction, import, services). Detach with `q` at any time.
+
+**If a phase fails**, the Failure screen names the phase, the error, and the fix hint. **Retry** restarts from the last completed phase checkpoint — completed phases never re-run (a crashed build resumes, an imported database is not re-imported).
+
+**After it completes** the realm services (`auth`, `world`) are running and everything afterwards — the dashboard, account admin, backups, logs — works unprivileged after a one-time `config grant` (see [Running as a Non-Root User](#-running-as-a-non-root-user)). Root is only needed again for service control and timers.
+
+Secrets are stored in `/root/.vmangos-secrets/setup.conf` (mode `600`); the install log lives at `/var/log/vmangos-install.log`, and the live journal is `journalctl -u vmangos-install`.
+
+### Headless Installs (advanced)
+
+The raw scripts remain for automation, cloud-init, or hosts where a TUI is impractical. They are not the primary path — prefer the wizard whenever you can open a terminal:
 
 ```bash
 wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/auto_install.sh
@@ -35,15 +56,12 @@ sudo bash auto_install.sh
 - Stores secrets in `/root/.vmangos-secrets/setup.conf`
 - Logs everything to `/var/log/vmangos-install.log`
 
-**Guided:**
+Or drive `vmangos_setup.sh` directly (prompts, or environment variables for full non-interactive runs):
 
 ```bash
 wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/vmangos_setup.sh
 sudo bash vmangos_setup.sh
 ```
-
-- Prompts for install root, DB names, credentials, OS user, and client data path
-- Same provisioning power, more control
 
 For installer internals (checkpoints, environment variables, background builds), see the [Install Automation Reference](install-automation.md).
 
@@ -243,6 +261,7 @@ sudo /opt/mangos/manager/bin/vmangos-manager logs recent --limit 10
 
 | Task | Command |
 |---|---|
+| Install or re-attach to an install | `sudo vmangos-manager install` |
 | Open the dashboard | `vmangos-manager` (no arguments needed) |
 | Watch live status | `vmangos-manager server status --watch` |
 | Create account | `VMANGOS_PASSWORD='pass' vmangos-manager account create USER --password-env` |

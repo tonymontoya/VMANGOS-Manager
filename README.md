@@ -2,7 +2,7 @@
 
 ![CI](https://github.com/tonymontoya/VMaNGOS-Manager/actions/workflows/ci.yml/badge.svg)
 ![Ubuntu 22.04](https://img.shields.io/badge/ubuntu-22.04-E95420)
-![Release](https://img.shields.io/badge/release-v0.3.1-0f766e)
+![Release](https://img.shields.io/badge/release-v0.5.0-0f766e)
 ![Interface](https://img.shields.io/badge/interface-Textual%20TUI-0f172a)
 
 An SSH terminal-native administration suite for VMANGOS private servers optimized for performance and security. 
@@ -27,8 +27,8 @@ An SSH terminal-native administration suite for VMANGOS private servers optimize
 
 | Doc | What You'll Find |
 |---|---|
-| [🚀 User Guide](docs/user-guide.md) | End-to-end walkthrough of install, dashboard views, and daily rhythm |
-| [🔧 Install Automation](docs/install-automation.md) | Deep dive into `auto_install.sh` and `vmangos_setup.sh` |
+| [🚀 User Guide](docs/user-guide.md) | End-to-end walkthrough of the install wizard, dashboard views, and daily rhythm |
+| [🔧 Install Automation](docs/install-automation.md) | Deep dive into `auto_install.sh` and `vmangos_setup.sh` (advanced/headless path) |
 | [📋 CLI Reference](docs/cli-reference.md) | Complete command reference |
 | [🛡️ Security Notes](docs/security.md) | Password handling, DB model, and update safety |
 | [🔍 Troubleshooting](docs/troubleshooting.md) | Common problems and diagnostic commands |
@@ -39,8 +39,9 @@ An SSH terminal-native administration suite for VMANGOS private servers optimize
 
 | Component | What It Does | Status |
 |---|---|---|
+| 🧙 **Install Wizard** | `vmangos-manager install` — forms, review, detachable systemd-run install, live viewer, checkpoint retry |
 | 🖥️ **Dashboard** | 7-view Textual TUI for live server ops |
-| 🚀 **Auto-Installer** | `auto_install.sh` + `vmangos_setup.sh` for Ubuntu 22.04 |
+| 🛠️ **Install Scripts** | `auto_install.sh` + `vmangos_setup.sh` (advanced/headless path) |
 | 🎮 **Server Control** | Start, stop, restart, and health-check `auth` + `world` |
 | 👤 **Account Admin** | Create, ban/unban, set GM level, password reset |
 | 💾 **Backups** | SQL dumps, verify integrity, dry-run restore, timer scheduling |
@@ -58,10 +59,22 @@ An SSH terminal-native administration suite for VMANGOS private servers optimize
 - Root access (`sudo`)
 - WoW 1.12.1 client data (for extraction)
 
-### Option A — Fresh Host
+### Option A — Fresh Host: the Install Wizard (recommended)
 
 ```bash
-# Download the installer scripts
+git clone https://github.com/tonymontoya/VMaNGOS-Manager.git
+cd VMaNGOS-Manager
+sudo ./manager/bin/vmangos-manager install --bootstrap  # one-time (Textual deps)
+sudo ./manager/bin/vmangos-manager install              # the wizard
+```
+
+The wizard walks you through the forms (install root, client data path, database names and credentials), shows a review, and launches the install as its own systemd unit: **closing the TUI never stops it** — re-run `install` to re-attach, and a failed phase offers Retry from the last checkpoint. See the [User Guide](docs/user-guide.md) for the full walkthrough.
+
+### Headless Installs (advanced)
+
+For automation or hosts where a TUI is impractical, the raw scripts remain in-tree:
+
+```bash
 wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/auto_install.sh
 wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/vmangos_setup.sh
 
@@ -69,21 +82,7 @@ wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/vmangos_
 sudo bash auto_install.sh
 ```
 
-Want to pick your own DB names and paths? Use the guided installer instead:
-
-```bash
-wget https://raw.githubusercontent.com/tonymontoya/VMaNGOS-Manager/main/vmangos_setup.sh
-sudo bash vmangos_setup.sh
-```
-
-**Recommended (v0.5.0):** once the manager is on the host, run the one-time
-install wizard instead of the raw guided script — it walks you through the
-forms, shows a review, and launches the install in a detachable systemd unit:
-
-```bash
-sudo /opt/mangos/manager/bin/vmangos-manager install --bootstrap  # one-time (Textual deps)
-sudo /opt/mangos/manager/bin/vmangos-manager install              # the wizard
-```
+To pick your own DB names and paths non-interactively, drive `vmangos_setup.sh` directly with environment variables — see the [Install Automation Reference](docs/install-automation.md).
 
 ### Option B — Existing VMANGOS Host
 
