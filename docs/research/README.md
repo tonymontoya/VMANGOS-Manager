@@ -46,6 +46,22 @@ Production-grade service management patterns with safety interlocks.
 
 ---
 
+### vmangos-platform-capabilities.md
+Live primary-source research on `vmangos/core@development` (verified 2026-09-05) — the platform knowledge base for server customization planning.
+
+**Contains:**
+- Verified config surface (progression, rates, bots, ops control-plane options)
+- Scripting mechanisms verdict: Eluna NOT in mainline; C++ ScriptDev2-style alive; **PlayerBots mainline** (PartyBot/BattleBot/AHBot/RandomBot)
+- DB script engine surface (94 commands, 29 target types, 45+ conditions, patch gating)
+- Vanilla 1.12.1 addon API constraints and server↔addon transport reality (no SendAddonMessage)
+- Turtle WoW precedent + client-modding risk; capability matrix feature→effort
+
+**Sources:** vmangos/core source + wiki, PR/issue history, ecosystem forks, Turtle WoW wiki
+
+**Status:** ✅ Complete - VERIFIED/INFERRED labeled inline
+
+---
+
 ### maintenance-scheduler-patterns.md
 Best practices for scheduled maintenance in MMORPG environments.
 
