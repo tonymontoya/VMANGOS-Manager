@@ -170,12 +170,26 @@ See the [User Guide](user-guide.md) for the walkthrough and [Troubleshooting](tr
 /opt/mangos/manager/bin/vmangos-manager backup now [--verify]
 /opt/mangos/manager/bin/vmangos-manager backup list [--format text|json]
 /opt/mangos/manager/bin/vmangos-manager backup verify <file> [--level 1|2]
-/opt/mangos/manager/bin/vmangos-manager backup restore <file> [--dry-run]
+/opt/mangos/manager/bin/vmangos-manager backup restore <file> [--dry-run | --preflight] [--yes] [--backup-first] [--format text|json]
 /opt/mangos/manager/bin/vmangos-manager backup clean [--keep-last N]
 /opt/mangos/manager/bin/vmangos-manager backup schedule status [--format text|json]
 /opt/mangos/manager/bin/vmangos-manager backup schedule --daily HH:MM
 /opt/mangos/manager/bin/vmangos-manager backup schedule --weekly "Sun 04:00"
 ```
+
+### Restore contract
+
+Restore is a guarded, deliberately high-friction workflow. Nothing destructive happens until every preflight check has passed **and** you have confirmed.
+
+- `--dry-run` prints the plan (target DBs, service stop/start sequence, readiness hints). It runs no checks with side effects and never mutates anything. `--format json` emits a machine-parseable plan envelope.
+- `--preflight` runs every readiness check — backup integrity (level 1), privileged credential presence, a live database auth probe with those credentials, and the safety-backup gate — and exits non-zero when not ready. Nothing is stopped or changed. With `--format json` the envelope reports `data.ready` plus per-check results.
+- Live restore **fails closed** before any service is stopped when:
+  - privileged credentials are missing (`MYSQL_RESTORE_DEFAULTS_FILE` mode `600`, or `MYSQL_RESTORE_PASSWORD`; optional `MYSQL_RESTORE_USER`, default `root`) — the limited manager DB user can never restore;
+  - the database rejects those credentials (auth probe);
+  - the current databases have no backup newer than 24 hours — rerun with `--backup-first` to snapshot current state before overwriting it.
+- `--yes` is the only non-interactive confirmation path; without it, a terminal prompt requires typing `RESTORE`. The old `FORCE_RESTORE` env bypass has been removed.
+- `--backup-first` takes a verified backup of the current databases after confirmation and before services stop — the undo/forensics path for a bad restore.
+- On success the command restarts the realm, validates that both services are active and the databases answer, and prints post-restore next steps. A failure after the import restarts services and exits with the `RESTORE_PARTIAL` error code.
 
 ---
 

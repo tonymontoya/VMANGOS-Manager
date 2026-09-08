@@ -471,6 +471,55 @@ def iso_to_clock(value: Any) -> str:
         return text
 
 
+def iso_age_seconds(value: Any) -> int | None:
+    """Age in seconds of an ISO timestamp; None when missing or unparsable."""
+    text = str(value or "")
+    if not text:
+        return None
+    try:
+        normalized = text.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - parsed).total_seconds()))
+    except ValueError:
+        return None
+
+
+# Mirrors RESTORE_SAFETY_BACKUP_MAX_AGE_SECONDS in lib/backup.sh: a live
+# restore refuses to overwrite the current databases unless the newest
+# backup is at most this old (or --backup-first is passed).
+RESTORE_SAFETY_WINDOW_SECONDS = 24 * 3600
+
+
+def summarize_restore_readiness(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Restore readiness from snapshot data only (no subprocess calls).
+
+    Credentials reflect the dashboard process environment: the CLI sees the
+    same env when launched from this session, and a plain shell may have more.
+    """
+    summary = snapshot.get("backups", {}).get("summary", {})
+    latest_age = iso_age_seconds(summary.get("latest_timestamp"))
+    within_window = latest_age is not None and latest_age <= RESTORE_SAFETY_WINDOW_SECONDS
+    return {
+        "credentials_ready": bool(snapshot.get("restore_credentials_ready")),
+        "latest_age_seconds": latest_age,
+        "within_safety_window": within_window,
+    }
+
+
+def format_age(seconds: int | None) -> str:
+    if seconds is None:
+        return "unknown"
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
 def schedule_job_type_label(job_type: Any) -> str:
     normalized = str(job_type or "").strip().lower()
     if normalized == "honor":
@@ -726,6 +775,7 @@ KEY_ACTION_DESCRIPTIONS: dict[str, tuple[str, str, str]] = {
     "m": ("create_restart_schedule", "Schedule Restart", "restart"),
     "P": ("refresh_update_plan", "Update Plan", "plan"),
     "d": ("restore_selected_backup_dry_run", "Dry Run", "restore dry-run"),
+    "p": ("restore_selected_backup_preflight", "Preflight", "restore preflight"),
     "y": ("schedule_daily_backup", "Daily", "daily timer"),
     "w": ("schedule_weekly_backup", "Weekly", "weekly timer"),
     "j": ("cancel_selected_schedule", "Remove Task", "remove task"),
@@ -739,7 +789,7 @@ VIEW_KEYS: dict[str, list[str]] = {
     "overview": ["o", "s", "x", "R", "b", "v", "k"],
     "monitor": ["o", "s", "x", "R", "b", "v"],
     "accounts": ["c", "p", "g", "n", "u", "/", "S"],
-    "backups": ["b", "v", "d", "y", "w", "/", "S"],
+    "backups": ["b", "v", "d", "p", "y", "w", "/", "S"],
     "operations": ["h", "m", "j", "P", "T", "l", "/", "S"],
     "config": ["k"],
     "logs": ["f", "/", "S"],
@@ -1008,8 +1058,28 @@ def build_dashboard_action_request(
                 "view": "backups",
                 "feedback": {
                     "success_receipt": f"Completed a restore dry-run for {backup_file}.",
-                    "success_next": "Review the selected backup here; live restore stays in the CLI and should only be run during an approved recovery window.",
+                    "success_next": "Review the plan, then press p for the full preflight; live restore stays in the CLI and only runs during an approved recovery window.",
                     "failure_next": "Inspect the archive path and backup health, then retry the dry-run from Backups.",
+                },
+            }
+
+        if action_name == "backup_restore_preflight":
+            if backup is None or not backup_dir:
+                return {"error": "restore preflight skipped: no backup selected"}
+            backup_file = str(backup.get("file", "")).strip()
+            if not backup_file:
+                return {"error": "restore preflight skipped: selected backup has no file name"}
+            backup_path = f"{backup_dir.rstrip('/')}/{backup_file}"
+            return {
+                "label": f"backup restore preflight {backup_file}",
+                "command": ["backup", "restore", backup_path, "--preflight"],
+                "env": {},
+                "refresh_after": False,
+                "view": "backups",
+                "feedback": {
+                    "success_receipt": f"Restore preflight passed for {backup_file}.",
+                    "success_next": "All readiness checks passed; if you decide to recover, run the live restore from the CLI during an approved recovery window.",
+                    "failure_next": "Fix the failed checks (credentials, auth probe, or a fresh safety backup via --backup-first), then rerun the preflight from Backups.",
                 },
             }
 
@@ -1357,6 +1427,11 @@ def build_snapshot(
         "config_show": config_show,
         "config_summary": config_summary,
         "config_content": config_content,
+        # Restore credentials are env-only (never in the config); readiness
+        # here reflects this dashboard session's environment.
+        "restore_credentials_ready": bool(
+            os.environ.get("MYSQL_RESTORE_DEFAULTS_FILE") or os.environ.get("MYSQL_RESTORE_PASSWORD")
+        ),
         "backups": {
             "entries": backup_entries,
             "summary": backup_summary,
@@ -1955,6 +2030,36 @@ def render_backups_summary(snapshot: dict[str, Any], selected_backup: dict[str, 
     else:
         lines.append(f"[bold {ACCENT_ROSE}]Schedule state unavailable:[/] {format_error_text(backup_schedule_status.get('error', 'unknown error'))}")
 
+    readiness = summarize_restore_readiness(snapshot)
+    lines.extend(
+        [
+            "",
+            f"[bold {ACCENT_GOLD}]Restore Readiness[/]",
+            f"[{ACCENT_MUTED}]Credentials[/]  {format_state('healthy' if readiness['credentials_ready'] else 'warning')}"
+            + (
+                ""
+                if readiness["credentials_ready"]
+                else f"  not in this session — set MYSQL_RESTORE_DEFAULTS_FILE or MYSQL_RESTORE_PASSWORD in the shell that runs vmangos-manager"
+            ),
+        ]
+    )
+    if readiness["latest_age_seconds"] is None:
+        if summary.get("count", 0):
+            lines.append(f"[{ACCENT_MUTED}]Safety Copy[/]  {format_state('warning')}  latest backup age unknown")
+        else:
+            lines.append(f"[{ACCENT_MUTED}]Safety Copy[/]  {format_state('critical')}  no backups yet")
+    elif readiness["within_safety_window"]:
+        lines.append(
+            f"[{ACCENT_MUTED}]Safety Copy[/]  {format_state('healthy')}  latest backup {format_age(readiness['latest_age_seconds'])} (within 24h window)"
+        )
+    else:
+        lines.append(
+            f"[{ACCENT_MUTED}]Safety Copy[/]  {format_state('warning')}  latest backup {format_age(readiness['latest_age_seconds'])} — live restore will require --backup-first"
+        )
+    lines.append(
+        f"[{ACCENT_MUTED}]Preflight[/]   press p on a selected backup, or run vmangos-manager backup restore <file> --preflight"
+    )
+
     if selected_backup:
         lines.extend(
             [
@@ -1966,7 +2071,7 @@ def render_backups_summary(snapshot: dict[str, Any], selected_backup: dict[str, 
                 f"[{ACCENT_MUTED}]DBs[/]         {escape_markup(', '.join(selected_backup.get('databases', [])) or 'n/a')}",
                 f"[{ACCENT_MUTED}]Created By[/]  {escape_markup(selected_backup.get('created_by', 'n/a'))}",
                 "",
-                f"[{ACCENT_MUTED}]Safety[/]      live restore is CLI-only: vmangos-manager backup restore <file>",
+                f"[{ACCENT_MUTED}]Safety[/]      live restore is CLI-only: preflight, then run vmangos-manager backup restore <file> --yes",
             ]
         )
     else:
@@ -1974,7 +2079,7 @@ def render_backups_summary(snapshot: dict[str, Any], selected_backup: dict[str, 
             [
                 "",
                 f"[{ACCENT_MUTED}]Selection[/]   choose a backup row to inspect it.",
-                f"[{ACCENT_MUTED}]Safety[/]      live restore is CLI-only: vmangos-manager backup restore <file>",
+                f"[{ACCENT_MUTED}]Safety[/]      live restore is CLI-only: preflight, then run vmangos-manager backup restore <file> --yes",
             ]
         )
 
@@ -3340,7 +3445,7 @@ def create_app(
                 refresh_after=False,
                 feedback={
                     "success_receipt": f"Verified backup {self.selected_backup_file}.",
-                    "success_next": "If you need recovery planning, use restore dry-run here; live restore stays in the CLI.",
+                    "success_next": "If you need recovery planning, use dry-run (d) or preflight (p) here; live restore stays in the CLI.",
                     "failure_next": "Inspect the selected archive and retry verification from Backups.",
                 },
             )
@@ -3449,6 +3554,16 @@ def create_app(
                 [],
                 f"Run a dry-run restore check for {backup_file}.",
             )
+
+        def action_restore_selected_backup_preflight(self) -> None:
+            backup = self.selected_backup()
+            if backup is None:
+                self.set_action_result("restore preflight skipped: no backup selected", tone="warning")
+                return
+            backup_file = str(backup.get("file", "selected backup")).strip()
+            self.active_view = "backups"
+            self.apply_view_state()
+            self.dispatch_dashboard_action("backup_restore_preflight")
 
         def action_schedule_daily_backup(self) -> None:
             self.active_view = "backups"

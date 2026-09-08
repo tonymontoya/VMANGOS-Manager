@@ -211,7 +211,23 @@ Backup verify is fail-closed for missing metadata. Recreate the backup or repair
 
 ### Restore requires privileged credentials
 
-Restore intentionally refuses to guess privileged DB credentials. Supply them explicitly via `MYSQL_RESTORE_DEFAULTS_FILE` or `MYSQL_RESTORE_PASSWORD` before running a real restore.
+Restore intentionally refuses to guess privileged DB credentials. Supply them explicitly via `MYSQL_RESTORE_DEFAULTS_FILE` or `MYSQL_RESTORE_PASSWORD` before running a real restore. The check runs in preflight — before any service is stopped — so a missing credential never takes the realm down.
+
+### Restore preflight reports "database rejected the restore credentials"
+
+The auth probe (`SELECT 1` with the restore credentials) failed: wrong password, wrong `MYSQL_RESTORE_USER`, or the database is unreachable. Check the credential values and `mysql -h <host> -P <port> -u root -p` by hand, then rerun `backup restore <file> --preflight`.
+
+### Restore refuses: "no backup of the current databases within 24h"
+
+The safety-backup gate fired. Restore will not overwrite the databases without an undo snapshot of the current state. Rerun with `--backup-first` to take one automatically, or wait for the next scheduled backup.
+
+### Restore exits with RESTORE_PARTIAL
+
+The dump import failed, or the realm did not come back up afterwards. Manager attempts to restart services on either path. Check `systemctl status` for the auth/world units and the database logs; the databases may be inconsistent — if you cannot repair them, restore a different archive using the [Recovery Runbook](user-guide.md#-recovery-runbook). If you passed `--backup-first`, the pre-restore archive of the previous state is your undo path.
+
+### Restore refuses in non-interactive mode without confirmation
+
+Live restore needs either a terminal (you type `RESTORE`) or `--yes`. This is intentional: scripted restores must be explicit. Review the plan with `--dry-run` first. The legacy `FORCE_RESTORE=1` env bypass no longer exists.
 
 ---
 

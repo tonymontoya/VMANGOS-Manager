@@ -44,7 +44,7 @@ An SSH terminal-native administration suite for VMANGOS private servers optimize
 | 🛠️ **Install Scripts** | `auto_install.sh` + `vmangos_setup.sh` (advanced/headless path) |
 | 🎮 **Server Control** | Start, stop, restart, and health-check `auth` + `world` |
 | 👤 **Account Admin** | Create, ban/unban, set GM level, password reset |
-| 💾 **Backups** | SQL dumps, verify integrity, dry-run restore, timer scheduling |
+| 💾 **Backups** | SQL dumps, verify integrity, dry-run + guarded preflight restore, timer scheduling |
 | 📝 **Logs** | Filtered `auth`/`world` log investigation via `journald` |
 | ⏰ **Scheduling** | `systemd` timer generation for restarts and maintenance |
 | 🔄 **Update Planning** | Check, inspect, plan, and apply core + DB updates |

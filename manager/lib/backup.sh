@@ -33,6 +33,12 @@ export E_VERIFY_INCOMPLETE=15
 export E_RESTORE_PRIVS=16
 export E_RESTORE_PARTIAL=17
 export E_SCHEDULE_INVALID=18
+export E_RESTORE_UNSAFE=19
+
+# A live restore refuses to overwrite the current databases unless the newest
+# existing backup is at most this old (an undo/forensics snapshot of current
+# state), or the operator passes --backup-first to take one immediately.
+RESTORE_SAFETY_BACKUP_MAX_AGE_SECONDS=$((24 * 3600))
 
 # Required databases for backup
 # Database list populated from config in backup_load_config()
@@ -712,29 +718,207 @@ backup_dump_has_any_table_in_db() {
 # RESTORE PATH
 # ============================================================================
 
+# Age (in seconds) of the newest backup in BACKUP_DIR according to metadata
+# timestamps (mtime fallback). Prints nothing when no backups exist. File
+# reads only — safe to call from dry-run and preflight.
+backup_newest_backup_age_seconds() {
+    local metadata_file ts epoch newest=""
+
+    for metadata_file in "$BACKUP_DIR"/vmangos_backup_*.json; do
+        [[ -f "$metadata_file" ]] || continue
+        ts=$(metadata_json_get "$metadata_file" "timestamp")
+        if [[ -z "$ts" ]]; then
+            ts=$(stat -c %y "$metadata_file" 2>/dev/null)
+        fi
+        [[ -n "$ts" ]] || continue
+        epoch=$(date -d "$ts" +%s 2>/dev/null) || continue
+        if [[ -z "$newest" || "$epoch" -gt "$newest" ]]; then
+            newest="$epoch"
+        fi
+    done
+
+    [[ -n "$newest" ]] || return 0
+    echo $(( $(date +%s) - newest ))
+}
+
+# Silent preflight collector: runs every check a live restore must pass
+# before anything destructive happens and fills the PREFLIGHT_* result
+# arrays (name/label/ok/note). Returns 0 only when all checks pass.
+# Never prints, never stops/starts services, never prompts.
+#   $1 = backup file
+#   $2 = backup_first ("true" satisfies the safety-backup gate)
+backup_restore_preflight() {
+    local backup_file="$1"
+    local backup_first="${2:-false}"
+    local failures=0
+
+    PREFLIGHT_NAMES=()
+    PREFLIGHT_LABELS=()
+    PREFLIGHT_OK=()
+    PREFLIGHT_NOTES=()
+
+    local ok
+    local note
+
+    ok=false
+    note=""
+    if backup_verify "$backup_file" 1 >/dev/null 2>&1; then
+        ok=true
+    else
+        note="backup failed level 1 verification (gunzip/checksum)"
+    fi
+    PREFLIGHT_NAMES+=("backup_integrity")
+    PREFLIGHT_LABELS+=("Backup integrity (level 1 verify)")
+    PREFLIGHT_OK+=("$ok")
+    PREFLIGHT_NOTES+=("$note")
+    [[ "$ok" == "true" ]] || failures=$((failures + 1))
+
+    ok=false
+    note=""
+    if db_restore_credentials >/dev/null 2>&1; then
+        ok=true
+    else
+        note="set MYSQL_RESTORE_DEFAULTS_FILE (mode 600) or MYSQL_RESTORE_PASSWORD"
+    fi
+    PREFLIGHT_NAMES+=("credentials")
+    PREFLIGHT_LABELS+=("Privileged restore credentials present")
+    PREFLIGHT_OK+=("$ok")
+    PREFLIGHT_NOTES+=("$note")
+    [[ "$ok" == "true" ]] || failures=$((failures + 1))
+
+    ok=false
+    note=""
+    if db_restore_probe >/dev/null 2>&1; then
+        ok=true
+    else
+        note="database rejected the restore credentials or is unreachable"
+    fi
+    PREFLIGHT_NAMES+=("auth_probe")
+    PREFLIGHT_LABELS+=("Database accepts the restore credentials")
+    PREFLIGHT_OK+=("$ok")
+    PREFLIGHT_NOTES+=("$note")
+    [[ "$ok" == "true" ]] || failures=$((failures + 1))
+
+    ok=false
+    note=""
+    local safety_age=""
+    safety_age=$(backup_newest_backup_age_seconds)
+    if [[ "$backup_first" == "true" ]]; then
+        ok=true
+        note="pre-restore snapshot will be created by --backup-first"
+    elif [[ -n "$safety_age" && "$safety_age" -le "$RESTORE_SAFETY_BACKUP_MAX_AGE_SECONDS" ]]; then
+        ok=true
+        note="current databases snapshotted ${safety_age}s ago"
+    else
+        note="no backup of the current databases within ${RESTORE_SAFETY_BACKUP_MAX_AGE_SECONDS}s; rerun with --backup-first"
+    fi
+    PREFLIGHT_NAMES+=("safety_backup")
+    PREFLIGHT_LABELS+=("Current databases have a recent backup")
+    PREFLIGHT_OK+=("$ok")
+    PREFLIGHT_NOTES+=("$note")
+    [[ "$ok" == "true" ]] || failures=$((failures + 1))
+
+    [[ "$failures" -eq 0 ]]
+}
+
+# Text rendering of the last backup_restore_preflight results.
+backup_restore_preflight_report_text() {
+    local i
+    for i in "${!PREFLIGHT_NAMES[@]}"; do
+        if [[ "${PREFLIGHT_OK[$i]}" == "true" ]]; then
+            log_info "✓ ${PREFLIGHT_LABELS[$i]}"
+        else
+            log_error "✗ ${PREFLIGHT_LABELS[$i]}"
+            if [[ -n "${PREFLIGHT_NOTES[$i]}" ]]; then
+                log_error "  ${PREFLIGHT_NOTES[$i]}"
+            fi
+        fi
+    done
+    if [[ "$1" == "true" ]]; then
+        log_info "Preflight verdict: READY — all checks passed"
+    else
+        log_error "Preflight verdict: NOT READY — fix the checks above and rerun"
+    fi
+}
+
+# JSON rendering of the last backup_restore_preflight results. The command
+# itself succeeded, so the envelope is success:true and readiness lives in
+# data.ready (exit code still reflects readiness for scripting).
+backup_restore_preflight_report_json() {
+    local checks=() i
+    for i in "${!PREFLIGHT_NAMES[@]}"; do
+        checks+=("$(json_object \
+            "$(json_kvs name "${PREFLIGHT_NAMES[$i]}")" \
+            "$(json_kvs label "${PREFLIGHT_LABELS[$i]}")" \
+            "$(json_kv_raw ok "${PREFLIGHT_OK[$i]}")" \
+            "$(json_kvs note "${PREFLIGHT_NOTES[$i]}")")")
+    done
+    json_output true "$(json_object \
+        "$(json_kv_raw ready "$1")" \
+        "$(json_kv_raw checks "$(json_array ${checks[@]+"${checks[@]}"})")")"
+}
+
 backup_restore() {
     local backup_file="$1"
-    local dry_run="${2:-false}"
-    
-    log_section "VMANGOS Backup Restore"
-    
+    local mode="${2:-live}"
+    local fmt="${3:-text}"
+    local assume_yes="${4:-false}"
+    local backup_first="${5:-false}"
+
+    if [[ "$fmt" != "json" ]]; then
+        log_section "VMANGOS Backup Restore"
+    fi
     # Load configuration
     backup_load_config || error_exit "Failed to load configuration" "$E_CONFIG_ERROR"
     server_load_config || error_exit "Failed to load server configuration" "$E_CONFIG_ERROR"
-    
+
     # Validate backup file
     if [[ ! -f "$backup_file" ]]; then
         error_exit "Backup file not found: $backup_file" "$E_INVALID_ARGS"
     fi
-    
-    # Dry-run mode
-    if [[ "$dry_run" == "true" ]]; then
-        backup_restore_dry_run "$backup_file"
-        return 0
+
+    case "$mode" in
+        dry-run)
+            backup_restore_dry_run "$backup_file" "$fmt"
+            return $?
+            ;;
+        preflight)
+            local ready=true
+            backup_restore_preflight "$backup_file" "$backup_first" || ready=false
+            if [[ "$fmt" == "json" ]]; then
+                backup_restore_preflight_report_json "$ready"
+            else
+                backup_restore_preflight_report_text "$ready"
+            fi
+            if [[ "$ready" == "true" ]]; then
+                return 0
+            fi
+            return 1
+            ;;
+        live) ;;
+        *)
+            error_exit "Unknown restore mode: $mode" "$E_INVALID_ARGS"
+            ;;
+    esac
+
+    # All destructive-step guards run before anything is stopped or touched:
+    # integrity, credentials, live auth probe, and the pre-restore backup gate.
+    if [[ "$fmt" == "json" ]]; then
+        if ! backup_restore_preflight "$backup_file" "$backup_first"; then
+            json_output false "null" "RESTORE_PREFLIGHT" "Restore preflight failed - nothing was changed" "Run 'backup restore <file> --preflight' for the detailed check report"
+            return "$E_RESTORE_UNSAFE"
+        fi
+    else
+        local preflight_ready=true
+        backup_restore_preflight "$backup_file" "$backup_first" || preflight_ready=false
+        backup_restore_preflight_report_text "$preflight_ready"
+        if [[ "$preflight_ready" != "true" ]]; then
+            error_exit "Restore preflight failed - nothing was changed" "$E_RESTORE_UNSAFE"
+        fi
     fi
-    
+
     # WARNING: Restore requires downtime and root privileges
-    echo ""
+    [[ "$fmt" == "json" ]] || echo ""
     log_warn "⚠️  RESTORE OPERATION REQUIRES SERVER DOWNTIME ⚠️"
     log_warn ""
     log_warn "This operation will:"
@@ -747,9 +931,19 @@ backup_restore() {
     log_warn "  - Root database credentials (not vmangos_mgr)"
     log_warn "  - Server downtime (users will be disconnected)"
     log_warn ""
-    
-    # Require explicit confirmation
-    if [[ "${FORCE_RESTORE:-0}" != "1" ]]; then
+
+    # Require explicit confirmation. --yes is the only non-interactive path;
+    # the typed prompt is never silently skipped.
+    if [[ "$assume_yes" != "true" ]]; then
+        if [[ ! -t 0 ]]; then
+            if [[ "$fmt" == "json" ]]; then
+                json_output false "null" "RESTORE_CONFIRM_REQUIRED" "Refusing to restore in non-interactive mode without confirmation" "Check the plan with --dry-run, then rerun with --yes"
+                return 1
+            fi
+            log_error "Refusing to restore in non-interactive mode without confirmation"
+            log_info "Check the plan with 'backup restore <file> --dry-run', then rerun with --yes"
+            return 1
+        fi
         echo -n "Type 'RESTORE' to confirm: "
         read -r confirmation
         if [[ "$confirmation" != "RESTORE" ]]; then
@@ -757,26 +951,31 @@ backup_restore() {
             return 1
         fi
     fi
-    
-    # Verify backup before proceeding
-    log_info "Verifying backup integrity..."
-    if ! backup_verify "$backup_file" 1; then
-        error_exit "Backup verification failed - restore aborted" "$E_VERIFY_CORRUPT"
+
+    # Optional pre-restore snapshot of the current databases (undo path).
+    # Runs after confirmation but before anything is stopped: a failure here
+    # aborts with the realm untouched.
+    if [[ "$backup_first" == "true" ]]; then
+        log_info "Creating pre-restore backup of current databases..."
+        if ! backup_now true >/dev/null 2>&1; then
+            error_exit "Pre-restore backup failed - restore aborted, nothing was changed" "$E_BACKUP_MYSQLDUMP"
+        fi
+        log_info "✓ Pre-restore backup complete"
     fi
-    
+
     # Stop services (world first, then auth)
     log_info "Stopping VMANGOS services..."
     server_stop false false || {
         log_error "Failed to stop services cleanly"
         log_warn "Proceeding anyway..."
     }
-    
+
     # Restore databases
-    
+
     # Restore from backup (single import of full dump)
     log_info "Restoring from backup: $backup_file"
     log_info "This will restore all databases: ${BACKUP_DATABASES[*]}"
-    
+
     if ! backup_restore_full "$backup_file"; then
         log_error "═══════════════════════════════════════════════════"
         log_error "  RESTORE FAILED"
@@ -786,19 +985,45 @@ backup_restore() {
         log_error "Your databases may be in an INCONSISTENT state."
         log_error "Manual intervention is required."
         log_error ""
-        
+
         # Try to restart services anyway so the server is not left down
         log_warn "Attempting to restart services..."
         server_start false || true
-        
+
         json_output false "null" "RESTORE_PARTIAL" "Database restore failed" "Databases may be in an inconsistent state. Manual intervention required."
         return "$E_RESTORE_PARTIAL"
     fi
-    
+
     log_info "✓ Database restore complete"
-    
-    log_info "✓ Restore complete"
-    json_output true "{\"restored_from\": \"$backup_file\", \"databases\": [$(printf '"%s",' "${BACKUP_DATABASES[@]}" | sed 's/,$//')]}"
+
+    # Bring the realm back up before reporting success
+    log_info "Starting VMANGOS services..."
+    if ! server_start false; then
+        json_output false "null" "RESTORE_PARTIAL" "Restore succeeded but services failed to start" "Check 'systemctl status' for the auth/world services, then start them manually."
+        return "$E_RESTORE_PARTIAL"
+    fi
+
+    # Post-restore validation: services up and the restored databases answer.
+    if ! service_active "$AUTH_SERVICE" || ! service_active "$WORLD_SERVICE"; then
+        json_output false "null" "RESTORE_PARTIAL" "Services not active after restore" "Check 'systemctl status' for the auth/world services, then start them manually."
+        return "$E_RESTORE_PARTIAL"
+    fi
+    if ! db_check_connection; then
+        json_output false "null" "RESTORE_PARTIAL" "Database connectivity check failed after restore" "The dump imported but the databases are not answering; inspect the mysql server logs."
+        return "$E_RESTORE_PARTIAL"
+    fi
+
+    log_info "✓ Services active and database connectivity confirmed"
+    log_info "Next steps: spot-check a known account or character, then run 'backup verify <file>' on the restored archive if you haven't already."
+
+    local pre_backup_state="skipped"
+    if [[ "$backup_first" == "true" ]]; then
+        pre_backup_state="created"
+    fi
+    json_output true "$(json_object \
+        "$(json_kvs restored_from "$backup_file")" \
+        "$(json_kv_raw databases "$(json_string_array "${BACKUP_DATABASES[@]}")")" \
+        "$(json_kvs pre_restore_backup "$pre_backup_state")")"
     return 0
 }
 
@@ -812,31 +1037,85 @@ backup_restore_full() {
 
 backup_restore_dry_run() {
     local backup_file="$1"
-    
+    local fmt="${2:-text}"
+
+    local metadata_file created_at size_bytes databases
+    local databases_list=()
+    metadata_file="${backup_file%.sql.gz}.json"
+    if [[ -f "$metadata_file" ]]; then
+        created_at=$(metadata_json_get "$metadata_file" "timestamp")
+        size_bytes=$(metadata_json_get "$metadata_file" "size_bytes")
+        mapfile -t databases_list < <(metadata_json_array_values "$metadata_file" "databases")
+        databases=$(metadata_json_array_join "$metadata_file" "databases")
+    fi
+    if [[ ${#databases_list[@]} -eq 0 ]]; then
+        databases_list=("${BACKUP_DATABASES[@]}")
+        databases="$(IFS=', '; echo "${BACKUP_DATABASES[*]}")"
+    fi
+
+    local credentials_ready=false
+    if db_restore_credentials >/dev/null 2>&1; then
+        credentials_ready=true
+    fi
+
+    local safety_age="" safety_line="no backups yet"
+    safety_age=$(backup_newest_backup_age_seconds)
+    if [[ -n "$safety_age" ]]; then
+        safety_line="${safety_age}s old"
+    fi
+
+    if [[ "$fmt" == "json" ]]; then
+        json_output true "$(json_object \
+            "$(json_kvs mode "dry-run")" \
+            "$(json_kvs file "$backup_file")" \
+            "$(json_kvs timestamp "${created_at:-}")" \
+            "$(json_kv_raw size_bytes "${size_bytes:-0}")" \
+            "$(json_kv_raw databases "$(json_string_array ${databases_list[@]+"${databases_list[@]}"})")" \
+            "$(json_kv_raw credentials_ready "$credentials_ready")" \
+            "$(json_kv_raw safety_backup_age_seconds "${safety_age:-null}")" \
+            "$(json_kv_raw steps "$(json_string_array \
+                "stop world service" \
+                "stop auth service" \
+                "restore databases from backup" \
+                "start auth service" \
+                "start world service")")")"
+        return 0
+    fi
+
     log_info "RESTORE DRY-RUN: What would happen"
     echo ""
     echo "Backup file: $backup_file"
     echo ""
-    
+
     # Show backup metadata
-    local metadata_file
-    metadata_file="${backup_file%.sql.gz}.json"
     if [[ -f "$metadata_file" ]]; then
         echo "Backup metadata:"
-        local created_at size_bytes databases
-        created_at=$(metadata_json_get "$metadata_file" "timestamp")
-        size_bytes=$(metadata_json_get "$metadata_file" "size_bytes")
-        databases=$(metadata_json_array_join "$metadata_file" "databases")
         if [[ -n "$created_at" || -n "$size_bytes" || -n "$databases" ]]; then
-            [[ -n "$created_at" ]] && echo "  Created: $created_at"
-            [[ -n "$size_bytes" ]] && echo "  Size: $size_bytes bytes"
-            [[ -n "$databases" ]] && echo "  Databases: $databases"
+            if [[ -n "$created_at" ]]; then
+                echo "  Created: $created_at"
+            fi
+            if [[ -n "$size_bytes" ]]; then
+                echo "  Size: $size_bytes bytes"
+            fi
+            if [[ -n "$databases" ]]; then
+                echo "  Databases: $databases"
+            fi
         else
             echo "  (metadata parse error)"
         fi
         echo ""
     fi
-    
+
+    echo "Readiness (informational - full checks run with --preflight):"
+    if [[ "$credentials_ready" == "true" ]]; then
+        echo "  Privileged credentials: present"
+    else
+        echo "  Privileged credentials: NOT SET"
+        echo "    Use MYSQL_RESTORE_DEFAULTS_FILE or MYSQL_RESTORE_PASSWORD"
+    fi
+    echo "  Newest backup of current databases: $safety_line"
+    echo ""
+
     echo "Actions that would be taken:"
     echo "  1. Stop world service"
     echo "  2. Stop auth service"
@@ -850,6 +1129,7 @@ backup_restore_dry_run() {
     echo "Requirements:"
     echo "  - Explicit privileged database credentials"
     echo "    Use MYSQL_RESTORE_DEFAULTS_FILE or MYSQL_RESTORE_PASSWORD"
+    echo "  - A backup of the current databases (auto-checked by --preflight, or take one with --backup-first)"
     echo "  - Server downtime (users will be disconnected)"
     echo ""
     echo "Estimated downtime: 1-5 minutes depending on backup size"

@@ -16,6 +16,7 @@
 #   db_check_connection                  verify the server is reachable
 #   db_dump <db>...                      mysqldump one or more databases to stdout
 #   db_restore_credentials               validate privileged restore credentials
+#   db_restore_probe                     authenticate with restore credentials (SELECT 1)
 #   db_restore <file.sql.gz>             import a gzipped dump (privileged)
 #
 
@@ -153,6 +154,25 @@ db_restore_credentials() {
     fi
 
     return 0
+}
+
+# Authenticate with the privileged restore credentials without touching any
+# data (SELECT 1). Restore preflight calls this before stopping services so a
+# bad password surfaces while the realm is still up.
+db_restore_probe() {
+    local restore_user="${MYSQL_RESTORE_USER:-root}"
+
+    db_load_config || return 1
+    db_restore_credentials || return 1
+
+    if [[ -n "${MYSQL_RESTORE_DEFAULTS_FILE:-}" ]]; then
+        mysql --defaults-file="$MYSQL_RESTORE_DEFAULTS_FILE" --connect-timeout=5 \
+            -e "SELECT 1" >/dev/null 2>&1
+        return $?
+    fi
+
+    MYSQL_PWD="$MYSQL_RESTORE_PASSWORD" mysql -h "$DB_HOST" -P "$DB_PORT" -u "$restore_user" \
+        --connect-timeout=5 -e "SELECT 1" >/dev/null 2>&1
 }
 
 db_restore() {
