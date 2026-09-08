@@ -337,6 +337,22 @@ test_database_server_provisioning() {
     capture="$tmp_dir/capture"
     mkdir -p "$tmp_dir/bin" "$tmp_dir/bin2" "$state"
 
+    # Hermetic host tools: the scenarios must see the host exactly as the
+    # suite assumes — in particular NO mysql client on PATH (CI runners
+    # ship a real one; the scenarios stage their own via bin2, and the
+    # client-missing scenarios need `command -v mysql` to fail). Everything
+    # else the sourced installer needs (date, sleep, ...) stays available.
+    local hostbin="$tmp_dir/hostbin" pdir tool
+    mkdir -p "$hostbin"
+    for pdir in $(printf '%s' "$PATH" | tr ':' ' '); do
+        for tool in "$pdir"/*; do
+            if [[ ! -x "$tool" ]]; then continue; fi
+            tool="${tool##*/}"
+            if [[ "$tool" == mysql* || "$tool" == mariadb* ]]; then continue; fi
+            if [[ ! -e "$hostbin/$tool" ]]; then ln -s "$pdir/$tool" "$hostbin/$tool"; fi
+        done
+    done
+
     cat > "$tmp_dir/bin/systemctl" <<EOF
 #!/usr/bin/env bash
 printf 'systemctl:%s\n' "\$*" >> '$capture'
@@ -379,7 +395,7 @@ EOF
         mkdir -p "$state" "$tmp_dir/bin2"
         : > "$capture"
         INSTALL_LOG="$tmp_dir/install-$name.log" \
-        PATH="$tmp_dir/bin2:$tmp_dir/bin:$PATH" \
+        PATH="$tmp_dir/bin2:$tmp_dir/bin:$hostbin" \
         REPO_ROOT="$REPO_ROOT" \
         bash -c '
             set -u
