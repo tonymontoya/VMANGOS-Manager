@@ -130,6 +130,19 @@ docker_exec() {
         "$CONTAINER_NAME" bash -c "$*"
 }
 
+# Drive the runner library inside the container: source installer.sh with
+# the mmaps seam exported (the TUI's environment carries it into the unit
+# the same way), then run the given installer.sh functions. This is the
+# exact path the FailureScreen's Retry and a second `install` take.
+runner_exec() { # runner_exec <installer.sh commands>
+    docker_exec "
+        set -u
+        export VMANGOS_SKIP_MMAPS=$SKIP_MMAPS_VALUE
+        source $MANAGER_PREFIX/lib/installer.sh
+        $*
+    "
+}
+
 require_docker() {
     command -v docker >/dev/null 2>&1 || die "docker is not on PATH"
     docker info >/dev/null 2>&1 || die "cannot reach the docker daemon"
@@ -177,34 +190,51 @@ checkpoint_read() {
     docker_exec "cat '$CHECKPOINT_FILE' 2>/dev/null" | tr -d '[:space:]' || true
 }
 
+# The ordered install chain: each phase -> the *_DONE checkpoint it writes
+# on completion, in chain order (the phase names are the journal marker
+# names; extraction writing DATA_DONE is historical naming). START heads
+# the chain as rank 0; every rank below derives from this one map, so a
+# new phase or checkpoint is a single entry here.
+INSTALL_CHAIN=(
+    'prerequisites:PREREQS_DONE'
+    'database:DATABASE_DONE'
+    'source:SOURCE_DONE'
+    'build:BUILD_DONE'
+    'config:CONFIG_DONE'
+    'extraction:DATA_DONE'
+    'db-import:DB_IMPORT_DONE'
+    'services:SERVICES_DONE'
+)
+
 # Position in the checkpoint chain (START=0 … SERVICES_DONE=8, -1 unknown).
-checkpoint_rank() {
-    case "$1" in
-        START)           echo 0 ;;
-        PREREQS_DONE)    echo 1 ;;
-        DATABASE_DONE)   echo 2 ;;
-        SOURCE_DONE)     echo 3 ;;
-        BUILD_DONE)      echo 4 ;;
-        CONFIG_DONE)     echo 5 ;;
-        DATA_DONE)       echo 6 ;;
-        DB_IMPORT_DONE)  echo 7 ;;
-        SERVICES_DONE)   echo 8 ;;
-        *)               echo -1 ;;
-    esac
+checkpoint_rank() { # checkpoint_rank <CHECKPOINT>
+    local entry rank=0
+    if [[ "$1" == START ]]; then
+        echo 0
+        return 0
+    fi
+    for entry in "${INSTALL_CHAIN[@]}"; do
+        rank=$(( rank + 1 ))
+        if [[ "$1" == "${entry#*:}" ]]; then
+            echo "$rank"
+            return 0
+        fi
+    done
+    echo -1
 }
 
 # Rank of the *_DONE checkpoint a phase writes when it completes
-# (prerequisites -> PREREQS_DONE, ..., extraction -> DATA_DONE).
-phase_done_rank() {
-    case "$1" in
-        prerequisites) echo 1 ;;
-        database)      echo 2 ;;
-        source)        echo 3 ;;
-        build)         echo 4 ;;
-        config)        echo 5 ;;
-        extraction)    echo 6 ;;
-        *)             echo -1 ;;
-    esac
+# (prerequisites -> PREREQS_DONE, ..., services -> SERVICES_DONE; -1 unknown).
+phase_done_rank() { # phase_done_rank <phase>
+    local entry rank=0
+    for entry in "${INSTALL_CHAIN[@]}"; do
+        rank=$(( rank + 1 ))
+        if [[ "$1" == "${entry%%:*}" ]]; then
+            echo "$rank"
+            return 0
+        fi
+    done
+    echo -1
 }
 
 # Default snapshot image tag for a checkpoint (SOURCE_DONE ->
@@ -218,17 +248,44 @@ snapshot_default_tag() { # snapshot_default_tag <CHECKPOINT>
 }
 
 # Poll until the checkpoint exists and is past the given chain position.
-wait_checkpoint_past() {
-    local rank="$1" timeout="$2"
+# On success sets WAIT_CHECKPOINT to the observed checkpoint and returns
+# 0; returns 1 on timeout (with a log line saying where it stalled).
+#
+# The optional third argument (fail-dead) detects an install that ENDED
+# below the target instead of letting it stall the wait for the whole
+# timeout: a completed install clears its checkpoints (done marker in
+# the journal), a failed one freezes them with a terminal error marker,
+# and a killed one stays down. The one deliberate exception: the
+# failure-retry scenario stops and restarts the unit within seconds and
+# its stop emits no marker, so a marker-less dead unit only counts as
+# ended once it stays down for a retry window (30s). A dead unit with
+# no checkpoint and no terminal marker is an install that has not
+# started yet (a parallel smoke may still be setting up) — keep waiting.
+wait_checkpoint_past() { # wait_checkpoint_past <rank> <timeout> [fail-dead]
+    local rank="$1" timeout="$2" fail_dead="${3:-}"
     local deadline=$(( $(date +%s) + timeout )) cp
     while (( $(date +%s) < deadline )); do
         cp="$(checkpoint_read)"
         if [[ -n "$cp" ]] && (( $(checkpoint_rank "$cp") > rank )); then
-            printf '%s\n' "$cp"
+            WAIT_CHECKPOINT="$cp"
             return 0
+        fi
+        if [[ -n "$fail_dead" ]] && ! unit_running; then
+            if [[ -z "$cp" ]] && (( $(journal_count 'phase=install event=done') > 0 )); then
+                fail "the install completed while waiting (checkpoints cleared) — it will not advance"
+            fi
+            if (( $(journal_count 'event=error') > 0 )); then
+                fail "the install ended in failure at checkpoint ${cp:-none} (error marker in the journal) — it will not advance; retry the install"
+            fi
+            if [[ -n "$cp" ]]; then
+                sleep 30
+                unit_running \
+                    || fail "the install ended at checkpoint $cp — it will not advance; retry the install"
+            fi
         fi
         sleep 5
     done
+    log "checkpoint still at ${cp:-none} after ${timeout}s (wanted past rank $rank)"
     return 1
 }
 
@@ -533,9 +590,10 @@ phase_kill_reattach() {
 phase_failure_retry() {
     require_unit_running "failure/retry"
     log "waiting for the first phase checkpoint (prerequisites runs real apt)..."
-    local cp_before
-    cp_before="$(wait_checkpoint_past 0 "$TIMEOUT_PREREQS")" \
-        || fail "no phase checkpoint appeared within ${TIMEOUT_PREREQS}s"
+    if ! wait_checkpoint_past 0 "$TIMEOUT_PREREQS"; then
+        fail "no phase checkpoint appeared within ${TIMEOUT_PREREQS}s"
+    fi
+    local cp_before="$WAIT_CHECKPOINT"
     log "checkpoint before forced failure: $cp_before"
     local prereq_starts_before
     prereq_starts_before="$(journal_count 'phase=prerequisites event=start')"
@@ -552,13 +610,8 @@ phase_failure_retry() {
     # The runner's retry path: installer_unit_stop (stop + reset-failed) then
     # installer_unit_start — the command the FailureScreen's Retry runs.
     log "driving the retry (installer_unit_stop + installer_unit_start)..."
-    docker_exec "
-        set -u
-        export VMANGOS_SKIP_MMAPS=$SKIP_MMAPS_VALUE
-        source $MANAGER_PREFIX/lib/installer.sh
-        installer_unit_stop
-        installer_unit_start '$SECRETS_FILE' '$SETUP_SCRIPT'
-    " || fail "retry launch failed"
+    runner_exec "installer_unit_stop; installer_unit_start '$SECRETS_FILE' '$SETUP_SCRIPT'" \
+        || fail "retry launch failed"
     sleep 5
     require_unit_running "failure/retry (after retry)"
     log "unit state after retry: $(unit_state)"
@@ -580,18 +633,20 @@ phase_failure_retry() {
 
     # Resume verification 3: the checkpoint advances from where it was —
     # the resumed run continues the install instead of idling or resetting.
-    local cp_after
-    cp_after="$(wait_checkpoint_past "$(checkpoint_rank "$cp_before")" "$TIMEOUT_ADVANCE")" \
-        || fail "checkpoint never advanced past $cp_before after the retry"
+    if ! wait_checkpoint_past "$(checkpoint_rank "$cp_before")" "$TIMEOUT_ADVANCE"; then
+        fail "checkpoint never advanced past $cp_before after the retry"
+    fi
+    local cp_after="$WAIT_CHECKPOINT"
     log "checkpoint advanced after retry: $cp_before -> $cp_after"
 
     pass "failure/retry: stopped then restarted via the runner's retry path; resumed from $cp_before (now $cp_after), no completed phase re-ran"
 }
 
-# Stream the install's markers from the journal until it ends (done or error),
-# a unit death, or the timeout. Prints the newest marker each poll so progress
-# is visible. Returns: 0 completed, 1 error marker, 2 timeout, 3 unit left
-# active states without a terminal marker.
+# Stream the install's markers from the journal until it ends: the done
+# marker, the unit leaving the active states (an errored install dies,
+# ending this way too), or the timeout. Prints the newest marker each
+# poll so progress is visible. Returns: 0 completed, 2 timeout, 3 the
+# unit left active states without a terminal marker.
 phase_watch() {
     local timeout="${SMOKE_WATCH_TIMEOUT:-$TIMEOUT_INSTALL}"
     local deadline=$(( $(date +%s) + timeout ))
@@ -694,12 +749,8 @@ phase_name_recreation() {
         fail "name-recreation precondition: unit still running (ActiveState=$(unit_state))"
     fi
     log "re-creating the unit name via the runner (installer_unit_start)"
-    docker_exec "
-        set -u
-        export VMANGOS_SKIP_MMAPS=$SKIP_MMAPS_VALUE
-        source $MANAGER_PREFIX/lib/installer.sh
-        installer_unit_start '$SECRETS_FILE' '$SETUP_SCRIPT'
-    " || fail "runner refused to re-create the unit name after a completed run"
+    runner_exec "installer_unit_start '$SECRETS_FILE' '$SETUP_SCRIPT'" \
+        || fail "runner refused to re-create the unit name after a completed run"
     local deadline=$(( $(date +%s) + 120 )) starts
     while (( $(date +%s) < deadline )); do
         starts="$(journal_count 'phase=prerequisites event=start')"
@@ -714,11 +765,8 @@ phase_name_recreation() {
     require_unit_running "name-recreation (running)"
     # Stop it again through the runner: this is a name exercise, not an
     # install. The completed install's services are untouched by it.
-    docker_exec "
-        set -u
-        source $MANAGER_PREFIX/lib/installer.sh
-        installer_unit_stop
-    " || fail "runner could not stop the re-created unit"
+    runner_exec "installer_unit_stop" \
+        || fail "runner could not stop the re-created unit"
     sleep 3
     if unit_running; then
         fail "re-created unit still running after installer_unit_stop"
@@ -792,39 +840,15 @@ phase_snapshot() {
     tag="${SNAPSHOT_TAG:-$(snapshot_default_tag "$after")}"
     cp="$(checkpoint_read)"
     if [[ -z "$cp" ]] || (( $(checkpoint_rank "$cp") < rank )); then
-        # The checkpoint does not satisfy the target yet. Three honest
-        # states: the install is running (wait for it to advance), it has
-        # not started yet (a parallel smoke still setting up — wait for
-        # the first checkpoint), or it ended without reaching the target
-        # (fail fast: a dead install never advances).
-        if [[ -z "$cp" ]] && ! unit_running \
-            && (( $(journal_count 'phase=install event=done') > 0 )); then
-            fail "snapshot: the install already completed (checkpoints cleared) — a finished container cannot be snapshotted (re-run from build-image/setup and snapshot while it is in progress)"
-        fi
         log "snapshot: waiting for checkpoint $after (currently: ${cp:-not started}, unit $(unit_state))..."
-        local deadline=$(( $(date +%s) + TIMEOUT_INSTALL ))
-        while (( $(date +%s) < deadline )); do
-            cp="$(checkpoint_read)"
-            if [[ -n "$cp" ]]; then
-                if (( $(checkpoint_rank "$cp") >= rank )); then
-                    break
-                fi
-                if ! unit_running; then
-                    # The unit may be mid-retry — the failure-retry scenario
-                    # deliberately stops and restarts it. Only call the
-                    # install ended once it stays down.
-                    sleep 30
-                    unit_running \
-                        || fail "snapshot: the install ended at checkpoint $cp (below $after) — nothing to snapshot"
-                else
-                    sleep 5
-                fi
-            else
-                sleep 5
-            fi
-        done
-        [[ -n "$cp" && "$(checkpoint_rank "$cp")" -ge "$rank" ]] \
-            || fail "snapshot: the checkpoint never passed $after within ${TIMEOUT_INSTALL}s (last: ${cp:-none})"
+        # Reaching the target rank = passing the rank below it. fail-dead
+        # turns an install that ended below the target — completed,
+        # failed, or killed — into an immediate diagnosis instead of a
+        # full-timeout stall.
+        if ! wait_checkpoint_past "$(( rank - 1 ))" "$TIMEOUT_INSTALL" fail-dead; then
+            fail "snapshot: the checkpoint never passed $after within ${TIMEOUT_INSTALL}s"
+        fi
+        cp="$WAIT_CHECKPOINT"
     fi
     log "snapshot: checkpoint $cp passed $after — committing $CONTAINER_NAME as $tag"
     docker commit "$CONTAINER_NAME" "$tag" >/dev/null
@@ -838,9 +862,12 @@ phase_snapshot() {
 snapshot_freeze_starts() {
     local cp_rank p r counts=""
     cp_rank="$(checkpoint_rank "$(checkpoint_read)")"
-    for p in prerequisites database source build config extraction; do
+    # Every chain phase completed at or below the embedded checkpoint,
+    # straight from INSTALL_CHAIN — a phase added to the chain freezes
+    # here without a second list to edit.
+    for p in "${INSTALL_CHAIN[@]%%:*}"; do
         r="$(phase_done_rank "$p")"
-        (( r >= 1 && r <= cp_rank )) || continue
+        (( r <= cp_rank )) || continue
         counts+="$p $(journal_count "phase=$p event=start")"$'\n'
     done
     mkdir -p "$EVIDENCE_DIR"
@@ -883,12 +910,8 @@ phase_resume_install() {
     local resumed_before
     resumed_before="$(journal_count "Resuming from checkpoint: $cp")"
     log "starting the install via the runner (installer_unit_start)..."
-    docker_exec "
-        set -u
-        export VMANGOS_SKIP_MMAPS=$SKIP_MMAPS_VALUE
-        source $MANAGER_PREFIX/lib/installer.sh
-        installer_unit_start '$SECRETS_FILE' '$SETUP_SCRIPT'
-    " || fail "resume-install: the runner refused to start the unit"
+    runner_exec "installer_unit_start '$SECRETS_FILE' '$SETUP_SCRIPT'" \
+        || fail "resume-install: the runner refused to start the unit"
     sleep 5
     require_unit_running "resume-install"
     local resumed_after
