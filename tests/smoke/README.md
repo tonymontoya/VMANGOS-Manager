@@ -5,8 +5,9 @@ wizard TUI, the runner (`manager/lib/installer.sh`), `vmangos_setup.sh`, the
 marker protocol, and the viewer — against **reality**: the install is
 launched by driving `vmangos-manager install` in a pty like a user (gate
 button, typed form answers, review confirm), real apt, real MySQL/MariaDB, a
-real MangOS build, real MPQ extraction, real systemd services, real markers,
-and a real verified retry. It exercises the #104 acceptance scenarios plus
+real MangOS build, real MPQ extraction (mmaps generation skipped by default —
+see [Runtime expectations](#runtime-expectations)), real systemd services,
+real markers, and a real verified retry. It exercises the #104 acceptance scenarios plus
 two folded-in additions:
 
 * the **transient-unit name-recreation edge** after a completed run, and
@@ -41,9 +42,13 @@ and easy to break (see the `Dockerfile`):
 
 ```sh
 # Full smoke (build image -> container -> manager -> TUI launch -> scenarios
-# -> watch to completion -> verify -> teardown). ~4.5 h on a 10-core
-# workstation (MoveMapGen dominates — see Runtime expectations).
+# -> watch to completion -> verify -> teardown). ~30 min on a 10-core
+# workstation: MoveMapGen (the ~2.5h mmaps step) is SKIPPED by default —
+# use --full-extraction when the extraction/mmaps code itself changes.
 tests/smoke/wizard_smoke.sh
+
+# Complete run incl. MoveMapGen (~4.5 h) — for extraction-code changes:
+tests/smoke/wizard_smoke.sh --full-extraction
 
 # A single phase (each is independently testable):
 tests/smoke/wizard_smoke.sh --phase build-image
@@ -57,10 +62,15 @@ tests/smoke/wizard_smoke.sh --phase watch
 tests/smoke/wizard_smoke.sh --phase completion
 tests/smoke/wizard_smoke.sh --phase name-recreation
 tests/smoke/wizard_smoke.sh --phase flake-watch
+tests/smoke/wizard_smoke.sh --phase snapshot
+tests/smoke/wizard_smoke.sh --phase resume-install
 tests/smoke/wizard_smoke.sh --phase teardown
 
 # Keep the container for inspection (skip teardown):
 tests/smoke/wizard_smoke.sh --keep
+
+# Re-smoke from a snapshot image instead of a clean run (~10 min; below):
+tests/smoke/wizard_smoke.sh --from-snapshot vmangos-smoke-snap-data
 ```
 
 Tear down and prepare for a fresh run (keeps the client-data cache):
@@ -92,31 +102,118 @@ secrets or calls the runner directly on the launch path.
 | `kill-reattach` | Kill the viewer's journal session; the unit **keeps running**; re-attach works. |
 | `failure-retry` | Stop the unit after the first phase checkpoint; the runner's retry path (`installer_unit_stop` + `installer_unit_start` — what the FailureScreen's Retry runs) restarts it. Resume is **verified three ways**: the retried invocation logs `Resuming from checkpoint: <captured>`, no completed phase re-ran (prerequisites never starts again), and the checkpoint then advances past the captured one. |
 | `watch` | Markers stream until the terminal `phase=install event=done` marker. |
-| `completion` | Terminal marker present; `auth` + `world` services active; the `realmlist` row is **queried from the database inside the container** and its address/port must match the marker's `server_ip`/`world_port` (the marker alone is the installer grading its own homework). |
+| `completion` | Terminal marker present; `auth` + `world` services active; the `realmlist` row is **queried from the database inside the container** and its address/port must match the marker's `server_ip`/`world_port` (the marker alone is the installer grading its own homework). When this run executed the extraction phase, the mmaps skip (default) or full extraction (`--full-extraction`) is verified against the journal markers. |
 | `name-recreation` | After a completed run, the runner re-creates the unit name (`installer_unit_start`) and the unit runs our installer; it is stopped again via `installer_unit_stop` (a real re-install goes through the wizard's gate — this exercises the `--collect` name edge). |
 | `flake-watch` | The viewer async suite is re-run N times (`SMOKE_FLAKE_RUNS`, default 5) as a stability gate. Any failure fails the smoke and its output is captured — the #113 unit-state race is fixed (`first_seconds` 15s window exceeds the checker's 5s query timeout), so no failure is tolerated. |
+| `snapshot` | Once the container's install checkpoint passes `SMOKE_SNAPSHOT_AFTER` (default `DATA_DONE`), the container is `docker commit`ed into a tagged snapshot image. Works in parallel with a running smoke or against a kept container whose checkpoint already satisfies the target. |
+| `resume-install` | Starts the install from the checkpoint embedded in a snapshot image via the runner (the same path Retry takes); verifies a fresh `Resuming from checkpoint: <cp>` journal line and freezes the embedded phases' start-marker counts for `completion` to check. |
 
 ## Runtime expectations
 
-A full clean run is **~4.5 hours** on a 10-core workstation. The breakdown
-(from a recorded run): image build + container + manager + TUI launch ~3 min;
-prerequisites ~5 min; database (mysql-server install) ~1 min; source ~1 min;
-MangOS build ~5 min; DBC/map + vmap extraction ~2 min; **MoveMapGen ~2.5 h**;
-db import ~1-2 min; service bring-up ~1 min. MoveMapGen is single-threaded
-and generates mmaps for every map that has vmaps — the two large continent
-maps (Elwynn Forest, Dustwallow Marsh) each take well over an hour — so it is
-the dominant cost and the only reason a clean run can exceed 4 h. The `watch`
-phase has a **6 h** ceiling by default (`SMOKE_WATCH_TIMEOUT` /
+A default clean run is **~30 minutes** on a 10-core workstation. The
+breakdown (from recorded runs): image build + container + manager + TUI
+launch ~3 min; prerequisites ~5 min; database (mysql-server install) ~1
+min; source ~1 min; MangOS build ~5 min; DBC/map + vmap extraction ~2 min;
+db import ~1-2 min; service bring-up ~1 min; scenarios ~10 min.
+
+**MoveMapGen is skipped by default.** It is single-threaded and generates
+mmaps for every map that has vmaps — the two large continent maps (Elwynn
+Forest, Dustwallow Marsh) each take well over an hour, ~2.5 h total. The
+extraction path (extractors, vmap assembly, mmaps) is verified by real
+full runs, and the server runs fine without mmaps (NPC pathfinding
+disabled), so the smoke skips it via the `VMANGOS_SKIP_MMAPS=1` seam: the
+smoke exports it, the TUI's inherited environment carries it, the runner
+forwards it into the unit, and `vmangos_setup.sh` skips the step with a
+warn marker (`mmaps skipped by request`). `completion` asserts the marker
+whenever the run executed the extraction phase — a broken seam fails fast
+instead of silently burning hours.
+
+Run the complete extraction **only** when the extraction/mmaps code itself
+changes (`vmangos_setup.sh` extraction phase, the extractor build, or
+MoveMapGen wiring):
+
+```sh
+tests/smoke/wizard_smoke.sh --full-extraction   # ~4.5 h
+```
+
+The `watch` phase has a **6 h** ceiling by default (`SMOKE_WATCH_TIMEOUT` /
 `SMOKE_INSTALL_TIMEOUT` to override). `failure-retry` waits for the first
 phase checkpoint before forcing its failure (prerequisites' real apt, ~5 min;
 `SMOKE_PREREQS_TIMEOUT`, default 25 min, and `SMOKE_ADVANCE_TIMEOUT`,
 default 15 min, bound the two waits).
 
-If you only need to re-exercise the viewer/runner (not the full build),
-snapshot the container after the source phase (`docker commit`) so a re-smoke
-can start from `SOURCE_DONE` — the build + extraction + db-import phases are
-the expensive, already-proven part. This stays a manual README-only
-optimization; the smoke itself does not automate it.
+## Snapshots: cheap re-smokes (#116)
+
+Even a ~30 min default run re-pays apt, the database setup, the build, and
+the extraction. Changes to the viewer, the completion checks, or the
+services never need to re-exercise those — so the smoke can `docker commit`
+the container at a checkpoint and re-run from the committed image instead
+of the base image:
+
+```sh
+# Terminal 1: any run (--keep so the container survives for the re-smoke):
+tests/smoke/wizard_smoke.sh --keep
+
+# Terminal 2, while it runs: wait for the checkpoint, commit the image.
+# Default checkpoint: DATA_DONE (everything through extraction).
+tests/smoke/wizard_smoke.sh --phase snapshot
+# -> vmangos-smoke-snap-data (the tag derives from the checkpoint)
+
+# Other checkpoints (e.g. skip only prerequisites+database+source):
+SMOKE_SNAPSHOT_AFTER=SOURCE_DONE tests/smoke/wizard_smoke.sh --phase snapshot
+# -> vmangos-smoke-snap-source
+```
+
+`--phase snapshot` also works against a `--keep`'d container after the
+run ends, as long as the checkpoint file still satisfies the target — a
+**completed** install clears its checkpoints, so a finished container can
+no longer be snapshotted.
+
+A snapshot image embeds everything the finished phases produced: the
+install root (checkpoint file, build tree, extracted DBC/maps/vmaps/mmaps),
+the databases, the installed manager, and the secrets the TUI wrote. A
+re-smoke starts a fresh container from it and resumes the install from the
+embedded checkpoint:
+
+```sh
+tests/smoke/wizard_smoke.sh --from-snapshot vmangos-smoke-snap-data
+```
+
+The re-smoke flow replaces `build-image`/`tui-launch` with `resume-install`
+(starts the install from the embedded checkpoint through the runner — the
+same path Retry takes; the wizard's gate is deliberately not clean here)
+and verifies the resume itself: the journal must show a fresh
+`Resuming from checkpoint: <cp>`, and at `completion` the start-marker
+counts of every phase embedded in the snapshot are compared against
+baselines frozen at resume time — build and extraction (and everything
+before them) must never start again. `failure-retry` runs right after the
+resume (inside the short db-import window), then `tui-attach`,
+`kill-reattach`, `watch`, `completion`, `name-recreation`, and
+`flake-watch` all run unchanged on the resumed install.
+
+Expected cost by starting checkpoint (10-core workstation):
+
+| Snapshot image | Default for | Re-smoke skips | Re-smoke cost |
+|---|---|---|---|
+| `vmangos-smoke-snap-data` | `DATA_DONE` | prerequisites + database + source + build + config + **extraction** | **~10 min** (setup+manager ~3 min, db-import ~1-2 min, services ~1 min, scenarios) |
+| `vmangos-smoke-snap-source` | `SOURCE_DONE` | prerequisites + database + source | ~15 min (build + extraction still run; mmaps skipped by default) |
+
+A snapshot mirrors the run that created it: one created from a default
+(skip-mmaps) run embeds an install root without mmaps — exactly what its
+re-smokes would produce anyway, and everything the completion checks need.
+Create it with `--full-extraction` if you need real mmaps embedded.
+
+Notes:
+
+* Committed services are captured as-is — like a power cut. MySQL recovers
+  its journals when the re-smoked container boots; the transient install
+  unit never survives (its state lives in `/run`, which is not committed).
+* The journal **does** survive inside the snapshot (`/var/log/journal`), so
+  marker counts accumulate across re-smokes — the baselines are frozen at
+  resume time, never assumed zero.
+* Teardown and `reset.sh` never delete snapshot images. Remove them
+  explicitly (`docker rmi vmangos-smoke-snap-data`) or all at once with
+  `reset.sh --snapshots`.
 
 The client-data cache (`/home/tony/Data`, ~5.2 GB of MPQs) is mounted read-only
 and kept across runs, so the extraction/db-import phases are reproducible

@@ -91,6 +91,7 @@ The `config detect` command inspects your existing layout and prints a proposed 
 - **Retry logic** — Network downloads and git clones retry with backoff
 - **Checkpoint/resume** — Interrupted installs can resume from the last completed phase
 - **Background build support** — Long compilations can run via `VMANGOS_BACKGROUND_BUILD=1` to prevent SSH timeouts
+- **Optional mmaps skip** — `VMANGOS_SKIP_MMAPS=1` skips the hours-long movement-map generation (the server runs without NPC pathfinding); a test seam used by the install-wizard smoke, not needed for real installs
 - **Explicit logging** — Everything is written to `/var/log/vmangos-install.log`
 
 ---

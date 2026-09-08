@@ -635,6 +635,101 @@ EOF
     return "$failed"
 }
 
+# VMANGOS_SKIP_MMAPS=1 skips the hours-long MoveMapGen step with a warn
+# marker (the smoke's default): DBC/maps/vmaps still extract, the phase
+# still completes, and the generator never runs.
+test_extraction_skip_mmaps() {
+    local tmp_dir root client output failed=0
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    client="$tmp_dir/client-src"
+    mkdir -p "$tmp_dir/bin" "$client" "$root/run/bin/Extractors" "$root/client-data" "$root/.install-checkpoints"
+
+    cat > "$tmp_dir/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+if [[ "${1:-}" == "test" ]]; then
+    [[ -r "${3:-}" ]] && exit 0
+    exit 1
+fi
+exec "$@"
+EOF
+    cat > "$tmp_dir/bin/id" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    cat > "$tmp_dir/bin/chown" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$tmp_dir/bin/sudo" "$tmp_dir/bin/id" "$tmp_dir/bin/chown"
+
+    touch "$client/dbc.MPQ" "$client/terrain.MPQ" "$root/client-data/dbc.MPQ"
+    # Pre-create so a never-invoked generator asserts as 0, not empty.
+    : > "$tmp_dir/capture"
+
+    cat > "$root/run/bin/Extractors/MapExtractor" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p dbc maps
+touch dbc/Map.dbc maps/0004331.map
+exit 0
+EOF
+    cat > "$root/run/bin/Extractors/VMapExtractor" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p Buildings
+touch Buildings/out.wmo
+exit 0
+EOF
+    cat > "$root/run/bin/Extractors/VMapAssembler" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p vmaps
+touch vmaps/000.vmtree
+exit 0
+EOF
+    cat > "$root/run/bin/Extractors/MoveMapGenerator" <<EOF
+#!/usr/bin/env bash
+printf 'movemapgen:%s\n' "\$*" >> '$tmp_dir/capture'
+mkdir -p mmaps
+exit 0
+EOF
+    chmod +x "$root/run/bin/Extractors/"*
+
+    VMANGOS_SKIP_MMAPS=1 \
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        refresh_runtime_paths
+        CLIENT_DATA="'"$client"'"
+        MANGOSOSUSER="mangos"
+
+        phase_data_extraction
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+    output="$(cat "$tmp_dir/phase.out")"
+
+    assert_equals "0" \
+        "$(grep -c '^movemapgen:' "$tmp_dir/capture" 2>/dev/null || true)" \
+        "MoveMapGen never runs under VMANGOS_SKIP_MMAPS=1" || failed=1
+    assert_equals "1" \
+        "$(grep -c 'mmaps skipped by request' "$tmp_dir/phase.out" || true)" \
+        "the skip emits a warn marker naming the request" || failed=1
+    assert_equals "0" \
+        "$(test -e "$root/mmaps" && echo 1 || echo 0)" \
+        "no mmaps output is produced" || failed=1
+    assert_equals "1" \
+        "$(grep -c 'phase=extraction event=done' "$tmp_dir/phase.out" || true)" \
+        "extraction still completes (DBC/maps/vmaps extracted)" || failed=1
+    assert_equals "DATA_DONE" \
+        "$(cat "$root/.install-checkpoints/checkpoint" 2>/dev/null || true)" \
+        "the DATA_DONE checkpoint is still written" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
 test_extraction_phase_invocations() {
     local tmp_dir output root client
     tmp_dir="$(mktemp -d)"
@@ -2088,6 +2183,7 @@ main() {
     run_test "Installer: Client data symlink farm" test_client_data_symlink_farm
     run_test "Installer: Database server provisioning" test_database_server_provisioning
     run_test "Installer: Extraction resume clears partial vmaps" test_extraction_resume_clears_partial_vmaps
+    run_test "Installer: Extraction skips mmaps on request" test_extraction_skip_mmaps
     run_test "Installer: Extraction phase" test_extraction_phase_invocations
     run_test "Installer: Extraction failure honesty" test_extraction_failure_honesty
     run_test "Installer: Download retry" test_download_retry_honesty
