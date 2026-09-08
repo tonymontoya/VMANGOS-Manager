@@ -166,8 +166,9 @@ SMOKE_SNAPSHOT_AFTER=SOURCE_DONE tests/smoke/wizard_smoke.sh --phase snapshot
 
 `--phase snapshot` also works against a `--keep`'d container after the
 run ends, as long as the checkpoint file still satisfies the target — a
-**completed** install clears its checkpoints, so a finished container can
-no longer be snapshotted.
+**completed** install clears its checkpoints, and a **failed** one
+freezes them below the target. Either way the phase fails fast with the
+diagnosis instead of waiting out its timeout.
 
 A snapshot image embeds everything the finished phases produced: the
 install root (checkpoint file, build tree, extracted DBC/maps/vmaps/mmaps),
