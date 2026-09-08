@@ -2819,7 +2819,7 @@ PY
     assert_true "[[ \$compact_monitor_storage_missing == *'I/O[/][bold#94a3b8]unavailable[/]'* && \$compact_monitor_storage_missing == *'install[bold#f59e0b]sysstat/iostat[/]toexposeliveread/writeratesanddiskwait.'* ]]" "dashboard monitor storage panel degrades cleanly when optional iostat data is absent" || all_passed=1
     assert_true "[[ \$compact_player_pulse == *'PlayerPulse'* && \$compact_player_pulse == *'OnlineNow[/][bold#f59e0b]1[/]'* && \$compact_player_pulse == *'Mix[/]players=0staff=1'* && \$compact_player_pulse == *'GMCoverage[/]1GM/1online'* && \$compact_player_pulse == *'GMsOnline[/]1'* && \$compact_player_pulse == *'Roster[/]1visible[#cbd5e1]mode[/]onlineroster'* && \$compact_player_pulse == *'Open[/][bold#f59e0b]o[/]onlineroster'* ]]" "dashboard player pulse keeps summary stats aligned with roster visibility context" || all_passed=1
     assert_true "[[ \$compact_alerts == *'AlertsandEvents'* && \$compact_alerts == *'Anythingcurrentlywrong,plusrecentserviceevents.'* && \$compact_alerts == *'Overall[/][bold#34d399]healthy[/][#cbd5e1]active[/]0'* && \$compact_alerts == *'Noactivealerts'* && \$compact_alerts == *'Honorqueuerefreshed'* ]]" "dashboard alerts panel stays scoped to risks and recent realm-side events" || all_passed=1
-    assert_true "[[ \$compact_backups == *'BackupReadiness'* && \$compact_backups == *'Protection[/][bold#34d399]healthy[/]'* && \$compact_backups == *'TimerState'* && \$compact_backups == *'Daily[/]'* && \$compact_backups == *'daily04:00'* && \$compact_backups == *'Safety[/]liverestoreisCLI-only:vmangos-managerbackuprestore<file>'* && \$compact_backups != *'Readyfor'* ]]" "dashboard backups panel centers protection posture and selected backup readiness with an explicit CLI restore boundary" || all_passed=1
+    assert_true "[[ \$compact_backups == *'BackupReadiness'* && \$compact_backups == *'Protection[/][bold#34d399]healthy[/]'* && \$compact_backups == *'TimerState'* && \$compact_backups == *'Daily[/]'* && \$compact_backups == *'daily04:00'* && \$compact_backups == *'RestoreReadiness'* && \$compact_backups == *'SafetyCopy[/][bold#f59e0b]warning[/]latestbackupageunknown'* && \$compact_backups == *'Preflight[/]pressponaselectedbackup,orrunvmangos-managerbackuprestore<file>--preflight'* && \$compact_backups == *'Safety[/]liverestoreisCLI-only:preflight,thenrunvmangos-managerbackuprestore<file>--yes'* && \$compact_backups != *'Readyfor'* ]]" "dashboard backups panel centers protection posture, restore readiness, and an explicit CLI restore boundary" || all_passed=1
     assert_true "[[ \$compact_config == *'Configuration[/]'* && \$compact_config == *'ServerSettings'* && \$compact_config == *'DatabaseSettings'* && \$compact_config == *'DBSecret[/]inlinevaluemasked'* && \$compact_config == *'Read-only[/]editmanager.confand.dbpassintheshell,neverhere.'* && \$compact_config != *'ConfigPreview'* ]]" "dashboard config panel is regrouped into clearer wiring sections without exposing secrets" || all_passed=1
     assert_true "[[ \$compact_player == *'SelectedPlayer'* && \$compact_player == *'Selected[/][bold#2dd4bf]PLAYERONE'* && \$compact_player != *'Playersnow'* && \$compact_player == *'Nextstep[/]open[bold#f59e0b]Accounts[/]forpassword,GM,ban,andunbanactions.'* ]]" "dashboard player details stay scoped to the selected player workflow" || all_passed=1
     assert_true "[[ \$compact_empty_player != *'Onlinenow'* && \$compact_empty_player == *'chooseaplayerrowtoinspectthataccount.'* ]]" "dashboard empty player state stays item-scoped" || all_passed=1
@@ -4384,12 +4384,13 @@ EOF
     server_start() { start_called=1; }
     backup_verify() { verify_called=1; }
 
-    output=$(backup_restore "$dump_file" true 2>/dev/null)
+    output=$(backup_restore "$dump_file" dry-run text 2>/dev/null)
 
     assert_equals "0" "$stop_called" "restore dry-run does not stop services" || all_passed=1
     assert_equals "0" "$start_called" "restore dry-run does not start services" || all_passed=1
     assert_equals "0" "$verify_called" "restore dry-run does not run verification" || all_passed=1
     assert_true "[[ \$output == *'RESTORE DRY-RUN'* ]]" "restore dry-run prints plan output" || all_passed=1
+    assert_true "[[ \$output == *'Privileged credentials'* ]]" "restore dry-run reports credential readiness" || all_passed=1
 
     rm -rf "$temp_dir"
     BACKUP_CONFIG_LOADED=""
@@ -4474,6 +4475,359 @@ test_backup_restore_requires_explicit_credentials() {
         all_passed=1
     fi
 
+    return $all_passed
+}
+
+# Shared fixture: one valid gzip dump + metadata sidecar in a temp dir.
+backup_restore_test_fixture() {
+    local temp_dir="$1"
+    printf '%s\n' '-- MySQL dump 10.13' | gzip > "$temp_dir/test.sql.gz"
+    local checksum
+    checksum=$(sha256_file "$temp_dir/test.sql.gz")
+    printf '{"timestamp":"%s","size_bytes":23,"databases":["auth","characters"],"checksum_sha256":"%s"}\n' \
+        "$(date -Iseconds)" "$checksum" > "$temp_dir/test.json"
+}
+
+# Shared stubs so restore tests never touch real services or mysql.
+backup_restore_test_stubs() {
+    local order_file="$1"
+
+    backup_verify() { return 0; }
+    db_restore_credentials() { return 0; }
+    db_restore_probe() { return 0; }
+    backup_newest_backup_age_seconds() { echo 100; return 0; }
+    server_stop() { echo "stop" >> "$order_file"; }
+    server_start() { echo "start" >> "$order_file"; return 0; }
+    backup_restore_full() { echo "restore" >> "$order_file"; return 0; }
+    backup_now() { echo "backup" >> "$order_file"; return 0; }
+    service_active() { return 0; }
+    db_check_connection() { return 0; }
+}
+
+backup_restore_test_cleanup() {
+    unset -f backup_verify db_restore_credentials db_restore_probe server_stop server_start
+    unset -f backup_restore_full backup_now service_active db_check_connection
+    unset -f backup_newest_backup_age_seconds
+    unset PREFLIGHT_NAMES PREFLIGHT_LABELS PREFLIGHT_OK PREFLIGHT_NOTES
+    unset MYSQL_RESTORE_DEFAULTS_FILE MYSQL_RESTORE_PASSWORD
+}
+
+test_backup_restore_preflight_blocks_before_stop() {
+    # shellcheck source=../lib/backup.sh
+    source "$LIB_DIR/backup.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir order_file
+    temp_dir=$(mktemp -d)
+    order_file="$temp_dir/order"
+    backup_restore_test_fixture "$temp_dir"
+    backup_restore_test_stubs "$order_file"
+
+    # Break only the credentials check: preflight must fail and no service
+    # may be touched in either preflight or live mode.
+    db_restore_credentials() { log_error "no creds"; return 1; }
+
+    BACKUP_CONFIG_LOADED=1
+    SERVER_CONFIG_LOADED=1
+    BACKUP_DATABASES=("auth" "characters")
+    BACKUP_DIR="$temp_dir"
+    unset MYSQL_RESTORE_DEFAULTS_FILE MYSQL_RESTORE_PASSWORD
+
+    if backup_restore "$temp_dir/test.sql.gz" preflight text >/dev/null 2>&1; then
+        echo -e "${RED}✗${NC} preflight passed with missing credentials"
+        all_passed=1
+    else
+        echo -e "${GREEN}✓${NC} preflight fails with missing credentials"
+    fi
+
+    # Live mode with a failing preflight exits (real error_exit) inside a
+    # subshell; the order file proves nothing was stopped or restored.
+    (
+        backup_restore "$temp_dir/test.sql.gz" live text false false >/dev/null 2>&1
+    )
+    if [[ -f "$order_file" ]]; then
+        echo -e "${RED}✗${NC} live restore touched services despite failed preflight"
+        all_passed=1
+    else
+        echo -e "${GREEN}✓${NC} live restore with failed preflight stops nothing"
+    fi
+
+    backup_restore_test_cleanup
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_backup_restore_requires_yes_for_non_interactive() {
+    # shellcheck source=../lib/backup.sh
+    source "$LIB_DIR/backup.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir order_file
+    temp_dir=$(mktemp -d)
+    order_file="$temp_dir/order"
+    backup_restore_test_fixture "$temp_dir"
+    backup_restore_test_stubs "$order_file"
+
+    BACKUP_CONFIG_LOADED=1
+    SERVER_CONFIG_LOADED=1
+    BACKUP_DATABASES=("auth" "characters")
+    BACKUP_DIR="$temp_dir"
+
+    # Tests run without a tty: the typed prompt must refuse instead of
+    # hanging, and the legacy FORCE_RESTORE env must no longer bypass it.
+    if backup_restore "$temp_dir/test.sql.gz" live text false false >/dev/null 2>&1; then
+        echo -e "${RED}✗${NC} live restore ran without --yes in non-interactive mode"
+        all_passed=1
+    else
+        echo -e "${GREEN}✓${NC} live restore refuses non-interactive mode without --yes"
+    fi
+
+    (
+        export FORCE_RESTORE=1
+        backup_restore "$temp_dir/test.sql.gz" live text false false >/dev/null 2>&1
+    )
+    if [[ -f "$order_file" ]]; then
+        echo -e "${RED}✗${NC} FORCE_RESTORE env still bypasses confirmation"
+        all_passed=1
+    else
+        echo -e "${GREEN}✓${NC} FORCE_RESTORE env no longer bypasses confirmation"
+    fi
+
+    backup_restore_test_cleanup
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_backup_restore_yes_full_flow_order() {
+    # shellcheck source=../lib/backup.sh
+    source "$LIB_DIR/backup.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir order_file output
+    temp_dir=$(mktemp -d)
+    order_file="$temp_dir/order"
+    backup_restore_test_fixture "$temp_dir"
+    backup_restore_test_stubs "$order_file"
+
+    BACKUP_CONFIG_LOADED=1
+    SERVER_CONFIG_LOADED=1
+    BACKUP_DATABASES=("auth" "characters")
+    BACKUP_DIR="$temp_dir"
+
+    output=$(backup_restore "$temp_dir/test.sql.gz" live text true false 2>/dev/null)
+    assert_equals "stop
+restore
+start" "$(cat "$order_file")" "restore runs stop -> restore -> start" || all_passed=1
+
+    local envelope
+    envelope=$(printf '%s\n' "$output" | tail -n 1)
+    if printf '%s' "$envelope" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["success"] is True
+assert data["data"]["restored_from"].endswith("test.sql.gz")
+assert data["data"]["pre_restore_backup"] == "skipped"
+' 2>/dev/null; then
+        echo -e "${GREEN}✓${NC} restore success emits a JSON envelope with pre_restore_backup=skipped"
+    else
+        echo -e "${RED}✗${NC} restore success JSON envelope malformed"
+        all_passed=1
+    fi
+
+    backup_restore_test_cleanup
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_backup_restore_backup_first_snapshots_before_stop() {
+    # shellcheck source=../lib/backup.sh
+    source "$LIB_DIR/backup.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir order_file output envelope
+    temp_dir=$(mktemp -d)
+    order_file="$temp_dir/order"
+    backup_restore_test_fixture "$temp_dir"
+    backup_restore_test_stubs "$order_file"
+
+    BACKUP_CONFIG_LOADED=1
+    SERVER_CONFIG_LOADED=1
+    BACKUP_DATABASES=("auth" "characters")
+    BACKUP_DIR="$temp_dir"
+
+    output=$(backup_restore "$temp_dir/test.sql.gz" live text true true 2>/dev/null)
+    assert_equals "backup
+stop
+restore
+start" "$(cat "$order_file")" "--backup-first snapshots before services stop" || all_passed=1
+
+    envelope=$(printf '%s\n' "$output" | tail -n 1)
+    if printf '%s' "$envelope" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["data"]["pre_restore_backup"] == "created"
+' 2>/dev/null; then
+        echo -e "${GREEN}✓${NC} success envelope records pre_restore_backup=created"
+    else
+        echo -e "${RED}✗${NC} success envelope lost the pre-restore backup state"
+        all_passed=1
+    fi
+
+    backup_restore_test_cleanup
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_backup_restore_safety_backup_gate() {
+    # shellcheck source=../lib/backup.sh
+    source "$LIB_DIR/backup.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    backup_restore_test_fixture "$temp_dir"
+
+    backup_verify() { return 0; }
+    db_restore_credentials() { return 0; }
+    db_restore_probe() { return 0; }
+    backup_newest_backup_age_seconds() {
+        [[ -n "${TEST_SAFETY_AGE:-}" ]] && echo "$TEST_SAFETY_AGE"
+        return 0
+    }
+
+    BACKUP_CONFIG_LOADED=1
+    SERVER_CONFIG_LOADED=1
+    BACKUP_DATABASES=("auth" "characters")
+    BACKUP_DIR="$temp_dir"
+
+    TEST_SAFETY_AGE=""
+    if backup_restore_preflight "$temp_dir/test.sql.gz" false; then
+        echo -e "${RED}✗${NC} safety gate passed with no existing backups"
+        all_passed=1
+    else
+        echo -e "${GREEN}✓${NC} safety gate fails with no existing backups"
+    fi
+
+    TEST_SAFETY_AGE=90000
+    if backup_restore_preflight "$temp_dir/test.sql.gz" false; then
+        echo -e "${RED}✗${NC} safety gate passed with a stale backup"
+        all_passed=1
+    else
+        echo -e "${GREEN}✓${NC} safety gate fails with a stale backup"
+    fi
+
+    TEST_SAFETY_AGE=100
+    if backup_restore_preflight "$temp_dir/test.sql.gz" false; then
+        echo -e "${GREEN}✓${NC} safety gate passes with a fresh backup"
+    else
+        echo -e "${RED}✗${NC} safety gate failed with a fresh backup"
+        all_passed=1
+    fi
+
+    TEST_SAFETY_AGE=""
+    if backup_restore_preflight "$temp_dir/test.sql.gz" true; then
+        echo -e "${GREEN}✓${NC} safety gate passes via --backup-first without existing backups"
+    else
+        echo -e "${RED}✗${NC} safety gate failed despite --backup-first"
+        all_passed=1
+    fi
+
+    backup_restore_test_cleanup
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_backup_restore_dry_run_json_envelope() {
+    # shellcheck source=../lib/backup.sh
+    source "$LIB_DIR/backup.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir output
+    temp_dir=$(mktemp -d)
+    backup_restore_test_fixture "$temp_dir"
+
+    BACKUP_CONFIG_LOADED=1
+    SERVER_CONFIG_LOADED=1
+    BACKUP_DATABASES=("auth" "characters")
+    BACKUP_DIR="$temp_dir"
+    unset MYSQL_RESTORE_DEFAULTS_FILE MYSQL_RESTORE_PASSWORD
+
+    output=$(backup_restore "$temp_dir/test.sql.gz" dry-run json 2>/dev/null)
+    if printf '%s' "$output" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["success"] is True
+plan = data["data"]
+assert plan["mode"] == "dry-run"
+assert plan["credentials_ready"] is False
+assert plan["safety_backup_age_seconds"] is None
+assert "auth" in plan["databases"] and "characters" in plan["databases"]
+assert len(plan["steps"]) == 5
+' 2>/dev/null; then
+        echo -e "${GREEN}✓${NC} dry-run --format json emits a parseable plan envelope"
+    else
+        echo -e "${RED}✗${NC} dry-run --format json envelope malformed"
+        all_passed=1
+    fi
+
+    backup_restore_test_cleanup
+    rm -rf "$temp_dir"
+    return $all_passed
+}
+
+test_backup_restore_preflight_json_envelope() {
+    # shellcheck source=../lib/backup.sh
+    source "$LIB_DIR/backup.sh"
+    SKIP_ROOT_INIT=1
+
+    local all_passed=0
+    local temp_dir output rc
+    temp_dir=$(mktemp -d)
+    backup_restore_test_fixture "$temp_dir"
+
+    backup_verify() { return 0; }
+    db_restore_credentials() { return 0; }
+    db_restore_probe() { return 1; }
+    backup_newest_backup_age_seconds() { echo 100; return 0; }
+
+    BACKUP_CONFIG_LOADED=1
+    SERVER_CONFIG_LOADED=1
+    BACKUP_DATABASES=("auth" "characters")
+    BACKUP_DIR="$temp_dir"
+
+    output=$(backup_restore "$temp_dir/test.sql.gz" preflight json 2>/dev/null)
+    rc=$?
+    if [[ "$rc" -ne 1 ]]; then
+        echo -e "${RED}✗${NC} preflight json should exit 1 when not ready (got $rc)"
+        all_passed=1
+    else
+        echo -e "${GREEN}✓${NC} preflight json exits 1 when not ready"
+    fi
+
+    if printf '%s' "$output" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data["success"] is True
+assert data["data"]["ready"] is False
+checks = {c["name"]: c["ok"] for c in data["data"]["checks"]}
+assert checks["backup_integrity"] is True
+assert checks["auth_probe"] is False
+assert checks["safety_backup"] is True
+' 2>/dev/null; then
+        echo -e "${GREEN}✓${NC} preflight json reports per-check results"
+    else
+        echo -e "${RED}✗${NC} preflight json envelope malformed"
+        all_passed=1
+    fi
+
+    backup_restore_test_cleanup
+    rm -rf "$temp_dir"
     return $all_passed
 }
 
@@ -5312,6 +5666,13 @@ main() {
     run_test "Backup: Verify loads config for Level 2" test_backup_verify_loads_config_for_level2
     run_test "Backup: Restore dry-run non-mutating" test_backup_restore_dry_run_non_mutating
     run_test "Backup: Restore requires explicit creds" test_backup_restore_requires_explicit_credentials
+    run_test "Backup: Restore preflight blocks before stop" test_backup_restore_preflight_blocks_before_stop
+    run_test "Backup: Restore requires --yes when non-interactive" test_backup_restore_requires_yes_for_non_interactive
+    run_test "Backup: Restore --yes full flow order" test_backup_restore_yes_full_flow_order
+    run_test "Backup: Restore --backup-first snapshots before stop" test_backup_restore_backup_first_snapshots_before_stop
+    run_test "Backup: Restore safety backup gate" test_backup_restore_safety_backup_gate
+    run_test "Backup: Restore dry-run JSON envelope" test_backup_restore_dry_run_json_envelope
+    run_test "Backup: Restore preflight JSON envelope" test_backup_restore_preflight_json_envelope
     run_test "Backup: Metadata failure preserves dump" test_backup_now_metadata_failure_preserves_dump
     run_test "Backup: List tolerates legacy metadata" test_backup_list_tolerates_legacy_metadata
     run_test "Backup: Metadata carries real commit" test_backup_metadata_carries_real_commit

@@ -104,7 +104,7 @@ sudo /opt/mangos/manager/bin/vmangos-manager dashboard --refresh 2
 | `1` | **Overview** | Quick health check: services, CPU, memory, players, alerts |
 | `2` | **Monitor** | Deep-dive host pressure: trends, disk I/O, process footprint |
 | `3` | **Accounts** | Create accounts, reset passwords, set GM level, ban/unban |
-| `4` | **Backups** | Check archive inventory, verify integrity, dry-run restores |
+| `4` | **Backups** | Check archive inventory, verify integrity, dry-run and preflight restores |
 | `5` | **Config** | Validate how Manager reads your install paths and DB wiring |
 | `6` | **Logs** | Investigate recent `auth`/`world` events with filters |
 | `7` | **Operations** | Schedule maintenance, review queued tasks, plan updates |
@@ -173,14 +173,16 @@ Backups are only useful if you can verify them. This view shows:
 - Complete backup inventory with timestamps and sizes
 - One-press verify for the selected archive
 - Restore dry-run to preview recovery steps
+- Restore readiness at a glance: whether this session holds privileged restore credentials, and whether the current databases have a backup inside the 24-hour safety window
 - Daily and weekly timer creation
 
 **Habit before risky work:**
 1. Press `b` to create a backup now
 2. Press `v` to verify it
 3. Press `d` to dry-run a restore
+4. Press `p` to run the full restore preflight (integrity, credentials, auth probe, safety backup)
 
-> **Note:** Live restore execution, cleanup policies, and timer removal are still handled in the CLI.
+> **Note:** Live restore execution, cleanup policies, and timer removal are handled in the CLI. See [Recovery Runbook](#-recovery-runbook) for the guarded workflow.
 
 ---
 
@@ -328,7 +330,7 @@ Use the dashboard for day-to-day operation. Drop to the CLI for scripting, raw J
 | **Server** | Summary status, start/stop/restart | Watch mode, raw JSON |
 | **Monitor** | Trends, process footprint, disk I/O | Ad hoc host tooling |
 | **Accounts** | Inventory, create, password reset, GM, ban/unban | Scripted bulk workflows |
-| **Backups** | Inventory, create, verify, dry-run, timer visibility | Cleanup, timer removal, live restore |
+| **Backups** | Inventory, create, verify, dry-run, preflight, readiness, timer visibility | Cleanup, timer removal, live restore |
 | **Config** | Read-only wiring validation | Detect, create, show, file editing |
 | **Logs** | Filtered investigation, live refresh | Raw JSON, watch mode, shell pipelines |
 | **Operations** | Maintenance readiness, task queue, planning | Update apply, source-tree work |
@@ -357,6 +359,61 @@ sudo /opt/mangos/manager/bin/vmangos-manager update apply --backup-first --inclu
 > - `update apply` is **non-atomic** and does not promise rollback.
 > - It **rejects dirty or divergent** source trees.
 > - It **fails closed** on unsupported SQL changes outside `sql/migrations`.
+
+---
+
+## 🚑 Recovery Runbook
+
+Live restore is a CLI-only, deliberately high-friction workflow. Nothing destructive runs until every preflight check passes **and** you confirm. Budget a maintenance window; users will be disconnected.
+
+### Preconditions
+
+1. **A verified backup** — the archive you intend to restore (`backup verify <file>` passes).
+2. **Privileged DB credentials** — restore never uses the limited manager DB user. In the recovery shell export:
+   ```bash
+   export MYSQL_RESTORE_PASSWORD='root-password'     # or point at a mode-600 defaults file:
+   # export MYSQL_RESTORE_DEFAULTS_FILE=/root/.mysql-restore.cnf
+   ```
+3. **A fresh snapshot of current state** — restore refuses to overwrite the databases unless the newest backup is under 24 hours old, so you always have an undo point. No recent backup? `--backup-first` takes one for you.
+
+### Steps
+
+```bash
+# 1. Preview the plan (no checks with side effects, nothing changes)
+sudo /opt/mangos/manager/bin/vmangos-manager backup restore <file> --dry-run
+
+# 2. Run the full preflight: integrity, credentials, live auth probe, safety backup
+sudo /opt/mangos/manager/bin/vmangos-manager backup restore <file> --preflight
+
+# 3. Execute during the approved window.
+#    Interactive: you will be asked to type RESTORE.
+sudo /opt/mangos/manager/bin/vmangos-manager backup restore <file> --backup-first
+
+#    Scripted: --yes is the only non-interactive confirmation path
+sudo /opt/mangos/manager/bin/vmangos-manager backup restore <file> --yes --backup-first
+```
+
+### What the command does, in order
+
+1. Preflight (fail closed: credentials, auth probe, safety backup — **before** anything stops)
+2. Typed `RESTORE` confirmation (or `--yes`)
+3. Optional `--backup-first` snapshot of current databases
+4. Stop world, stop auth
+5. Import the dump with the privileged credentials
+6. Start auth and world, then verify both services are active and the DB answers
+
+### After the restore
+
+- The command itself validates services and DB connectivity and prints next steps.
+- Spot-check a known account or character in-game or via `account list`.
+- If anything looks wrong, the `--backup-first` archive of the *previous* state is your undo path — run this same runbook against it.
+
+### If it fails
+
+- `RESTORE_PARTIAL` — the import failed or services did not come back. Manager restarts services when it can; check `systemctl status` for the auth/world units and see [Troubleshooting](troubleshooting.md).
+- Preflight refusal — nothing was changed; fix the reported check and rerun.
+
+The dashboard's Backups view mirrors this contract read-only: **Restore Readiness** shows whether the session holds credentials and whether the safety window is satisfied, and `p` runs the same preflight against the selected backup.
 
 ---
 

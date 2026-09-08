@@ -59,6 +59,9 @@ COMMANDS:
       grant options: --user NAME [--group NAME] [--format text|json]  (run as root; grants NAME
                       read access to the config and write access to backups via a shared group)
     backup [now|list|verify|restore|clean|schedule] [OPTIONS]
+      restore options: <file> [--dry-run | --preflight] [--yes] [--backup-first] [--format text|json]
+                        dry-run: print the restore plan, no checks with side effects
+                        preflight: run all restore readiness checks (verify, credentials, auth probe)
       schedule options: [status] [--daily HH:MM | --weekly "Sun 04:00"] [--format text|json]
 EOF
 }
@@ -1253,9 +1256,17 @@ cmd_backup() {
         restore)
             local file=""
             local dry_run=false
+            local preflight=false
+            local assume_yes=false
+            local backup_first=false
+            local fmt="$OUTPUT_FORMAT"
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --dry-run) dry_run=true; shift ;;
+                    --preflight) preflight=true; shift ;;
+                    --yes) assume_yes=true; shift ;;
+                    --backup-first) backup_first=true; shift ;;
+                    --format) fmt="$2"; shift 2 ;;
                     --) shift; break ;;
                     -*) echo "Unknown option: $1"; exit 2 ;;
                     *)
@@ -1272,7 +1283,17 @@ cmd_backup() {
                 echo "Error: backup file required" >&2
                 exit 2
             fi
-            backup_restore "$file" "$dry_run"
+            if [[ "$dry_run" == true && "$preflight" == true ]]; then
+                echo "Error: --dry-run and --preflight are mutually exclusive" >&2
+                exit 2
+            fi
+            local mode="live"
+            if [[ "$dry_run" == true ]]; then
+                mode="dry-run"
+            elif [[ "$preflight" == true ]]; then
+                mode="preflight"
+            fi
+            backup_restore "$file" "$mode" "$fmt" "$assume_yes" "$backup_first"
             ;;
             
         clean)

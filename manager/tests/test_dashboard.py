@@ -11,6 +11,7 @@ Seams (agreed):
 import asyncio
 import json
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from textual.widgets import DataTable, Select
@@ -72,6 +73,39 @@ def write_snapshot_fixture(directory, accounts):
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(snapshot, handle)
     return path
+
+
+def add_backups_to_fixture(path, *, age_seconds=300, credentials_ready=False):
+    """Give a snapshot fixture one fresh backup so the Backups view fills in."""
+    with open(path, "r", encoding="utf-8") as handle:
+        snapshot = json.load(handle)
+    timestamp = (
+        datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    ).isoformat()
+    backup_file = "vmangos_backup_20260908_120000.sql.gz"
+    backup_dir = "/opt/mangos/backups"
+    snapshot["restore_credentials_ready"] = credentials_ready
+    snapshot["backups"] = {
+        "entries": [
+            {
+                "file": backup_file,
+                "timestamp": timestamp,
+                "size_bytes": 2048,
+                "created_by": "vmangos-manager 0.3.0",
+                "databases": ["auth", "characters"],
+            }
+        ],
+        "summary": {
+            "count": 1,
+            "backup_dir": backup_dir,
+            "latest_file": backup_file,
+            "latest_path": f"{backup_dir}/{backup_file}",
+            "latest_timestamp": timestamp,
+            "latest_size_bytes": 2048,
+        },
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle)
 
 
 def build_app(tmp_path, *, initial_view, accounts=None, snapshot_file="default", refresh=30):
@@ -446,6 +480,48 @@ def test_sidebar_click_switches_view(tmp_path):
             assert not app.query_one("#overview-view").has_class("hidden")
             assert app.query_one("#accounts-view").has_class("hidden")
             assert app.query_one("#sidebar-item-overview").has_class("active")
+
+    asyncio.run(scenario())
+
+
+def test_backups_view_shows_restore_readiness(tmp_path):
+    app, _log_path = build_app(tmp_path, initial_view="backups")
+    add_backups_to_fixture(os.path.join(tmp_path, "snapshot.json"), age_seconds=300, credentials_ready=False)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            table = app.query_one("#backups-table", DataTable)
+            await wait_for(lambda: table.row_count > 0, message="backups table to load")
+            await pilot.pause()
+            panel = str(app.query_one("#backup-summary").renderable)
+            assert "Restore Readiness" in panel
+            assert "not in this session" in panel, "missing credentials must carry env-var guidance"
+            assert "within 24h window" in panel, "a fresh backup must read as within the safety window"
+            assert "press p on a selected backup" in panel
+            assert "--preflight" in panel
+
+    asyncio.run(scenario())
+
+
+def test_backups_preflight_key_dispatches_selected_backup(tmp_path):
+    app, log_path = build_app(tmp_path, initial_view="backups")
+    add_backups_to_fixture(os.path.join(tmp_path, "snapshot.json"))
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            table = app.query_one("#backups-table", DataTable)
+            await wait_for(lambda: table.row_count > 0, message="backups table to load")
+            await pilot.press("down")  # highlight the backup row -> selection
+            await pilot.press("p")
+            await wait_for(
+                lambda: any(
+                    "backup restore /opt/mangos/backups/vmangos_backup_20260908_120000.sql.gz --preflight" in line
+                    for line in recorded_commands(log_path)
+                ),
+                message="preflight to be dispatched for the selected backup",
+            )
+            await asyncio.sleep(0.4)
+            await pilot.pause()
 
     asyncio.run(scenario())
 

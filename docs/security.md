@@ -47,6 +47,20 @@ Manager account management operates directly against the VMANGOS auth schema. Th
 
 ---
 
+## 🔐 Privileged Restore Credentials
+
+Live restore drops and re-imports every database, so it needs more power than the manager DB user has — and it is designed so that power is never ambient:
+
+- **Env-only, never in the config** — restore credentials are supplied per-run via `MYSQL_RESTORE_DEFAULTS_FILE` (must be mode `600`) or `MYSQL_RESTORE_PASSWORD`, with `MYSQL_RESTORE_USER` defaulting to `root`. They cannot be persisted in `manager.conf`, so a limited user cannot self-provision restore rights.
+- **Checked before anything stops** — preflight validates presence, file permissions, and live authentication before a single service is touched.
+- **Never on a command line** — passwords travel via `MYSQL_PWD` or the defaults file, never as arguments (visible in `ps`).
+- **Explicit confirmation only** — interactive runs require typing `RESTORE`; scripted runs require `--yes`. The undocumented `FORCE_RESTORE` env bypass has been removed.
+- **Undo path enforced** — restore refuses to overwrite databases without a backup of the current state newer than 24 hours, or an explicit `--backup-first`.
+
+See the [Recovery Runbook](user-guide.md#-recovery-runbook) for the operator workflow.
+
+---
+
 ## 🔄 Update Model
 
 Manager's update workflow is intentionally non-atomic. The recommended process is:
