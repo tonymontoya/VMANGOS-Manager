@@ -1671,7 +1671,7 @@ phase_data_extraction() {
     log_info "Starting MoveMapGen at $(date '+%H:%M:%S')..."
     log_info "====================================================================="
     
-    local MMAPS_FAILED=0
+    local MMAPS_MISSING=0
 
     # VMANGOS_SKIP_MMAPS=1 skips the hours-long mmaps generation entirely
     # (a test seam for the install smoke; a normal install leaves it unset):
@@ -1680,7 +1680,7 @@ phase_data_extraction() {
     if [ "${VMANGOS_SKIP_MMAPS:-0}" = "1" ]; then
         log_info "Skipping movement map generation (VMANGOS_SKIP_MMAPS=1)"
         warn_marker extraction "mmaps skipped by request (VMANGOS_SKIP_MMAPS=1) - the server will run without NPC pathfinding"
-        MMAPS_FAILED=1
+        MMAPS_MISSING=1
     elif [ $EXTRACTION_FAILED -eq 0 ] && [ $VMAPS_FAILED -eq 0 ] && [ -f ./MoveMapGen ]; then
         # Run with a background progress heartbeat
         {
@@ -1706,12 +1706,12 @@ phase_data_extraction() {
         else
             log_warn "MoveMapGen exited with status $MOVEMAP_RC at $(date '+%H:%M:%S')"
             log_warn "Server will run without mmaps (NPC pathfinding disabled)"
-            MMAPS_FAILED=1
+            MMAPS_MISSING=1
         fi
         log_info "====================================================================="
     else
         log_warn "Skipping movement map generation (previous step failed, vmaps missing or generator not found)"
-        MMAPS_FAILED=1
+        MMAPS_MISSING=1
     fi
     
     log_info ""
@@ -1738,12 +1738,12 @@ phase_data_extraction() {
         fail_marker extraction "Data extraction failed" "Verify the client data is WoW 1.12.1 (build 5875) and complete, then re-run the installer to resume from this phase"
         return 1
     else
-        if [ $VMAPS_FAILED -eq 1 ] || [ $MMAPS_FAILED -eq 1 ]; then
+        if [ $VMAPS_FAILED -eq 1 ] || [ $MMAPS_MISSING -eq 1 ]; then
             log_warn "Extraction completed with gaps:"
             if [ $VMAPS_FAILED -eq 1 ]; then
                 log_warn "  - vmaps missing: line-of-sight is disabled in mangosd.conf"
             fi
-            if [ $MMAPS_FAILED -eq 1 ]; then
+            if [ $MMAPS_MISSING -eq 1 ]; then
                 log_warn "  - mmaps missing: NPC pathfinding will be limited"
             fi
             log_info "You can re-run the missing steps manually (see commands above)."

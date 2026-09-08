@@ -48,10 +48,18 @@ else
 fi
 
 if (( REMOVE_SNAPSHOTS )); then
-    log "removing snapshot images (vmangos-smoke-snap-*)"
-    docker images --format '{{.Repository}}:{{.Tag}}' \
-        | grep -E '^vmangos-smoke-snap-[a-z-]+$' \
-        | xargs -r docker rmi >/dev/null 2>&1 || true
+    # Match on the repository (docker images also appends :TAG, which the
+    # pattern deliberately excludes — the snap family is only ever latest).
+    mapfile -t SNAP_IMAGES < <(
+        docker images --format '{{.Repository}}' \
+            | grep -E '^vmangos-smoke-snap-[a-z-]+$' || true
+    )
+    if (( ${#SNAP_IMAGES[@]} > 0 )); then
+        log "removing snapshot images: ${SNAP_IMAGES[*]}"
+        docker rmi "${SNAP_IMAGES[@]}" >/dev/null 2>&1 || true
+    else
+        log "no snapshot images (vmangos-smoke-snap-*) present"
+    fi
 else
     log "keeping snapshot images (vmangos-smoke-snap-*); remove with --snapshots"
 fi

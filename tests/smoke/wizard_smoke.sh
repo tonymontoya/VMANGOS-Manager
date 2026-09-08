@@ -313,7 +313,7 @@ phase_setup() {
         local cp
         cp="$(checkpoint_read)"
         [[ -n "$cp" ]] \
-            || fail "setup: $FROM_SNAPSHOT has no install checkpoint (committed before any phase finished?)"
+            || fail "setup: $FROM_SNAPSHOT has no install checkpoint (committed before any phase finished? re-create it: --phase snapshot waits for a checkpoint first)"
         docker_exec "test -f '$SECRETS_FILE'" >/dev/null 2>&1 \
             || fail "setup: $FROM_SNAPSHOT has no secrets file at $SECRETS_FILE"
         log "setup: snapshot state OK — checkpoint=$cp, secrets present"
@@ -665,11 +665,11 @@ phase_completion() {
         start_cp="$(tr -d '[:space:]' < "$EVIDENCE_DIR/install-start-checkpoint")"
     fi
     start_rank="$(checkpoint_rank "$start_cp")"
-    if (( start_rank >= 0 && start_rank < 6 )); then
+    if (( start_rank >= 0 && start_rank < $(checkpoint_rank DATA_DONE) )); then
         skip_markers="$(journal_count 'mmaps skipped by request')"
         if (( SKIP_MMAPS_VALUE )); then
             [[ "$skip_markers" -ge 1 ]] \
-                || fail "completion: no mmaps skip marker — VMANGOS_SKIP_MMAPS never reached the install (the runner seam is broken; a silent full extraction costs ~4h)"
+                || fail "completion: no mmaps skip marker — VMANGOS_SKIP_MMAPS never reached the install (the runner seam is broken; a silent full extraction costs ~4h; inspect with: docker exec $CONTAINER_NAME systemctl show vmangos-install -p Environment)"
             log "mmaps skipped by request, as configured ($skip_markers marker(s))"
         else
             [[ "$skip_markers" -eq 0 ]] \
@@ -799,7 +799,7 @@ phase_snapshot() {
         # (fail fast: a dead install never advances).
         if [[ -z "$cp" ]] && ! unit_running \
             && (( $(journal_count 'phase=install event=done') > 0 )); then
-            fail "snapshot: the install already completed (checkpoints cleared) — a finished container cannot be snapshotted"
+            fail "snapshot: the install already completed (checkpoints cleared) — a finished container cannot be snapshotted (re-run from build-image/setup and snapshot while it is in progress)"
         fi
         log "snapshot: waiting for checkpoint $after (currently: ${cp:-not started}, unit $(unit_state))..."
         local deadline=$(( $(date +%s) + TIMEOUT_INSTALL ))
@@ -910,7 +910,9 @@ phase_teardown() {
 # ---------------------------------------------------------------------------
 
 usage() {
-    sed -n '2,59p' "$0" | sed 's/^# \{0,1\}//'
+    # Header = every leading comment line after the shebang; stops at the
+    # first non-comment line, so header edits never need a range bump.
+    awk 'NR > 1 { if (! /^#/) exit; sub(/^# ?/, ""); print }' "$0"
     exit "${1:-0}"
 }
 
