@@ -4,6 +4,54 @@ If you are still getting oriented, read the [User Guide](user-guide.md) first. T
 
 ---
 
+## 🧙 Install Wizard
+
+### Where everything lives
+
+| Artifact | Location |
+|---|---|
+| Install journal (live) | `journalctl -u vmangos-install` (add `-f` to follow) |
+| Install log (file) | `/var/log/vmangos-install.log` |
+| Secrets file | `/root/.vmangos-secrets/setup.conf` (mode `600`, root only) |
+| Phase checkpoints | `<install-root>/.install-checkpoints/` |
+
+### The install died and the screen says "Install Failed"
+
+The Failure screen names the phase that died, the error message, and a hint that names the fix. **Retry** re-launches the install from the last completed phase checkpoint — finished phases are skipped, so a retry after a long build does not rebuild from zero. The journal for the failed attempt is preserved:
+
+```bash
+sudo journalctl -u vmangos-install --no-pager | less
+```
+
+If Retry is not enough, fix what the hint named and re-run `sudo vmangos-manager install` — the same resume-from-checkpoint logic applies.
+
+### The screen says "Install Unit Ended" (not success, not failure)
+
+The install unit exited without the completion marker — most likely an interrupted run (reboot, manual stop) or an older script. Nothing is claimed to be working. Verify where it stopped from the journal, then re-run `sudo vmangos-manager install` to resume from the last checkpoint:
+
+```bash
+sudo journalctl -u vmangos-install --no-pager | tail -50
+```
+
+### I closed the TUI — is the install still running?
+
+Yes, unless you chose Retry/stop from the Failure screen. The install runs as its own transient systemd unit, not as a child of your terminal. Check it and re-attach:
+
+```bash
+systemctl status vmangos-install
+sudo vmangos-manager install   # re-attaches the live viewer
+```
+
+### The wizard cannot find `vmangos_setup.sh`
+
+The wizard resolves the setup script one directory above the manager's own location (the layout of a repo checkout). Running `./manager/bin/vmangos-manager install` from a checkout always works; a manager installed to a custom prefix needs `vmangos_setup.sh` beside that prefix's parent — link it there:
+
+```bash
+sudo ln -sfn /path/to/VMaNGOS-Manager/vmangos_setup.sh /opt/mangos/vmangos_setup.sh
+```
+
+---
+
 ## ⚙️ Config
 
 ### `Configuration file not found`

@@ -76,6 +76,46 @@ log_section() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ==========================================" | tee -a "$INSTALL_LOG"
 }
 
+# =============================================================================
+# STRUCTURED PROGRESS MARKERS (protocol "@@VMANGOS v1")
+#
+# Markers are stdout-only: the journal (systemd-run) is the marker channel,
+# never the install log. One marker per line; values containing spaces are
+# double-quoted. Parsers grep for the literal prefix "@@VMANGOS v1".
+# =============================================================================
+
+log_marker() {
+    local phase="$1" event="$2"
+    shift 2
+    local out="@@VMANGOS v1 phase=${phase} event=${event}"
+    local kv key value
+    for kv in "$@"; do
+        key="${kv%%=*}"
+        value="${kv#*=}"
+        if [[ "$value" == *' '* || "$value" == *'"'* ]]; then
+            value="${value//\"/\\\"}"
+            value="\"${value}\""
+        fi
+        out="${out} ${key}=${value}"
+    done
+    printf '%s\n' "$out"
+}
+
+# fail_marker <phase> <msg> <hint>: the guarded-failure shape shared by every
+# phase death path. Always returns non-zero so `cmd || { fail_marker ...;
+# return 1; }` fails the phase even when errexit is suppressed (tests rely on
+# that). warn_marker <phase> <msg>: something failed but the install continues;
+# always returns zero so the guarded command's failure stays swallowed.
+fail_marker() {
+    log_marker "$1" error "msg=$2" "hint=$3"
+    return 1
+}
+
+warn_marker() {
+    log_marker "$1" warn "msg=$2"
+    return 0
+}
+
 refresh_runtime_paths() {
     CHECKPOINT_DIR="${INSTALLROOT}/.install-checkpoints"
     CHECKPOINT_FILE="${CHECKPOINT_DIR}/checkpoint"
@@ -669,6 +709,96 @@ ensure_service_account() {
     useradd --system --home-dir "$INSTALLROOT" --no-create-home --shell /usr/sbin/nologin "$MANGOSOSUSER"
 }
 
+# ---------------------------------------------------------------------------
+# Database server provisioning
+#
+# The installer assumes a fresh host with no SQL server and installs one
+# (mysql-server, which also provides the mysql client). A server that is
+# already running is adopted only when the installer can actually administer
+# it (root via the local socket) — every later statement in the database
+# phase runs through that exact connection, so adopting a server it cannot
+# reach would fail later at grant time with a misleading error. Each failure
+# path emits its own error marker (the viewer's Retry screen shows it).
+# ---------------------------------------------------------------------------
+
+# A usable server = the mysql client can connect as a privileged user (root
+# via the local socket). This is exactly what phase_database_setup needs.
+db_server_reachable() {
+    command -v mysql >/dev/null 2>&1 || return 1
+    mysql -e "SELECT 1" >/dev/null 2>&1
+}
+
+# A DB server is up at all, independent of whether the mysql client is present.
+db_server_running() {
+    systemctl is-active --quiet mysql 2>/dev/null && return 0
+    systemctl is-active --quiet mariadb 2>/dev/null && return 0
+    return 1
+}
+
+# Wait (bounded) until the server accepts privileged connections.
+wait_for_db_server() {
+    local deadline=$(( $(date +%s) + 90 ))
+    while (( $(date +%s) < deadline )); do
+        if db_server_reachable; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+ensure_database_server() {
+    # 1. Already running and reachable → use it.
+    if db_server_reachable; then
+        log_info "Using existing MySQL/MariaDB server (already reachable)"
+        return 0
+    fi
+
+    # 2. A server is already running → adopt it, without installing a second,
+    #    conflicting one. Install the client when it is missing; then require
+    #    reachability — refusing an unusable server here names the exact
+    #    broken thing instead of failing later inside the SQL statements.
+    if db_server_running; then
+        if ! command -v mysql >/dev/null 2>&1; then
+            log_info "A database server is running but no mysql client is present; installing mysql-client"
+            DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none \
+                apt-get install -y mysql-client || {
+                log_marker database error "msg=Failed to install the mysql client for the running database server" "hint=Check the apt output in the install log, then re-run the installer"
+                return 1
+            }
+        fi
+        if db_server_reachable; then
+            log_info "Using existing MySQL/MariaDB server (client installed)"
+            return 0
+        fi
+        log_error "A database server is running but this installer cannot administer it"
+        log_error "The database phase needs this to work as root: mysql -e \"SELECT 1\""
+        log_marker database error "msg=A database server is running but root cannot connect to it" "hint=Fix root access to the running MySQL/MariaDB server (mysql -e \"SELECT 1\" must work as root), or stop that server so this installer can provision its own, then re-run the installer"
+        return 1
+    fi
+
+    # 3. No server running → install one (server + client), then start it.
+    log_info "No MySQL/MariaDB server detected; installing mysql-server"
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none \
+        apt-get install -y mysql-server || {
+        log_marker database error "msg=Failed to install mysql-server" "hint=Check the apt output in the install log for the failing package, then re-run the installer"
+        return 1
+    }
+    systemctl enable mysql >/dev/null 2>&1 || true
+    systemctl start mysql || {
+        log_error "Failed to start the mysql server after install"
+        log_marker database error "msg=The installed mysql server failed to start" "hint=Check journalctl -u mysql for the startup error, then re-run the installer"
+        return 1
+    }
+    if wait_for_db_server; then
+        log_info "mysql-server installed, started, and reachable"
+        return 0
+    fi
+    log_error "mysql-server installed and started but did not become reachable"
+    log_marker database error "msg=The installed mysql server never became reachable" "hint=Check journalctl -u mysql and the install log, then re-run the installer"
+    return 1
+}
+
 check_client_data() {
     if [ -z "$CLIENT_DATA" ]; then
         # Try to auto-detect
@@ -718,63 +848,148 @@ check_client_data() {
     prepare_extraction_root
 }
 
+# True when $MANGOSOSUSER can read the given path (the extractors run as the
+# service user, so every client-data probe goes through sudo).
+data_readable() {
+    sudo -u "$MANGOSOSUSER" test -r "$1" 2>/dev/null
+}
+
 # Derive CLIENT_DATA_EXTRACT_ROOT from CLIENT_DATA so the extractors can read
 # the MPQs as $MANGOSOSUSER. Called from check_client_data on fresh installs
 # and on demand from phase_data_extraction, because a resumed install re-enters
 # the extraction phase without re-running the earlier phases.
+#
+# The mapextractor resolves every archive through a "Data/" entry: it opens
+# "<root>/Data/<file>.MPQ". A bare top-level MPQ directory therefore needs a
+# "Data -> ." self-symlink — the layout a working install (e.g. the bds realm)
+# ships. This function guarantees that layout is readable by $MANGOSOSUSER,
+# cheapest first:
+#   1. CLIENT_DATA already exposes Data/ and mangos can read through it.
+#   2. CLIENT_DATA is writable: add the "Data -> ." self-symlink in place.
+#   3. CLIENT_DATA is read-only (e.g. a :ro mount): stage a symlink farm in
+#      $INSTALLROOT/client-data instead of copying several GB.
+#   4. mangos cannot read CLIENT_DATA at all: reuse a valid staged root, or
+#      full copy (last resort).
 prepare_extraction_root() {
-    # The extractor expects {path}/Data/ structure
-    # If user provided the Data folder directly, create a Data/Data symlink
-    CLIENT_DATA_EXTRACT_ROOT="$CLIENT_DATA"
-    if [ -f "$CLIENT_DATA/dbc.MPQ" ] && [ -f "$CLIENT_DATA/terrain.MPQ" ]; then
-        # User provided the Data folder directly
-        # Create a symlink Data/Data pointing to itself for extractor compatibility
-        if [ ! -e "$CLIENT_DATA/Data" ]; then
-            log_info "Creating Data/Data symlink for extractor compatibility..."
-            ln -sf . "$CLIENT_DATA/Data" 2>/dev/null || true
-        fi
-    fi
-
-    # Check if mangos user can read the client data
-    # Extraction runs as mangos user for security, so we need readable permissions
-    if sudo -u "$MANGOSOSUSER" test -r "$CLIENT_DATA_EXTRACT_ROOT/dbc.MPQ" 2>/dev/null; then
+    # 1. Data/ already resolvable and readable by mangos.
+    if data_readable "$CLIENT_DATA/Data/dbc.MPQ"; then
+        CLIENT_DATA_EXTRACT_ROOT="$CLIENT_DATA"
+        log_info "Using client data (Data/ resolvable): $CLIENT_DATA"
         return 0
     fi
 
-    # Reuse a copy staged by an earlier (interrupted) run instead of
-    # re-copying several GB of MPQs on every resume.
-    if [ -f "$INSTALLROOT/client-data/dbc.MPQ" ] && \
-        sudo -u "$MANGOSOSUSER" test -r "$INSTALLROOT/client-data/dbc.MPQ" 2>/dev/null; then
+    if data_readable "$CLIENT_DATA/dbc.MPQ"; then
+        # MPQs at the top level. Prefer adding the self-symlink in place...
+        if [ -w "$CLIENT_DATA" ] && [ ! -e "$CLIENT_DATA/Data" ]; then
+            log_info "Creating Data/ self-symlink for extractor compatibility..."
+            ln -sfn . "$CLIENT_DATA/Data" 2>/dev/null || true
+        fi
+        if data_readable "$CLIENT_DATA/Data/dbc.MPQ"; then
+            CLIENT_DATA_EXTRACT_ROOT="$CLIENT_DATA"
+            log_info "Using client data (Data/ symlinked): $CLIENT_DATA"
+            return 0
+        fi
+        # ...but a read-only mount cannot hold the symlink: stage a farm.
+        if stage_client_data_symlink_farm; then
+            return 0
+        fi
+    fi
+
+    # 4a. The client data is unreadable by mangos, but a root staged by an
+    #     earlier run is still valid (repaired in place when it only lacks
+    #     its Data/ entry) — reuse it instead of re-copying.
+    if repair_staged_root; then
         CLIENT_DATA_EXTRACT_ROOT="$INSTALLROOT/client-data"
         log_info "Using previously staged client data: $CLIENT_DATA_EXTRACT_ROOT"
         return 0
     fi
 
+    # 4b. Last resort: copy the client data.
     log_warn "Client data is not accessible by $MANGOSOSUSER user"
     log_info "Copying client data to $INSTALLROOT/client-data for extraction..."
 
-    # Create temp location and copy data
-    mkdir -p "$INSTALLROOT/client-data"
-
-    # Copy all MPQ files and required directories
-    cp -r "$CLIENT_DATA_EXTRACT_ROOT"/*.MPQ "$INSTALLROOT/client-data/" 2>/dev/null || true
-    cp -r "$CLIENT_DATA_EXTRACT_ROOT"/*.mpq "$INSTALLROOT/client-data/" 2>/dev/null || true
-
-    # Copy Interface directory if it exists (contains Cinematics, etc)
-    if [ -d "$CLIENT_DATA_EXTRACT_ROOT/Interface" ]; then
-        cp -r "$CLIENT_DATA_EXTRACT_ROOT/Interface" "$INSTALLROOT/client-data/" 2>/dev/null || true
+    mkdir -p "$INSTALLROOT/client-data" || {
+        fail_marker extraction "Failed to create the client-data staging directory" "Check the permissions under $INSTALLROOT, then re-run the installer"
+        return 1
+    }
+    cp -r "$CLIENT_DATA"/*.MPQ "$INSTALLROOT/client-data/" 2>/dev/null || true
+    cp -r "$CLIENT_DATA"/*.mpq "$INSTALLROOT/client-data/" 2>/dev/null || true
+    if [ -d "$CLIENT_DATA/Interface" ]; then
+        cp -r "$CLIENT_DATA/Interface" "$INSTALLROOT/client-data/" 2>/dev/null || true
     fi
+    chown -R "$MANGOSOSUSER:$MANGOSOSUSER" "$INSTALLROOT/client-data" 2>/dev/null || {
+        fail_marker extraction "Failed to hand the staged client data to $MANGOSOSUSER" "Check that the installer runs as root, then re-run the installer"
+        return 1
+    }
+    ln -sfn . "$INSTALLROOT/client-data/Data" 2>/dev/null || true
 
-    # Set ownership for mangos user
-    chown -R "$MANGOSOSUSER:$MANGOSOSUSER" "$INSTALLROOT/client-data"
-
-    # Create the Data/Data symlink in the copy
-    if [ ! -e "$INSTALLROOT/client-data/Data" ]; then
-        ln -sf . "$INSTALLROOT/client-data/Data" 2>/dev/null || true
+    if ! data_readable "$INSTALLROOT/client-data/Data/dbc.MPQ"; then
+        log_error "Could not stage readable client data for $MANGOSOSUSER under $INSTALLROOT/client-data"
+        fail_marker extraction "Client data could not be staged for extraction" "Point VMANGOS_CLIENT_DATA at a readable WoW 1.12.1 (build 5875) Data folder containing dbc.MPQ and terrain.MPQ, then re-run the installer"
+        return 1
     fi
 
     CLIENT_DATA_EXTRACT_ROOT="$INSTALLROOT/client-data"
     log_info "Client data copied to: $CLIENT_DATA_EXTRACT_ROOT"
+}
+
+# True when the staging root $INSTALLROOT/client-data already exposes
+# Data/dbc.MPQ to the service user — a valid root an earlier (interrupted)
+# run left behind. Pure check: repairs belong to repair_staged_root.
+staged_root_is_usable() {
+    local STAGED="$INSTALLROOT/client-data"
+    data_readable "$STAGED/Data/dbc.MPQ"
+}
+
+# A staged root that is only missing its Data/ entry (e.g. an older full copy)
+# gets the self-symlink added in place instead of being re-staged.
+repair_staged_root() {
+    local STAGED="$INSTALLROOT/client-data"
+    if [ -f "$STAGED/dbc.MPQ" ] && [ -w "$STAGED" ]; then
+        ln -sfn . "$STAGED/Data" 2>/dev/null || true
+    fi
+    staged_root_is_usable
+}
+
+# Stage a writable "Data/"-resolvable root over a client data directory that
+# cannot hold the self-symlink itself (e.g. a read-only mount): per-MPQ
+# symlinks plus a "Data -> ." entry, under $INSTALLROOT/client-data. Reuses
+# a staging root from an earlier (interrupted) run when it is already valid,
+# instead of re-staging on every resume.
+stage_client_data_symlink_farm() {
+    local STAGED="$INSTALLROOT/client-data"
+
+    if staged_root_is_usable; then
+        CLIENT_DATA_EXTRACT_ROOT="$STAGED"
+        log_info "Using previously staged client data: $STAGED"
+        return 0
+    fi
+
+    log_warn "Client data is read-only and has no Data/ entry; staging a symlink farm at $STAGED"
+    rm -rf "$STAGED"
+    mkdir -p "$STAGED"
+
+    local f base
+    for f in "$CLIENT_DATA"/*.MPQ "$CLIENT_DATA"/*.mpq; do
+        [ -f "$f" ] || continue
+        base="$(basename "$f")"
+        ln -sfn "$f" "$STAGED/$base"
+    done
+    # Interface/ (Cinematics, etc.) is read via the same Data/ path.
+    if [ -d "$CLIENT_DATA/Interface" ]; then
+        ln -sfn "$CLIENT_DATA/Interface" "$STAGED/Interface"
+    fi
+    # Satisfy the extractor's "Data/" layout with a self-symlink.
+    ln -sfn . "$STAGED/Data"
+
+    if ! data_readable "$STAGED/Data/dbc.MPQ"; then
+        log_error "Staged client data is not readable by $MANGOSOSUSER: $STAGED/Data/dbc.MPQ"
+        return 1
+    fi
+
+    CLIENT_DATA_EXTRACT_ROOT="$STAGED"
+    log_info "Client data staged as symlinks: $STAGED"
+    return 0
 }
 
 # =============================================================================
@@ -783,61 +998,121 @@ prepare_extraction_root() {
 
 phase_prerequisites() {
     log_section "PHASE: Installing Prerequisites"
-    
+    log_marker prerequisites start
+
     # Keep prerequisite installs headless-safe on real servers where needrestart
     # may otherwise hold apt open behind a whiptail prompt.
-    DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get update
+    DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get update || {
+        fail_marker prerequisites "apt-get update failed" "Check network access and the apt mirror configuration, then re-run the installer"
+        return 1
+    }
+    # Note: install default-libmysqlclient-dev (the virtual package that
+    # resolves to the system MySQL client library) and NOT libmariadb-dev —
+    # the two conflict in apt (libmariadb-dev Conflicts libmysqlclient-dev,
+    # which default-libmysqlclient-dev Depends on), so requesting both makes
+    # the whole install fail to resolve. The MangOS CMake FindMySQL module
+    # accepts mysqlclient (provided here) as well as libmariadb.
     DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none \
-        apt-get install -y build-essential cmake git libmariadb-dev default-libmysqlclient-dev libssl-dev \
+        apt-get install -y build-essential cmake git default-libmysqlclient-dev libssl-dev \
             libbz2-dev libreadline-dev libncurses-dev libboost-all-dev \
-            p7zip-full python3 python3-pip python3-venv sysstat wget zlib1g-dev
+            p7zip-full python3 python3-pip python3-venv sysstat unzip wget zlib1g-dev || {
+        fail_marker prerequisites "Failed to install build prerequisites" "Check the apt output in the install log for the failing package"
+        return 1
+    }
 
-    ensure_service_account
+    ensure_service_account || {
+        fail_marker prerequisites "Failed to set up the service account $MANGOSOSUSER" "Check that the user name is available and that useradd succeeded"
+        return 1
+    }
 
+    log_marker prerequisites "done"
     set_checkpoint "PREREQS_DONE"
 }
 
 phase_database_setup() {
     log_section "PHASE: Database Setup"
-    
-    # Create databases
-    mysql -e "CREATE DATABASE IF NOT EXISTS \`$WORLDDB\`;" || true
-    mysql -e "CREATE DATABASE IF NOT EXISTS \`$AUTHDB\`;" || true
-    mysql -e "CREATE DATABASE IF NOT EXISTS \`$CHARACTERDB\`;" || true
-    mysql -e "CREATE DATABASE IF NOT EXISTS \`$LOGSDB\`;" || true
-    
+    log_marker database start
+
+    # Ensure a usable MySQL/MariaDB server is available. On a fresh host this
+    # installs mysql-server (server + client) and starts it; a server that is
+    # already running is adopted only when it is reachable as root. Each
+    # failure path inside emits its own specific error marker (the viewer's
+    # Retry screen shows it).
+    log_marker database progress "step=Ensuring database server is available"
+    ensure_database_server || return 1
+
+    # Create databases. These are best-effort (|| true in the original): a
+    # failure is recorded as a warn marker so phase=database event=done never
+    # asserts an unverified step; the import phase fails loudly if a database
+    # or grant that mattered is still missing.
+    mysql -e "CREATE DATABASE IF NOT EXISTS \`$WORLDDB\`;" \
+        || warn_marker database "CREATE DATABASE failed for $WORLDDB"
+    mysql -e "CREATE DATABASE IF NOT EXISTS \`$AUTHDB\`;" \
+        || warn_marker database "CREATE DATABASE failed for $AUTHDB"
+    mysql -e "CREATE DATABASE IF NOT EXISTS \`$CHARACTERDB\`;" \
+        || warn_marker database "CREATE DATABASE failed for $CHARACTERDB"
+    mysql -e "CREATE DATABASE IF NOT EXISTS \`$LOGSDB\`;" \
+        || warn_marker database "CREATE DATABASE failed for $LOGSDB"
+
     # Create user
-    mysql -e "CREATE USER IF NOT EXISTS '$MANGOSDBUSER'@'$SQLADMINIP' IDENTIFIED BY '$MANGOSDBPASS';" || true
-    mysql -e "GRANT ALL PRIVILEGES ON \`$WORLDDB\`.* TO '$MANGOSDBUSER'@'$SQLADMINIP';" || true
-    mysql -e "GRANT ALL PRIVILEGES ON \`$AUTHDB\`.* TO '$MANGOSDBUSER'@'$SQLADMINIP';" || true
-    mysql -e "GRANT ALL PRIVILEGES ON \`$CHARACTERDB\`.* TO '$MANGOSDBUSER'@'$SQLADMINIP';" || true
-    mysql -e "GRANT ALL PRIVILEGES ON \`$LOGSDB\`.* TO '$MANGOSDBUSER'@'$SQLADMINIP';" || true
-    mysql -e "FLUSH PRIVILEGES;"
-    
+    mysql -e "CREATE USER IF NOT EXISTS '$MANGOSDBUSER'@'$SQLADMINIP' IDENTIFIED BY '$MANGOSDBPASS';" \
+        || warn_marker database "CREATE USER failed for $MANGOSDBUSER"
+    mysql -e "GRANT ALL PRIVILEGES ON \`$WORLDDB\`.* TO '$MANGOSDBUSER'@'$SQLADMINIP';" \
+        || warn_marker database "GRANT failed on $WORLDDB for $MANGOSDBUSER"
+    mysql -e "GRANT ALL PRIVILEGES ON \`$AUTHDB\`.* TO '$MANGOSDBUSER'@'$SQLADMINIP';" \
+        || warn_marker database "GRANT failed on $AUTHDB for $MANGOSDBUSER"
+    mysql -e "GRANT ALL PRIVILEGES ON \`$CHARACTERDB\`.* TO '$MANGOSDBUSER'@'$SQLADMINIP';" \
+        || warn_marker database "GRANT failed on $CHARACTERDB for $MANGOSDBUSER"
+    mysql -e "GRANT ALL PRIVILEGES ON \`$LOGSDB\`.* TO '$MANGOSDBUSER'@'$SQLADMINIP';" \
+        || warn_marker database "GRANT failed on $LOGSDB for $MANGOSDBUSER"
+    mysql -e "FLUSH PRIVILEGES;" || {
+        fail_marker database "Failed to apply database grants" "Check that MariaDB or MySQL is running, then re-run the installer"
+        return 1
+    }
+
+    log_marker database "done"
     set_checkpoint "DATABASE_DONE"
 }
 
 phase_source_download() {
     log_section "PHASE: Downloading Source Code"
-    
-    mkdir -p "$INSTALLROOT"
-    cd "$INSTALLROOT"
-    
+    log_marker source start
+
+    mkdir -p "$INSTALLROOT" || {
+        fail_marker source "Failed to create the installation directory $INSTALLROOT" "Check the path and its permissions, then re-run the installer"
+        return 1
+    }
+    cd "$INSTALLROOT" || {
+        fail_marker source "Failed to enter the installation directory $INSTALLROOT" "Check the directory permissions, then re-run the installer"
+        return 1
+    }
+
     # Clone VMaNGOS core
     if [ ! -d "source" ]; then
-        git_clone_with_retry "https://github.com/vmangos/core" "source"
+        git_clone_with_retry "https://github.com/vmangos/core" "source" || {
+            fail_marker source "Failed to clone the VMaNGOS core repository" "Check network access to github.com, then re-run the installer"
+            return 1
+        }
     else
         log_info "Source directory exists, skipping clone"
     fi
-    
+
+    log_marker source "done"
     set_checkpoint "SOURCE_DONE"
 }
 
 phase_build() {
     log_section "PHASE: Building VMaNGOS from Source"
-    
-    cd "$INSTALLROOT"
-    CPU=$(nproc)
+    log_marker build start
+
+    cd "$INSTALLROOT" || {
+        fail_marker build "Failed to enter the installation directory $INSTALLROOT" "Check the directory permissions, then re-run the installer"
+        return 1
+    }
+    CPU=$(nproc) || {
+        fail_marker build "Failed to count the available CPU cores" "Check that nproc is available, then re-run the installer"
+        return 1
+    }
     
     log_info "====================================================================="
     log_info "COMPILING VMANGOS - THIS WILL TAKE 1-2 HOURS"
@@ -865,8 +1140,14 @@ phase_build() {
     log_info "====================================================================="
     
     # Create build directory
-    mkdir -p build
-    cd build
+    mkdir -p build || {
+        fail_marker build "Failed to create the build directory" "Check the permissions under $INSTALLROOT, then re-run the installer"
+        return 1
+    }
+    cd build || {
+        fail_marker build "Failed to enter the build directory" "Check the permissions under $INSTALLROOT/build, then re-run the installer"
+        return 1
+    }
     
     # Configure
     log_info ""
@@ -882,9 +1163,11 @@ phase_build() {
         set -e
         log_error "CMake configuration failed (exit $CMAKE_RC)"
         log_error "Check $INSTALL_LOG for the cmake error output"
+        fail_marker build "CMake configuration failed" "Check the cmake error output in the install log for the failing component"
         return 1
     fi
     log_info "CMake configuration complete."
+    log_marker build progress "percent=33" "step=Configure"
 
     # Build - with background support if enabled
     log_info ""
@@ -896,6 +1179,7 @@ phase_build() {
             set -e
             log_error "Background build failed"
             log_error "Check $INSTALL_LOG and $CHECKPOINT_DIR/build-status"
+            fail_marker build "Compilation failed" "Check the build log and build-status file for the failing target"
             return 1
         fi
     else
@@ -909,11 +1193,13 @@ phase_build() {
         if [ "$MAKE_RC" -ne 0 ]; then
             set -e
             log_error "Compilation failed (exit $MAKE_RC) - full output in $INSTALL_LOG"
+            fail_marker build "Compilation failed" "Check the install log for the compiler error"
             return 1
         fi
         log_info ""
         log_info "Compilation complete!"
     fi
+    log_marker build progress "percent=66" "step=Compile"
 
     # Install
     log_info ""
@@ -923,10 +1209,12 @@ phase_build() {
     set -e
     if [ "$INSTALL_RC" -ne 0 ]; then
         log_error "make install failed (exit $INSTALL_RC)"
+        fail_marker build "make install failed" "Check the install log for the failing install step"
         return 1
     fi
     if [ ! -f "$INSTALLROOT/run/etc/mangosd.conf.dist" ]; then
         log_error "Build artifacts missing after install (expected $INSTALLROOT/run/etc/mangosd.conf.dist)"
+        fail_marker build "Build artifacts missing after install" "Re-run the build phase; the compiled output was not produced"
         return 1
     fi
     log_info "Installation of binaries complete."
@@ -935,20 +1223,50 @@ phase_build() {
     log_info "====================================================================="
     log_info "BUILD COMPLETED at $(date '+%H:%M:%S')"
     log_info "====================================================================="
-    
+    log_marker build "done"
+
     set_checkpoint "BUILD_DONE"
+}
+
+# config_edit <setting> <file> <sed-expr>: one guarded config edit. sed -i
+# succeeds even when the pattern matches nothing; this catches execution
+# failures (unwritable file, no space left), which under set -e would
+# otherwise exit the script with the phase stuck at event=start.
+config_edit() {
+    local setting="$1" file="$2" expr="$3"
+    if ! sed -i "$expr" "$file"; then
+        fail_marker config "Failed to update $setting in $(basename "$file")" \
+            "Check free disk space and the permissions of $file, then re-run the installer"
+        return 1
+    fi
 }
 
 phase_config_setup() {
     log_section "PHASE: Configuration Setup"
-    
-    cd "$INSTALLROOT"
-    
+    log_marker config start
+
+    cd "$INSTALLROOT" || {
+        fail_marker config "Failed to enter the installation directory $INSTALLROOT" "Check the directory permissions, then re-run the installer"
+        return 1
+    }
+
     # Copy config files
-    cp "$INSTALLROOT/run/etc/mangosd.conf.dist" "$INSTALLROOT/run/etc/mangosd.conf"
-    cp "$INSTALLROOT/run/etc/realmd.conf.dist" "$INSTALLROOT/run/etc/realmd.conf"
+    cp "$INSTALLROOT/run/etc/mangosd.conf.dist" "$INSTALLROOT/run/etc/mangosd.conf" || {
+        fail_marker config "Build artifacts are missing (mangosd.conf.dist)" "Re-run the installer so the build phase completes first"
+        return 1
+    }
+    cp "$INSTALLROOT/run/etc/realmd.conf.dist" "$INSTALLROOT/run/etc/realmd.conf" || {
+        fail_marker config "Build artifacts are missing (realmd.conf.dist)" "Re-run the installer so the build phase completes first"
+        return 1
+    }
     
     log_info "Configuring realmd.conf..."
+
+    # The password is interpolated into sed replacement text below, where &
+    # and \ are special (& expands to the whole matched line, corrupting the
+    # config). Escape them so any legal password lands verbatim.
+    local MANGOSDBPASS_SED="${MANGOSDBPASS//\\/\\\\}"
+    MANGOSDBPASS_SED="${MANGOSDBPASS_SED//&/\\&}"
 
     # The database is set up locally by this installer (MySQL binds 127.0.0.1
     # by default on Ubuntu), so the daemons must connect via 127.0.0.1 - not
@@ -956,33 +1274,45 @@ phase_config_setup() {
     # the realmlist entry and BindIP below.
     # The config format is: LoginDatabaseInfo = "host;port;user;pass;db"
     # Use more flexible sed patterns that handle variations in spacing
-    sed -i "s|LoginDatabaseInfo.*=.*\"127\.0\.0\.1;3306;mangos;.*;realmd\"|LoginDatabaseInfo = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$AUTHDB\"|" "$INSTALLROOT/run/etc/realmd.conf"
-    sed -i "s|BindIP.*=.*\"0\.0\.0\.0\"|BindIP = \"$SERVERIP\"|" "$INSTALLROOT/run/etc/realmd.conf"
+    config_edit "LoginDatabaseInfo" "$INSTALLROOT/run/etc/realmd.conf" \
+        "s|LoginDatabaseInfo.*=.*\"127\.0\.0\.1;3306;mangos;.*;realmd\"|LoginDatabaseInfo = \"127.0.0.1;3306;$MANGOSDBUSER;${MANGOSDBPASS_SED};$AUTHDB\"|" || return 1
+    config_edit "BindIP" "$INSTALLROOT/run/etc/realmd.conf" \
+        "s|BindIP.*=.*\"0\.0\.0\.0\"|BindIP = \"$SERVERIP\"|" || return 1
 
     log_info "Configuring mangosd.conf..."
 
     # Update World server config - handle both old and new format
     # New format uses dots: LoginDatabase.Info, WorldDatabase.Info, etc.
     # Use flexible patterns that match the actual config file format
-    sed -i "s|LoginDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|LoginDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$AUTHDB\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|WorldDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|WorldDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$WORLDDB\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|CharacterDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|CharacterDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$CHARACTERDB\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|LogsDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|LogsDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;$MANGOSDBPASS;$LOGSDB\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    
+    config_edit "LoginDatabase.Info" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|LoginDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|LoginDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;${MANGOSDBPASS_SED};$AUTHDB\"|" || return 1
+    config_edit "WorldDatabase.Info" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|WorldDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|WorldDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;${MANGOSDBPASS_SED};$WORLDDB\"|" || return 1
+    config_edit "CharacterDatabase.Info" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|CharacterDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|CharacterDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;${MANGOSDBPASS_SED};$CHARACTERDB\"|" || return 1
+    config_edit "LogsDatabase.Info" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|LogsDatabase\.Info.*=.*\"127\.0\.0\.1;3306;mangos;.*;.*\"|LogsDatabase.Info = \"127.0.0.1;3306;$MANGOSDBUSER;${MANGOSDBPASS_SED};$LOGSDB\"|" || return 1
     # Update DataDir to point to installation root
-    sed -i "s|DataDir = \"\.\"|DataDir = \"$INSTALLROOT\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    
+    config_edit "DataDir" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|DataDir = \"\.\"|DataDir = \"$INSTALLROOT\"|" || return 1
+
     # Update log directories
-    sed -i "s|LogsDir = \"\"|LogsDir = \"$INSTALLROOT/logs/mangosd/\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|HonorDir = \"\"|HonorDir = \"$INSTALLROOT/logs/honor/\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    
+    config_edit "LogsDir" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|LogsDir = \"\"|LogsDir = \"$INSTALLROOT/logs/mangosd/\"|" || return 1
+    config_edit "HonorDir" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|HonorDir = \"\"|HonorDir = \"$INSTALLROOT/logs/honor/\"|" || return 1
+
     # Update BindIP for world server
-    sed -i "s|BindIP = \"0.0.0.0\"|BindIP = \"$SERVERIP\"|" "$INSTALLROOT/run/etc/mangosd.conf"
-    
+    config_edit "BindIP" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|BindIP = \"0.0.0.0\"|BindIP = \"$SERVERIP\"|" || return 1
+
     # Disable VMaps by default (they're optional and extraction takes hours)
-    sed -i "s|vmap.enableLOS = 1|vmap.enableLOS = 0|" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|vmap.enableHeight = 1|vmap.enableHeight = 0|" "$INSTALLROOT/run/etc/mangosd.conf"
-    sed -i "s|vmap.enableIndoorCheck = 1|vmap.enableIndoorCheck = 0|" "$INSTALLROOT/run/etc/mangosd.conf"
+    config_edit "vmap.enableLOS" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|vmap.enableLOS = 1|vmap.enableLOS = 0|" || return 1
+    config_edit "vmap.enableHeight" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|vmap.enableHeight = 1|vmap.enableHeight = 0|" || return 1
+    config_edit "vmap.enableIndoorCheck" "$INSTALLROOT/run/etc/mangosd.conf" \
+        "s|vmap.enableIndoorCheck = 1|vmap.enableIndoorCheck = 0|" || return 1
     
     if installer_should_provision_manager; then
         local manager_root manager_config_dir manager_config_file manager_password_file
@@ -992,22 +1322,34 @@ phase_config_setup() {
         manager_password_file="$manager_config_dir/.dbpass"
 
         log_info "Provisioning VMANGOS Manager configuration..."
-        mkdir -p "$manager_root/bin" "$manager_root/lib" "$manager_root/tests" "$manager_config_dir"
+        mkdir -p "$manager_root/bin" "$manager_root/lib" "$manager_root/tests" "$manager_config_dir" || {
+            fail_marker config "Failed to create the manager directories" "Check the permissions under $manager_root, then re-run the installer"
+            return 1
+        }
 
         if [ -d "$SCRIPT_DIR/manager" ]; then
             log_info "Installing bundled VMANGOS Manager sources into $manager_root"
-            cp "$SCRIPT_DIR/manager/bin/vmangos-manager" "$manager_root/bin/"
-            cp "$SCRIPT_DIR/manager/lib/"*.sh "$manager_root/lib/"
+            cp "$SCRIPT_DIR/manager/bin/vmangos-manager" "$manager_root/bin/" || {
+                fail_marker config "Failed to install the manager CLI" "Check the sources under $SCRIPT_DIR/manager, then re-run the installer"
+                return 1
+            }
+            cp "$SCRIPT_DIR/manager/lib/"*.sh "$manager_root/lib/" || {
+                fail_marker config "Failed to install the manager libraries" "Check the sources under $SCRIPT_DIR/manager, then re-run the installer"
+                return 1
+            }
             cp "$SCRIPT_DIR/manager/lib/"*.py "$manager_root/lib/" 2>/dev/null || true
             cp "$SCRIPT_DIR/manager/tests/"*.sh "$manager_root/tests/" 2>/dev/null || true
             cp "$SCRIPT_DIR/manager/Makefile" "$manager_root/" 2>/dev/null || true
             cp "$SCRIPT_DIR/manager/dashboard-requirements.txt" "$manager_root/" 2>/dev/null || true
-            chmod +x "$manager_root/bin/vmangos-manager"
+            chmod +x "$manager_root/bin/vmangos-manager" || {
+                fail_marker config "Failed to make the manager CLI executable" "Check the permissions under $manager_root/bin, then re-run the installer"
+                return 1
+            }
         else
             log_warn "Bundled manager sources not found next to vmangos_setup.sh; creating config only"
         fi
 
-        cat > "$manager_config_file" << EOF
+        if ! cat > "$manager_config_file" << EOF
 # VMANGOS Manager Configuration
 # Auto-generated by vmangos_setup.sh on $(date -Iseconds)
 
@@ -1036,21 +1378,52 @@ retention_days = 7
 level = info
 file = /var/log/vmangos-manager.log
 EOF
+        then
+            fail_marker config "Failed to write the manager configuration" "Check the disk and permissions under $manager_config_dir, then re-run the installer"
+            return 1
+        fi
 
-        printf '%s\n' "$MANGOSDBPASS" > "$manager_password_file"
+        printf '%s\n' "$MANGOSDBPASS" > "$manager_password_file" || {
+            fail_marker config "Failed to write the manager password file" "Check the disk and permissions under $manager_config_dir, then re-run the installer"
+            return 1
+        }
         # 640 + mangos group (set by the later chown -R) lets non-root users
         # read the config after 'usermod -aG mangos <user>'; 600 would lock
         # them out with errors on every subcommand.
-        chmod 640 "$manager_config_file" "$manager_password_file"
-        mkdir -p "$INSTALLROOT/backups"
-        chmod 775 "$INSTALLROOT/backups"
+        chmod 640 "$manager_config_file" "$manager_password_file" || {
+            fail_marker config "Failed to set the manager config permissions" "Check the permissions under $manager_config_dir, then re-run the installer"
+            return 1
+        }
+        mkdir -p "$INSTALLROOT/backups" || {
+            fail_marker config "Failed to create the backups directory" "Check the permissions under $INSTALLROOT, then re-run the installer"
+            return 1
+        }
+        chmod 775 "$INSTALLROOT/backups" || {
+            fail_marker config "Failed to set the backups directory permissions" "Check the permissions on $INSTALLROOT/backups, then re-run the installer"
+            return 1
+        }
         # Runtime lock dir is on tmpfs: recreate it group-writable at boot.
-        mkdir -p /etc/tmpfiles.d
-        printf 'd /run/vmangos-manager 0775 root %s -\n' "$MANGOSOSUSER" > /etc/tmpfiles.d/vmangos-manager.conf
+        mkdir -p /etc/tmpfiles.d || {
+            fail_marker config "Failed to create /etc/tmpfiles.d" "Check that the installer runs as root, then re-run the installer"
+            return 1
+        }
+        printf 'd /run/vmangos-manager 0775 root %s -\n' "$MANGOSOSUSER" > /etc/tmpfiles.d/vmangos-manager.conf || {
+            fail_marker config "Failed to write the manager tmpfiles rule" "Check free disk space and that the installer runs as root, then re-run the installer"
+            return 1
+        }
         systemd-tmpfiles --create /etc/tmpfiles.d/vmangos-manager.conf 2>/dev/null || true
-        mkdir -p /var/run/vmangos-manager
-        chgrp "$MANGOSOSUSER" /var/run/vmangos-manager
-        chmod 775 /var/run/vmangos-manager
+        mkdir -p /var/run/vmangos-manager || {
+            fail_marker config "Failed to create /var/run/vmangos-manager" "Check that the installer runs as root, then re-run the installer"
+            return 1
+        }
+        chgrp "$MANGOSOSUSER" /var/run/vmangos-manager || {
+            fail_marker config "Failed to set the manager runtime directory group" "Check that the installer runs as root, then re-run the installer"
+            return 1
+        }
+        chmod 775 /var/run/vmangos-manager || {
+            fail_marker config "Failed to set the manager runtime directory permissions" "Check that the installer runs as root, then re-run the installer"
+            return 1
+        }
         log_info "Manager config written to $manager_config_file"
         log_info "To manage the server as a non-root user:"
         log_info "  sudo usermod -aG $MANGOSOSUSER <username>   # then that user logs out/in"
@@ -1065,7 +1438,8 @@ EOF
     else
         log_info "Provisioning target excludes VMANGOS Manager; bundled manager setup skipped."
     fi
-    
+    log_marker config "done"
+
     set_checkpoint "CONFIG_DONE"
 }
 
@@ -1088,9 +1462,13 @@ ensure_realmlist_entry() {
 
 phase_data_extraction() {
     log_section "PHASE: Data Extraction from Client Data"
-    
-    cd "$INSTALLROOT"
-    
+    log_marker extraction start
+
+    cd "$INSTALLROOT" || {
+        fail_marker extraction "Failed to enter the installation directory $INSTALLROOT" "Check the directory permissions, then re-run the installer"
+        return 1
+    }
+
     # The server cannot boot without DBC files and base maps, so do NOT
     # checkpoint DATA_DONE here — stop and tell the user how to resume.
     if [ -z "$CLIENT_DATA" ] || [ ! -d "$CLIENT_DATA" ]; then
@@ -1107,13 +1485,17 @@ phase_data_extraction() {
         log_info ""
         log_info "To extract manually instead, place the client Data folder and run:"
         log_info "  sudo $INSTALLROOT/run/bin/Extractors/mapextractor --silent -i <client_root_with_Data>"
+        fail_marker extraction "No client data found" "Provide a WoW 1.12.1 (build 5875) client Data folder and set VMANGOS_CLIENT_DATA, then re-run the installer"
         return 1
     fi
 
     # A resumed install re-enters this phase without re-running
     # check_client_data, so make sure the service account exists (this phase
     # chowns and sudo -us to it) and derive the extraction root on demand.
-    ensure_service_account
+    ensure_service_account || {
+        fail_marker extraction "Failed to set up the service account $MANGOSOSUSER" "Check that the user name is available and that useradd succeeded"
+        return 1
+    }
     prepare_extraction_root
 
     # Copy extractors (handle both lowercase and capitalized names)
@@ -1130,20 +1512,30 @@ phase_data_extraction() {
         cp "$INSTALLROOT/run/bin/Extractors/MoveMapGenerator" "$INSTALLROOT/MoveMapGen" 2>/dev/null || true
     
     if [ -f "$INSTALLROOT/source/contrib/mmap/offmesh.txt" ]; then
-        cp "$INSTALLROOT/source/contrib/mmap/offmesh.txt" "$INSTALLROOT/"
+        # Optional input for the (already soft-failing) mmaps step: warn and
+        # continue instead of failing the phase.
+        cp "$INSTALLROOT/source/contrib/mmap/offmesh.txt" "$INSTALLROOT/" || \
+            warn_marker extraction "Failed to copy offmesh.txt; mmaps will run without it"
     fi
     
     # Create directories
-    mkdir -p "$INSTALLROOT/run/bin/5875"
-    mkdir -p "$INSTALLROOT/logs/mangosd"
-    mkdir -p "$INSTALLROOT/logs/honor"
-    mkdir -p "$INSTALLROOT/logs/realmd"
+    mkdir -p "$INSTALLROOT/run/bin/5875" "$INSTALLROOT/logs/mangosd" \
+        "$INSTALLROOT/logs/honor" "$INSTALLROOT/logs/realmd" || {
+        fail_marker extraction "Failed to create the extraction output directories" "Check the permissions under $INSTALLROOT, then re-run the installer"
+        return 1
+    }
     
     # Set ownership for extraction
-    chown -R "$MANGOSOSUSER:$MANGOSOSUSER" "$INSTALLROOT"
+    chown -R "$MANGOSOSUSER:$MANGOSOSUSER" "$INSTALLROOT" || {
+        fail_marker extraction "Failed to hand the installation directory to $MANGOSOSUSER" "Check that the installer runs as root, then re-run the installer"
+        return 1
+    }
     
     # Run extractors as mangos user
-    cd "$INSTALLROOT"
+    cd "$INSTALLROOT" || {
+        fail_marker extraction "Failed to enter the installation directory $INSTALLROOT" "Check the directory permissions, then re-run the installer"
+        return 1
+    }
     
     local EXTRACTION_FAILED=0
     
@@ -1166,6 +1558,7 @@ phase_data_extraction() {
 
         if [ "$MAPEXTRACT_RC" -eq 0 ] && [ -n "$(ls -A "$INSTALLROOT/dbc" 2>/dev/null)" ] && [ -n "$(ls -A "$INSTALLROOT/maps" 2>/dev/null)" ]; then
             log_info "DBC and map extraction completed successfully"
+            log_marker extraction progress "percent=10" "step=Extract DBC and maps"
         else
             log_error "Map extraction failed (exit status $MAPEXTRACT_RC or missing dbc/maps output)"
             EXTRACTION_FAILED=1
@@ -1188,12 +1581,22 @@ phase_data_extraction() {
 
     if [ $EXTRACTION_FAILED -eq 0 ] && [ -f ./vmapextractor ]; then
         log_info "Starting vmapextractor..."
+        # An interrupted earlier attempt leaves a partial Buildings dir, and
+        # vmapextractor refuses to run into a polluted directory — which used
+        # to turn the whole resume into a vmap-less, mmap-less install with
+        # only log warnings. Clear it so the step genuinely re-runs (MoveMapGen
+        # resumes tile-by-tile by itself; vmaps have no such mode).
+        if [ -n "$(ls -A "$INSTALLROOT/Buildings" 2>/dev/null)" ]; then
+            log_warn "Clearing partial vmap extraction output from an earlier attempt"
+            rm -rf "$INSTALLROOT/Buildings"
+        fi
         # -d (not -i): vmapextractor's input flag; it expects the MPQ folder itself.
         # --silent: skip its "press enter" prompts.
         # PIPESTATUS: tee would otherwise mask the extractor's exit code.
         sudo -u "$MANGOSOSUSER" bash -c "cd '$INSTALLROOT' && ./vmapextractor --silent -d '$CLIENT_DATA_EXTRACT_ROOT'" 2>&1 | tee -a "$INSTALL_LOG"
         if [ "${PIPESTATUS[0]}" -eq 0 ] && [ -n "$(ls -A "$INSTALLROOT/Buildings" 2>/dev/null)" ]; then
             log_info "VMap extraction completed"
+            log_marker extraction progress "percent=25" "step=Extract vmaps"
         else
             log_warn "VMap extractor failed or produced no Buildings output"
             VMAPS_FAILED=1
@@ -1214,15 +1617,22 @@ phase_data_extraction() {
     
     if [ $EXTRACTION_FAILED -eq 0 ] && [ $VMAPS_FAILED -eq 0 ] && [ -f ./vmap_assembler ]; then
         log_info "Starting vmap_assembler..."
-        mkdir -p "$INSTALLROOT/vmaps"
+        mkdir -p "$INSTALLROOT/vmaps" || {
+            fail_marker extraction "Failed to create the vmaps directory" "Check the permissions under $INSTALLROOT, then re-run the installer"
+            return 1
+        }
         # The assembler runs as $MANGOSOSUSER and must write into vmaps;
         # mkdir ran as root, so hand the directory over first.
-        chown "$MANGOSOSUSER:$MANGOSOSUSER" "$INSTALLROOT/vmaps"
+        chown "$MANGOSOSUSER:$MANGOSOSUSER" "$INSTALLROOT/vmaps" || {
+            fail_marker extraction "Failed to hand the vmaps directory to $MANGOSOSUSER" "Check that the installer runs as root, then re-run the installer"
+            return 1
+        }
         # Assemble from the Buildings dir vmapextractor wrote to $INSTALLROOT,
         # not from the raw client data. --silent skips its "press enter" prompt.
         sudo -u "$MANGOSOSUSER" bash -c "cd '$INSTALLROOT' && ./vmap_assembler --silent '$INSTALLROOT/Buildings' '$INSTALLROOT/vmaps'" 2>&1 | tee -a "$INSTALL_LOG"
         if [ "${PIPESTATUS[0]}" -eq 0 ] && [ -n "$(ls -A "$INSTALLROOT/vmaps" 2>/dev/null)" ]; then
             log_info "VMap assembly completed"
+            log_marker extraction progress "percent=40" "step=Assemble vmaps"
         else
             log_warn "VMap assembler had issues - server will run without vmaps"
             VMAPS_FAILED=1
@@ -1261,9 +1671,17 @@ phase_data_extraction() {
     log_info "Starting MoveMapGen at $(date '+%H:%M:%S')..."
     log_info "====================================================================="
     
-    local MMAPS_FAILED=0
+    local MMAPS_MISSING=0
 
-    if [ $EXTRACTION_FAILED -eq 0 ] && [ $VMAPS_FAILED -eq 0 ] && [ -f ./MoveMapGen ]; then
+    # VMANGOS_SKIP_MMAPS=1 skips the hours-long mmaps generation entirely
+    # (a test seam for the install smoke; a normal install leaves it unset):
+    # the server runs without mmaps, so the phase still completes and the
+    # summary reports the gap like any other soft-failed mmaps step.
+    if [ "${VMANGOS_SKIP_MMAPS:-0}" = "1" ]; then
+        log_info "Skipping movement map generation (VMANGOS_SKIP_MMAPS=1)"
+        warn_marker extraction "mmaps skipped by request (VMANGOS_SKIP_MMAPS=1) - the server will run without NPC pathfinding"
+        MMAPS_MISSING=1
+    elif [ $EXTRACTION_FAILED -eq 0 ] && [ $VMAPS_FAILED -eq 0 ] && [ -f ./MoveMapGen ]; then
         # Run with a background progress heartbeat
         {
             while true; do
@@ -1284,15 +1702,16 @@ phase_data_extraction() {
         log_info "====================================================================="
         if [ "$MOVEMAP_RC" -eq 0 ] && [ -n "$(ls -A "$INSTALLROOT/mmaps" 2>/dev/null)" ]; then
             log_info "Movement map generation completed at $(date '+%H:%M:%S')"
+            log_marker extraction progress "percent=90" "step=Generate movement maps"
         else
             log_warn "MoveMapGen exited with status $MOVEMAP_RC at $(date '+%H:%M:%S')"
             log_warn "Server will run without mmaps (NPC pathfinding disabled)"
-            MMAPS_FAILED=1
+            MMAPS_MISSING=1
         fi
         log_info "====================================================================="
     else
         log_warn "Skipping movement map generation (previous step failed, vmaps missing or generator not found)"
-        MMAPS_FAILED=1
+        MMAPS_MISSING=1
     fi
     
     log_info ""
@@ -1316,14 +1735,15 @@ phase_data_extraction() {
         log_info "  sudo -u $MANGOSOSUSER ./run/bin/Extractors/vmap_assembler --silent buildings vmaps"
         log_info "  sudo -u $MANGOSOSUSER ./run/bin/Extractors/MoveMapGenerator --silent"
         log_error ""
+        fail_marker extraction "Data extraction failed" "Verify the client data is WoW 1.12.1 (build 5875) and complete, then re-run the installer to resume from this phase"
         return 1
     else
-        if [ $VMAPS_FAILED -eq 1 ] || [ $MMAPS_FAILED -eq 1 ]; then
+        if [ $VMAPS_FAILED -eq 1 ] || [ $MMAPS_MISSING -eq 1 ]; then
             log_warn "Extraction completed with gaps:"
             if [ $VMAPS_FAILED -eq 1 ]; then
                 log_warn "  - vmaps missing: line-of-sight is disabled in mangosd.conf"
             fi
-            if [ $MMAPS_FAILED -eq 1 ]; then
+            if [ $MMAPS_MISSING -eq 1 ]; then
                 log_warn "  - mmaps missing: NPC pathfinding will be limited"
             fi
             log_info "You can re-run the missing steps manually (see commands above)."
@@ -1333,7 +1753,10 @@ phase_data_extraction() {
         
         # Create versioned directory structure (e.g., 5875 for WoW 1.12.1)
         log_info "Creating versioned data directory structure..."
-        mkdir -p "$INSTALLROOT/5875"
+        mkdir -p "$INSTALLROOT/5875" || {
+            fail_marker extraction "Failed to create the versioned data directory" "Check the permissions under $INSTALLROOT, then re-run the installer"
+            return 1
+        }
         
         # Create symlinks for dbc and maps in the versioned directory
         if [ -d "$INSTALLROOT/dbc" ]; then
@@ -1357,7 +1780,8 @@ phase_data_extraction() {
         chown -R "$MANGOSOSUSER:$MANGOSOSUSER" "$INSTALLROOT/5875" 2>/dev/null || true
         log_info "Versioned directory structure created."
     fi
-    
+    log_marker extraction "done"
+
     set_checkpoint "DATA_DONE"
 }
 
@@ -1386,8 +1810,12 @@ resolve_world_db_urls() {
 
 phase_database_import() {
     log_section "PHASE: Database Import"
+    log_marker db-import start
 
-    cd "$INSTALLROOT"
+    cd "$INSTALLROOT" || {
+        fail_marker db-import "Failed to enter the installation directory $INSTALLROOT" "Check the directory permissions, then re-run the installer"
+        return 1
+    }
 
     # Download and import world database
     # Try multiple sources in order of preference
@@ -1402,12 +1830,22 @@ phase_database_import() {
             # Check if file is valid (non-zero size)
             if [ -s "$DB_FILENAME" ]; then
                 log_info "Extracting world database..."
-                
-                # Extract based on file extension
+
+                # Extract based on file extension. The extractor's exit code
+                # must come through the tee (PIPESTATUS), or a corrupt
+                # download is only ever discovered as "no SQL found".
+                local EXTRACT_RC=0
                 if [[ "$DB_FILENAME" == *.zip ]]; then
                     unzip -o "$DB_FILENAME" 2>&1 | tee -a "$INSTALL_LOG"
+                    EXTRACT_RC="${PIPESTATUS[0]}"
                 elif [[ "$DB_FILENAME" == *.7z ]]; then
                     7z x "$DB_FILENAME" -aoa 2>&1 | tee -a "$INSTALL_LOG"
+                    EXTRACT_RC="${PIPESTATUS[0]}"
+                fi
+                if [ "$EXTRACT_RC" -ne 0 ]; then
+                    warn_marker db-import "Failed to extract the world database archive $DB_FILENAME (exit $EXTRACT_RC); trying the next source"
+                    rm -f "$DB_FILENAME"
+                    continue
                 fi
                 
                 # Check for mysql-dump directory structure (from vmangos releases)
@@ -1417,23 +1855,39 @@ phase_database_import() {
                     # Import in correct order: logon -> characters -> logs -> mangos (world)
                     if [ -f "mysql-dump/logon.sql" ]; then
                         log_info "Importing auth database (logon.sql)..."
-                        mysql "$AUTHDB" < "mysql-dump/logon.sql"
+                        mysql "$AUTHDB" < "mysql-dump/logon.sql" || {
+                            fail_marker db-import "Failed to import the auth database" "Check the MariaDB log for the failing statement, then re-run the installer"
+                            return 1
+                        }
+                        log_marker db-import progress "percent=20" "step=Import auth database"
                     fi
                     
                     if [ -f "mysql-dump/characters.sql" ]; then
                         log_info "Importing characters database..."
-                        mysql "$CHARACTERDB" < "mysql-dump/characters.sql"
+                        mysql "$CHARACTERDB" < "mysql-dump/characters.sql" || {
+                            fail_marker db-import "Failed to import the characters database" "Check the MariaDB log for the failing statement, then re-run the installer"
+                            return 1
+                        }
+                        log_marker db-import progress "percent=40" "step=Import characters database"
                     fi
                     
                     if [ -f "mysql-dump/logs.sql" ]; then
                         log_info "Importing logs database..."
-                        mysql "$LOGSDB" < "mysql-dump/logs.sql"
+                        mysql "$LOGSDB" < "mysql-dump/logs.sql" || {
+                            fail_marker db-import "Failed to import the logs database" "Check the MariaDB log for the failing statement, then re-run the installer"
+                            return 1
+                        }
+                        log_marker db-import progress "percent=60" "step=Import logs database"
                     fi
                     
                     if [ -f "mysql-dump/mangos.sql" ]; then
                         log_info "Importing world database (this may take a while)..."
-                        mysql "$WORLDDB" < "mysql-dump/mangos.sql"
+                        mysql "$WORLDDB" < "mysql-dump/mangos.sql" || {
+                            fail_marker db-import "Failed to import the world database" "Check the MariaDB log for the failing statement, then re-run the installer"
+                            return 1
+                        }
                         log_info "World database imported successfully"
+                        log_marker db-import progress "percent=80" "step=Import world database"
                     fi
                     
                     WORLD_DB_DOWNLOADED=true
@@ -1445,11 +1899,14 @@ phase_database_import() {
                     WORLD_SQL=$(find . -name "*.sql" -type f | grep -E "(world|mangos)" | head -n1)
                     if [ -n "$WORLD_SQL" ]; then
                         log_info "Importing world database from $WORLD_SQL (this may take a while)..."
-                        mysql "$WORLDDB" < "$WORLD_SQL"
+                        mysql "$WORLDDB" < "$WORLD_SQL" || {
+                            fail_marker db-import "Failed to import the world database" "Check the MariaDB log for the failing statement, then re-run the installer"
+                            return 1
+                        }
                         log_info "World database imported successfully"
                         WORLD_DB_DOWNLOADED=true
                     else
-                        log_warn "No SQL file found after extraction"
+                        warn_marker db-import "No SQL file found after extracting $DB_FILENAME"
                     fi
                 fi
                 
@@ -1488,9 +1945,15 @@ phase_database_import() {
         
         if [ "$MIGRATIONS_EXIST" -gt 0 ] && [ "$WORLD_DB_DOWNLOADED" != "true" ]; then
             log_info "Running database migrations..."
-            cd "$INSTALLROOT/source/sql/migrations"
+            cd "$INSTALLROOT/source/sql/migrations" || {
+                fail_marker db-import "Failed to enter the migrations directory" "Check the sources under $INSTALLROOT/source/sql, then re-run the installer"
+                return 1
+            }
             if [ -f "merge.sh" ]; then
-                chmod +x merge.sh
+                chmod +x merge.sh || {
+                    fail_marker db-import "Failed to make the migration merge script executable" "Check the sources under $INSTALLROOT/source/sql/migrations, then re-run the installer"
+                    return 1
+                }
                 ./merge.sh 2>&1 | tee -a "$INSTALL_LOG" || true
             fi
 
@@ -1511,16 +1974,21 @@ phase_database_import() {
         fi
     fi
 
-    ensure_realmlist_entry
-    
+    ensure_realmlist_entry || {
+        fail_marker db-import "Failed to seed the realmlist" "Check that the auth database exists and the MariaDB log for the failing statement"
+        return 1
+    }
+    log_marker db-import "done"
+
     set_checkpoint "DB_IMPORT_DONE"
 }
 
 phase_service_setup() {
     log_section "PHASE: Service Setup"
-    
+    log_marker services start
+
     # Create systemd services
-    cat > /etc/systemd/system/auth.service << EOF
+    if ! cat > /etc/systemd/system/auth.service << EOF
 [Unit]
 Description=VMaNGOS Auth Server (Classic WoW)
 After=network.target mysql.service
@@ -1537,8 +2005,12 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+    then
+        fail_marker services "Failed to write the auth service unit" "Check free disk space and that the installer runs as root, then re-run the installer"
+        return 1
+    fi
 
-    cat > /etc/systemd/system/world.service << EOF
+    if ! cat > /etc/systemd/system/world.service << EOF
 [Unit]
 Description=VMaNGOS World Server (Classic WoW)
 After=network.target mysql.service
@@ -1559,21 +2031,43 @@ TTYVHangup=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+    then
+        fail_marker services "Failed to write the world service unit" "Check free disk space and that the installer runs as root, then re-run the installer"
+        return 1
+    fi
 
-    systemctl daemon-reload
-    systemctl enable auth.service
-    systemctl enable world.service
+    systemctl daemon-reload || {
+        fail_marker services "systemctl daemon-reload failed" "Check the install log for the systemd error, then re-run the installer"
+        return 1
+    }
+    systemctl enable auth.service || {
+        fail_marker services "Failed to enable the auth service" "Check the install log for the systemd error, then re-run the installer"
+        return 1
+    }
+    systemctl enable world.service || {
+        fail_marker services "Failed to enable the world service" "Check the install log for the systemd error, then re-run the installer"
+        return 1
+    }
     
     # Fix permissions
-    chown -R "$MANGOSOSUSER:$MANGOSOSUSER" "$INSTALLROOT"
+    chown -R "$MANGOSOSUSER:$MANGOSOSUSER" "$INSTALLROOT" || {
+        fail_marker services "Failed to hand the installation directory to $MANGOSOSUSER" "Check that the installer runs as root, then re-run the installer"
+        return 1
+    }
     
     # Start services
     log_info "Starting auth service..."
-    systemctl start auth.service
+    systemctl start auth.service || {
+        fail_marker services "Failed to start the auth service" "Check the unit with: journalctl -u auth -n 50, then re-run the installer"
+        return 1
+    }
     sleep 3
-    
+
     log_info "Starting world service (this may take 30-60 seconds to fully load)..."
-    systemctl start world.service
+    systemctl start world.service || {
+        fail_marker services "Failed to start the world service" "Check the unit with: journalctl -u world -n 50, then re-run the installer"
+        return 1
+    }
     sleep 15
     
     # Verify services are running
@@ -1607,6 +2101,7 @@ EOF
 
     if [ "$AUTH_STATUS" != "active" ] || [ "$WORLD_STATUS" != "active" ]; then
         log_error "Service verification failed - not marking installation complete"
+        fail_marker services "Service verification failed" "Check journalctl -u auth and journalctl -u world for the startup failure, then re-run the installer"
         return 1
     fi
 
@@ -1616,7 +2111,8 @@ EOF
             "$INSTALLROOT/logs/mangosd/gm_critical.log" \
             2>/dev/null || true
     fi
-    
+    log_marker services "done"
+
     set_checkpoint "SERVICES_DONE"
 }
 
@@ -1654,6 +2150,7 @@ main() {
     if [ "$CHECKPOINT" = "BUILD_DONE" ] && [ ! -f "$INSTALLROOT/run/etc/mangosd.conf.dist" ]; then
         log_warn "BUILD_DONE checkpoint found but build artifacts are missing"
         log_warn "Resetting to SOURCE_DONE so the build phase runs again"
+        log_marker build progress "percent=0" "step=Self-heal: build artifacts missing, the build phase will run again"
         CHECKPOINT="SOURCE_DONE"
         set_checkpoint "SOURCE_DONE"
     fi
@@ -1711,6 +2208,7 @@ main() {
     fi
 
     if [ "$CHECKPOINT" = "SERVICES_DONE" ]; then
+        log_marker install "done" "server_ip=${SERVERIP:-unknown}" auth_port=3724 world_port=8085
         log_section "Installation Complete!"
         log_info ""
         log_info "========================================"

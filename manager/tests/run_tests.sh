@@ -4592,6 +4592,619 @@ test_backup_metadata_carries_real_commit() {
     return $all_passed
 }
 
+test_installer_unit_name_and_state_queries() {
+    # shellcheck source=../lib/installer.sh
+    source "$LIB_DIR/installer.sh"
+
+    local all_passed=0
+    local output
+
+    assert_equals "vmangos-install" "$(installer_unit_name)" "installer unit name is the single vmangos-install constant" || all_passed=1
+    assert_equals "journalctl -u vmangos-install" "$(installer_journal_cmd)" "journal command targets the install unit" || all_passed=1
+
+    installer_systemctl() {
+        case "$1" in
+            show)
+                printf 'ActiveState=active\n'
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    }
+    assert_equals "active" "$(installer_unit_state)" "state parses ActiveState from systemctl show" || all_passed=1
+    installer_unit_active && output="yes" || output="no"
+    assert_equals "yes" "$output" "active unit reports active" || all_passed=1
+
+    installer_systemctl() {
+        case "$1" in
+            show)
+                printf 'ActiveState=failed\n'
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    }
+    assert_equals "failed" "$(installer_unit_state)" "failed state is surfaced" || all_passed=1
+    installer_unit_active && output="yes" || output="no"
+    assert_equals "no" "$output" "failed unit is not active" || all_passed=1
+
+    installer_systemctl() {
+        case "$1" in
+            show)
+                printf 'ActiveState=inactive\n'
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    }
+    assert_equals "inactive" "$(installer_unit_state)" "inactive state is surfaced" || all_passed=1
+    installer_unit_active && output="yes" || output="no"
+    assert_equals "no" "$output" "inactive unit is not active" || all_passed=1
+
+    return $all_passed
+}
+
+test_installer_unit_start_builds_systemd_run_env() {
+    # shellcheck source=../lib/installer.sh
+    source "$LIB_DIR/installer.sh"
+
+    local all_passed=0
+    local temp_root secrets_file setup_script systemd_run_log log
+
+    temp_root=$(mktemp -d)
+    secrets_file="$temp_root/secrets.conf"
+    setup_script="$temp_root/setup/vmangos_setup.sh"
+    systemd_run_log="$temp_root/systemd-run.log"
+    mkdir -p "$temp_root/setup"
+    printf '#!/bin/bash\nexit 0\n' > "$setup_script"
+
+    cat > "$secrets_file" << 'EOF'
+PROVISIONTARGET=mangos_box
+CLIENTDATA=/home/tony/Data
+INSTALLROOT=/opt/mangos
+SQLADMINUSER=root
+SQLADMINIP=%
+SQLADMINPASS='p@ss w0rd!'
+WORLDDB=world
+AUTHDB=auth
+CHARACTERDB=characters
+LOGSDB=realm_logs
+MANGOSDBUSER=mangos
+MANGOSDBPASS='db p@ss'
+MANGOSOSUSER=mangos
+SKIP_SECURE_MYSQL=no
+REINSTALL_POLICY=replace
+EOF
+
+    check_root() { :; }
+    installer_unit_active() { return 1; }
+    installer_systemd_run() {
+        local arg
+        for arg in "$@"; do
+            printf '%s\n' "$arg" >> "$systemd_run_log"
+        done
+        return 0
+    }
+
+    installer_unit_start "$secrets_file" "$setup_script" >/dev/null || all_passed=1
+
+    log=$(cat "$systemd_run_log" 2>/dev/null)
+    assert_true "[[ \"\$log\" == *'--unit=vmangos-install'* ]]" "systemd-run targets the vmangos-install unit" || all_passed=1
+    assert_true "[[ \"\$log\" == *'--description=VMaNGOS install'* ]]" "systemd-run carries the install description" || all_passed=1
+    assert_true "[[ \"\$log\" == *'--collect'* ]]" "systemd-run collects the transient unit after exit" || all_passed=1
+    assert_true "[[ \"\$log\" == *'bash'* ]]" "systemd-run invocation runs the setup script with bash" || all_passed=1
+    assert_true "[[ \"\$log\" == *\"$temp_root/setup/vmangos_setup.sh\"* ]]" "systemd-run uses the absolute setup script path" || all_passed=1
+    assert_true "[[ \"\$log\" == *'VMANGOS_AUTO_INSTALL=1'* ]]" "automated install flag is passed" || all_passed=1
+    assert_true "[[ \"\$log\" == *'VMANGOS_INPUT_MODE=automated'* ]]" "input mode is automated" || all_passed=1
+    assert_true "[[ \"\$log\" == *'VMANGOS_PROVISION_TARGET=mangos_box'* ]]" "provision target maps from PROVISIONTARGET" || all_passed=1
+    assert_true "[[ \"\$log\" == *'VMANGOS_CLIENT_DATA=/home/tony/Data'* ]]" "client data maps from CLIENTDATA" || all_passed=1
+    assert_true "[[ \"\$log\" == *'VMANGOS_INSTALL_ROOT=/opt/mangos'* ]]" "install root maps from INSTALLROOT" || all_passed=1
+    assert_true "[[ \"\$log\" == *'VMANGOS_SQL_ADMIN_PASS=p@ss w0rd!'* ]]" "SQL admin password passes through as one --setenv value" || all_passed=1
+    assert_true "[[ \"\$log\" == *'VMANGOS_DB_PASS=db p@ss'* ]]" "DB password with a space passes through as one --setenv value" || all_passed=1
+    assert_true "[[ \"\$log\" == *'VMANGOS_LOGS_DB=realm_logs'* ]]" "logs DB maps from LOGSDB" || all_passed=1
+    assert_true "[[ \"\$log\" == *'REINSTALL_POLICY=replace'* ]]" "reinstall policy reaches the unit" || all_passed=1
+    assert_true "[[ \"\$log\" == *'VMANGOS_BACKGROUND_BUILD=1'* ]]" "background build is enabled" || all_passed=1
+    assert_true "[[ \"\$log\" == *'INSTALL_LOG=/var/log/vmangos-install.log'* ]]" "install log path is passed" || all_passed=1
+
+    rm -rf "$temp_root"
+    return $all_passed
+}
+
+test_installer_unit_start_forwards_mmaps_skip() {
+    # shellcheck source=../lib/installer.sh
+    source "$LIB_DIR/installer.sh"
+
+    local all_passed=0
+    local temp_root secrets_file setup_script systemd_run_log log
+
+    temp_root=$(mktemp -d)
+    secrets_file="$temp_root/secrets.conf"
+    setup_script="$temp_root/setup/vmangos_setup.sh"
+    systemd_run_log="$temp_root/systemd-run.log"
+    mkdir -p "$temp_root/setup"
+    printf '#!/bin/bash\nexit 0\n' > "$setup_script"
+    printf 'INSTALLROOT=/opt/mangos\nCLIENTDATA=/home/tony/Data\n' > "$secrets_file"
+
+    check_root() { :; }
+    installer_unit_active() { return 1; }
+    installer_systemd_run() {
+        local arg
+        for arg in "$@"; do
+            printf '%s\n' "$arg" >> "$systemd_run_log"
+        done
+        return 0
+    }
+
+    VMANGOS_SKIP_MMAPS=1 installer_unit_start "$secrets_file" "$setup_script" >/dev/null \
+        || all_passed=1
+    log=$(cat "$systemd_run_log" 2>/dev/null)
+    assert_true "[[ \"\$log\" == *'VMANGOS_SKIP_MMAPS=1'* ]]" \
+        "mmaps skip forwards from the invoking environment into the unit" || all_passed=1
+
+    : > "$systemd_run_log"
+    installer_unit_start "$secrets_file" "$setup_script" >/dev/null || all_passed=1
+    log=$(cat "$systemd_run_log" 2>/dev/null)
+    assert_true "[[ \"\$log\" != *'VMANGOS_SKIP_MMAPS'* ]]" \
+        "no mmaps skip variable reaches the unit when the environment does not set it" || all_passed=1
+
+    rm -rf "$temp_root"
+    return $all_passed
+}
+
+test_installer_unit_start_rejects_double_start() {
+    # shellcheck source=../lib/installer.sh
+    source "$LIB_DIR/installer.sh"
+
+    local all_passed=0
+    local temp_root secrets_file setup_script systemd_run_log output rc
+
+    temp_root=$(mktemp -d)
+    secrets_file="$temp_root/secrets.conf"
+    setup_script="$temp_root/setup/vmangos_setup.sh"
+    systemd_run_log="$temp_root/systemd-run.log"
+    mkdir -p "$temp_root/setup"
+    printf '#!/bin/bash\nexit 0\n' > "$setup_script"
+    printf 'CLIENTDATA=/data\n' > "$secrets_file"
+
+    check_root() { :; }
+    installer_unit_active() { return 0; }
+    installer_systemd_run() {
+        printf 'MUST_NOT_RUN\n' >> "$systemd_run_log"
+        return 0
+    }
+
+    rc=0
+    output=$(installer_unit_start "$secrets_file" "$setup_script" 2>&1) || rc=$?
+    assert_equals "1" "$rc" "double start is rejected" || all_passed=1
+    assert_true "[[ \"\$output\" == *'already in progress'* ]]" "rejection names the running install" || all_passed=1
+    assert_true "[[ \"\$output\" == *'journalctl -u vmangos-install'* ]]" "rejection points at the journal" || all_passed=1
+    assert_true "! [[ -f \"\$systemd_run_log\" ]]" "systemd-run is never invoked on double start" || all_passed=1
+
+    rm -rf "$temp_root"
+    return $all_passed
+}
+
+test_installer_unit_start_surfaces_systemd_run_failure() {
+    # shellcheck source=../lib/installer.sh
+    source "$LIB_DIR/installer.sh"
+
+    local all_passed=0
+    local temp_root secrets_file setup_script output rc
+
+    temp_root=$(mktemp -d)
+    secrets_file="$temp_root/secrets.conf"
+    setup_script="$temp_root/setup/vmangos_setup.sh"
+    mkdir -p "$temp_root/setup"
+    printf '#!/bin/bash\nexit 0\n' > "$setup_script"
+    printf 'CLIENTDATA=/data\n' > "$secrets_file"
+
+    check_root() { :; }
+    installer_unit_active() { return 1; }
+    installer_systemd_run() { return 5; }
+
+    rc=0
+    output=$(installer_unit_start "$secrets_file" "$setup_script" 2>&1) || rc=$?
+    assert_equals "1" "$rc" "systemd-run failure is not swallowed" || all_passed=1
+    assert_true "[[ \"\$output\" == *'systemd-run failed'* ]]" "failure is reported" || all_passed=1
+    assert_true "[[ \"\$output\" == *'journalctl -u vmangos-install -n 50'* ]]" "failure points at a diagnosis command" || all_passed=1
+
+    rm -rf "$temp_root"
+    return $all_passed
+}
+
+test_installer_unit_stop_issues_stop_and_reset_failed() {
+    # shellcheck source=../lib/installer.sh
+    source "$LIB_DIR/installer.sh"
+
+    local all_passed=0
+    local systemctl_log
+
+    systemctl_log=$(mktemp)
+    check_root() { :; }
+    installer_systemctl() {
+        printf '%s\n' "$*" >> "$systemctl_log"
+        return 0
+    }
+
+    installer_unit_stop
+    assert_equals "stop vmangos-install.service
+reset-failed vmangos-install.service" "$(cat "$systemctl_log")" "stop path issues stop then reset-failed" || all_passed=1
+
+    rm -f "$systemctl_log"
+    return $all_passed
+}
+
+test_installer_unit_start_requires_secrets_file() {
+    # shellcheck source=../lib/installer.sh
+    source "$LIB_DIR/installer.sh"
+
+    local all_passed=0
+    local temp_root setup_script output rc
+
+    temp_root=$(mktemp -d)
+    setup_script="$temp_root/vmangos_setup.sh"
+    printf '#!/bin/bash\nexit 0\n' > "$setup_script"
+
+    check_root() { :; }
+    installer_unit_active() { return 1; }
+    installer_systemd_run() { return 0; }
+
+    rc=0
+    output=$(installer_unit_start "$temp_root/missing.conf" "$setup_script" 2>&1) || rc=$?
+    assert_equals "1" "$rc" "missing secrets file is rejected" || all_passed=1
+    assert_true "[[ \"\$output\" == *'secrets file not found'* ]]" "rejection names the missing secrets file" || all_passed=1
+
+    rm -rf "$temp_root"
+    return $all_passed
+}
+
+# ============================================================================
+# Install wizard (#102): CLI dispatch + existing-install gate
+# ============================================================================
+
+test_cli_install_requires_root() {
+    local all_passed=0
+    local output rc lines
+
+    if [[ "$EUID" -eq 0 ]]; then
+        log_info "running as root; skipping non-root refusal check"
+        return $all_passed
+    fi
+
+    rc=0
+    output=$(bash "$MANAGER_DIR/bin/vmangos-manager" install 2>&1) || rc=$?
+    lines=$(printf '%s\n' "$output" | wc -l)
+
+    assert_true "[[ \"\$output\" == *'Run this with sudo: sudo vmangos-manager install'* ]]" \
+        "install refusal names the sudo command" || all_passed=1
+    assert_equals 1 "$lines" "install refusal is a single line" || all_passed=1
+    assert_equals 1 "$rc" "install non-root refusal exits 1" || all_passed=1
+
+    return $all_passed
+}
+
+test_cli_install_dispatch_fast_fails_without_python() {
+    # VMANGOS_WIZARD_PYTHON seam: a missing python must fail fast with the
+    # bootstrap hint, before any gate evaluation or wizard startup.
+    local all_passed=0
+    local output rc
+
+    rc=0
+    output=$(
+        cd "$MANAGER_DIR"
+        VMANGOS_WIZARD_PYTHON=/nonexistent \
+            bash -c 'source lib/wizard.sh; CONFIG_FILE=/dev/null; wizard_run /bin/true /nonexistent/secrets /nonexistent/setup.sh false' 2>&1
+    ) || rc=$?
+
+    assert_true "[[ \"\$output\" == *'Wizard dependencies are not installed'* ]]" \
+        "dispatch reports missing wizard dependencies" || all_passed=1
+    assert_true "[[ \"\$output\" == *'install --bootstrap'* ]]" \
+        "dispatch names the bootstrap fix" || all_passed=1
+    assert_equals 1 "$rc" "dispatch exits 1 when the wizard python is missing" || all_passed=1
+
+    return $all_passed
+}
+
+test_cli_install_reports_active_unit() {
+    # A still-running install unit gets a one-line pointer and exit 0
+    # (the attach experience is #103).
+    local all_passed=0
+    local output rc
+
+    rc=0
+    output=$(
+        cd "$MANAGER_DIR"
+        VMANGOS_WIZARD_PYTHON=/nonexistent \
+            bash -c 'source lib/wizard.sh; CONFIG_FILE=/dev/null; installer_unit_active() { return 0; }; wizard_run /bin/true /nonexistent/secrets /nonexistent/setup.sh false' 2>&1
+    ) || rc=$?
+
+    assert_true "[[ \"\$output\" == *'Install already running'* ]]" \
+        "active unit gets a pointer line" || all_passed=1
+    assert_true "[[ \"\$output\" == *'journalctl -u vmangos-install -f'* ]]" \
+        "pointer names the follow command" || all_passed=1
+    assert_equals 0 "$rc" "active unit exits 0" || all_passed=1
+
+    return $all_passed
+}
+
+test_cli_install_attaches_active_unit() {
+    # An active install unit + an available Textual python → dispatch launches
+    # the viewer with --attach (not the gate/form flow, not the pointer).
+    local all_passed=0
+    local output rc
+    local fake_python
+    fake_python=$(mktemp "${TMPDIR:-/tmp}/vmangos_fake_python.XXXXXX")
+    # The fake python passes the 'import textual' check and records its args.
+    cat > "$fake_python" <<'PYEOF'
+#!/usr/bin/env bash
+if [[ "$1" == "-c" ]]; then
+    exit 0
+fi
+echo "FAKE_PYTHON_ARGS: $*"
+PYEOF
+    chmod +x "$fake_python"
+
+    rc=0
+    output=$(
+        cd "$MANAGER_DIR"
+        VMANGOS_WIZARD_PYTHON="$fake_python" \
+            bash -c 'source lib/wizard.sh; CONFIG_FILE=/dev/null; installer_unit_active() { return 0; }; wizard_run /bin/true /nonexistent/secrets /nonexistent/setup.sh false' 2>&1
+    ) || rc=$?
+
+    assert_true "[[ \"\$output\" == *'--attach'* ]]" \
+        "active unit dispatch launches the viewer with --attach" || all_passed=1
+    assert_true "printf '%s' \"$output\" | grep -q 'FAKE_PYTHON_ARGS'" \
+        "attach dispatch invokes the python app" || all_passed=1
+    assert_true "! printf '%s' \"$output\" | grep -q 'Install already running'" \
+        "attach with python does not fall back to the pointer" || all_passed=1
+
+    rm -f "$fake_python"
+    return $all_passed
+}
+
+test_wizard_gate_action_table() {
+    # The gate evaluates exactly as auto_install.sh does: the real
+    # vmangos_setup.sh existing_install_action against a temp install root.
+    # shellcheck source=../lib/wizard.sh
+    source "$LIB_DIR/wizard.sh"
+
+    local all_passed=0
+    local workdir root secrets setup_script output checkpoint
+
+    workdir=$(mktemp -d)
+    root="$workdir/opt/mangos"
+    secrets="$workdir/setup.conf"
+    setup_script="$MANAGER_DIR/../vmangos_setup.sh"
+
+    # clean: no install root
+    rm -rf "$root"
+    printf 'INSTALLROOT="%s"\n' "$root" > "$secrets"
+    output=$(wizard_gate_action "$secrets" "$setup_script" 2>&1)
+    assert_equals "clean" "$(printf '%s' "$output" | tail -1)" "gate: no install root -> clean" || all_passed=1
+
+    # resume: install root with a checkpoint
+    mkdir -p "$root/.install-checkpoints"
+    echo "SOURCE_DONE" > "$root/.install-checkpoints/checkpoint"
+    output=$(wizard_gate_action "$secrets" "$setup_script" 2>&1)
+    assert_equals "resume" "$(printf '%s' "$output" | tail -1)" "gate: checkpoint present -> resume" || all_passed=1
+
+    # abort: full install, policy abort (default)
+    rm -rf "$root/.install-checkpoints"
+    printf 'INSTALLROOT="%s"\n' "$root" > "$secrets"
+    output=$(wizard_gate_action "$secrets" "$setup_script" 2>&1)
+    assert_equals "abort" "$(printf '%s' "$output" | tail -1)" "gate: full install, policy default -> abort" || all_passed=1
+
+    # replace: full install, policy replace
+    printf 'INSTALLROOT="%s"\nREINSTALL_POLICY="replace"\n' "$root" > "$secrets"
+    output=$(wizard_gate_action "$secrets" "$setup_script" 2>&1)
+    assert_equals "replace" "$(printf '%s' "$output" | tail -1)" "gate: full install, policy replace -> replace" || all_passed=1
+
+    # checkpoint helper reads the resume point
+    mkdir -p "$root/.install-checkpoints"
+    echo "BUILD_DONE" > "$root/.install-checkpoints/checkpoint"
+    checkpoint=$(wizard_checkpoint "$root")
+    assert_equals "BUILD_DONE" "$checkpoint" "checkpoint helper reads the checkpoint file" || all_passed=1
+
+    rm -rf "$workdir"
+    return $all_passed
+}
+
+test_wizard_gate_action_rejects_missing_setup_script() {
+    # shellcheck source=../lib/wizard.sh
+    source "$LIB_DIR/wizard.sh"
+
+    local all_passed=0
+    local output rc
+
+    rc=0
+    output=$(wizard_gate_action /nonexistent/secrets /nonexistent/vmangos_setup.sh 2>&1) || rc=$?
+    assert_equals 1 "$rc" "gate fails when the setup script is missing" || all_passed=1
+    assert_true "[[ \"\$output\" == *'Setup script not found'* ]]" \
+        "gate names the missing setup script" || all_passed=1
+
+    return $all_passed
+}
+
+test_installer_clear_install_resets_to_clean() {
+    # The destructive path: after clearing the install root the gate must
+    # flip from resume to clean — a post-replace launch starts from START,
+    # not the old checkpoint.
+    # shellcheck source=../lib/installer.sh
+    source "$LIB_DIR/installer.sh"
+    # shellcheck source=../lib/wizard.sh
+    source "$LIB_DIR/wizard.sh"
+
+    local all_passed=0
+    local workdir root secrets setup_script output
+
+    workdir=$(mktemp -d)
+    root="$workdir/opt/mangos"
+    secrets="$workdir/setup.conf"
+    setup_script="$MANAGER_DIR/../vmangos_setup.sh"
+
+    # Establish a resume-state install: root with a checkpoint.
+    mkdir -p "$root/.install-checkpoints"
+    echo "SOURCE_DONE" > "$root/.install-checkpoints/checkpoint"
+    printf 'INSTALLROOT="%s"\n' "$root" > "$secrets"
+
+    output=$(wizard_gate_action "$secrets" "$setup_script" 2>&1)
+    assert_equals "resume" "$(printf '%s' "$output" | tail -1)" "pre-clear gate is resume" || all_passed=1
+
+    # Clear it — the destructive verb the wizard's typed confirmation leads to.
+    installer_clear_install "$root" || all_passed=1
+    assert_true "[[ ! -e \"$root\" ]]" "clear removes the install root" || all_passed=1
+
+    # Post-clear: the gate must be clean — a fresh start from START.
+    output=$(wizard_gate_action "$secrets" "$setup_script" 2>&1)
+    assert_equals "clean" "$(printf '%s' "$output" | tail -1)" "post-clear gate is clean (starts from START)" || all_passed=1
+
+    rm -rf "$workdir"
+    return $all_passed
+}
+
+test_installer_clear_install_refuses_unsafe_root() {
+    # shellcheck source=../lib/installer.sh
+    source "$LIB_DIR/installer.sh"
+
+    local all_passed=0
+    local output rc
+
+    # Empty root
+    rc=0
+    output=$(installer_clear_install "" 2>&1) || rc=$?
+    assert_equals 1 "$rc" "clear refuses an empty root" || all_passed=1
+    assert_true "[[ \"\$output\" == *'Refusing to clear an unsafe install root'* ]]" \
+        "clear names the refusal" || all_passed=1
+
+    # Relative root
+    rc=0
+    output=$(installer_clear_install "opt/mangos" 2>&1) || rc=$?
+    assert_equals 1 "$rc" "clear refuses a relative root" || all_passed=1
+
+    # Root filesystem
+    rc=0
+    output=$(installer_clear_install "/" 2>&1) || rc=$?
+    assert_equals 1 "$rc" "clear refuses the root filesystem" || all_passed=1
+
+    # Top-level single-component directories must never be clearable.
+    # (rc==1 guarantees rm -rf was never reached — it returns before it.)
+    local top
+    for top in /tmp /home /opt /var /etc /usr; do
+        rc=0
+        output=$(installer_clear_install "$top" 2>&1) || rc=$?
+        assert_equals 1 "$rc" "clear refuses the top-level directory $top" || all_passed=1
+        assert_true "[[ \"\$output\" == *'Refusing to clear a top-level directory'* ]]" \
+            "clear names the top-level refusal for $top" || all_passed=1
+    done
+
+    return $all_passed
+}
+
+test_installer_clear_install_marker_guard() {
+    # A non-empty directory is only deletable when it is a VMaNGOS install
+    # root (carries .install-checkpoints). Empty or missing directories are
+    # fine; a non-empty non-install directory must be refused.
+    # shellcheck source=../lib/installer.sh
+    source "$LIB_DIR/installer.sh"
+
+    local all_passed=0
+    local workdir output rc
+
+    workdir=$(mktemp -d)
+
+    # 1) Non-empty directory WITHOUT the marker -> refused, and left intact.
+    local data="$workdir/somedata"
+    mkdir -p "$data"
+    echo "precious" > "$data/file.txt"
+    rc=0
+    output=$(installer_clear_install "$data" 2>&1) || rc=$?
+    assert_equals 1 "$rc" "clear refuses a non-empty non-install directory" || all_passed=1
+    assert_true "[[ \"\$output\" == *'.install-checkpoints marker'* ]]" \
+        "clear names the marker guard" || all_passed=1
+    assert_true "[[ -f \"$data/file.txt\" ]]" "non-install directory left intact" || all_passed=1
+
+    # 2) Non-empty directory WITH the marker (a real install root) -> allowed.
+    local installroot="$workdir/opt/mangos"
+    mkdir -p "$installroot/.install-checkpoints"
+    echo "SOURCE_DONE" > "$installroot/.install-checkpoints/checkpoint"
+    rc=0
+    output=$(installer_clear_install "$installroot" 2>&1) || rc=$?
+    assert_equals 0 "$rc" "clear removes a real install root" || all_passed=1
+    assert_true "[[ ! -e \"$installroot\" ]]" "install root removed" || all_passed=1
+
+    # 3) Empty directory -> allowed (nothing to protect).
+    local empty="$workdir/opt/empty"
+    mkdir -p "$empty"
+    rc=0
+    output=$(installer_clear_install "$empty" 2>&1) || rc=$?
+    assert_equals 0 "$rc" "clear removes an empty directory" || all_passed=1
+    assert_true "[[ ! -e \"$empty\" ]]" "empty directory removed" || all_passed=1
+
+    # 4) Missing directory -> allowed (fresh-install case, rm -rf is a no-op).
+    local missing="$workdir/opt/missing"
+    rc=0
+    output=$(installer_clear_install "$missing" 2>&1) || rc=$?
+    assert_equals 0 "$rc" "clear tolerates a missing directory" || all_passed=1
+
+    rm -rf "$workdir"
+    return $all_passed
+}
+
+test_wizard_gate_action_ignores_noisy_secrets() {
+    # A secrets file that prints to stdout/stderr when sourced must not leak
+    # into the gate result or the error output.
+    # shellcheck source=../lib/wizard.sh
+    source "$LIB_DIR/wizard.sh"
+
+    local all_passed=0
+    local workdir root secrets setup_script output
+
+    workdir=$(mktemp -d)
+    root="$workdir/opt/mangos"
+    secrets="$workdir/setup.conf"
+    setup_script="$MANAGER_DIR/../vmangos_setup.sh"
+
+    rm -rf "$root"
+    {
+        echo 'echo "leak-stdout-marker"'
+        echo 'echo "leak-stderr-marker" >&2'
+        printf 'INSTALLROOT="%s"\n' "$root"
+    } > "$secrets"
+
+    output=$(wizard_gate_action "$secrets" "$setup_script" 2>&1)
+    assert_equals "clean" "$(printf '%s' "$output" | tail -1)" "noisy secrets still gate clean" || all_passed=1
+    assert_true "! printf '%s' \"$output\" | grep -q leak-stdout-marker" "stdout noise not captured" || all_passed=1
+    assert_true "! printf '%s' \"$output\" | grep -q leak-stderr-marker" "stderr noise not captured" || all_passed=1
+
+    rm -rf "$workdir"
+    return $all_passed
+}
+
+test_cli_install_bootstrap_during_active_unit() {
+    # --bootstrap must run before the active-unit check (mirrors
+    # dashboard_run): an active unit must not short-circuit bootstrap.
+    local all_passed=0
+    local output rc
+
+    rc=0
+    output=$(
+        cd "$MANAGER_DIR"
+        VMANGOS_WIZARD_PYTHON=/nonexistent \
+            bash -c 'source lib/wizard.sh; CONFIG_FILE=/dev/null; installer_unit_active() { return 0; }; wizard_bootstrap() { echo "BOOTSTRAPPED"; return 0; }; wizard_run /bin/true /nonexistent/secrets /nonexistent/setup.sh true' 2>&1
+    ) || rc=$?
+
+    assert_true "! printf '%s' \"$output\" | grep -q 'Install already running'" \
+        "bootstrap is not short-circuited by an active unit" || all_passed=1
+    assert_true "printf '%s' \"$output\" | grep -q BOOTSTRAPPED" \
+        "bootstrap runs despite an active unit" || all_passed=1
+    assert_equals 0 "$rc" "bootstrap exits 0" || all_passed=1
+
+    return $all_passed
+}
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -4694,7 +5307,25 @@ main() {
     run_test "Backup: Metadata failure preserves dump" test_backup_now_metadata_failure_preserves_dump
     run_test "Backup: List tolerates legacy metadata" test_backup_list_tolerates_legacy_metadata
     run_test "Backup: Metadata carries real commit" test_backup_metadata_carries_real_commit
-    
+    run_test "Installer: Unit name and state queries" test_installer_unit_name_and_state_queries
+    run_test "Installer: Start builds systemd-run env" test_installer_unit_start_builds_systemd_run_env
+    run_test "Installer: Start forwards mmaps skip" test_installer_unit_start_forwards_mmaps_skip
+    run_test "Installer: Start rejects double start" test_installer_unit_start_rejects_double_start
+    run_test "Installer: Start surfaces systemd-run failure" test_installer_unit_start_surfaces_systemd_run_failure
+    run_test "Installer: Stop issues stop and reset-failed" test_installer_unit_stop_issues_stop_and_reset_failed
+    run_test "Installer: Start requires secrets file" test_installer_unit_start_requires_secrets_file
+    run_test "Wizard: install requires root (single line, exit 1)" test_cli_install_requires_root
+    run_test "Wizard: dispatch fast-fails without wizard python" test_cli_install_dispatch_fast_fails_without_python
+    run_test "Wizard: active install unit gets a pointer" test_cli_install_reports_active_unit
+    run_test "Wizard: active install unit attaches the viewer" test_cli_install_attaches_active_unit
+    run_test "Wizard: gate action table (clean/resume/abort/replace)" test_wizard_gate_action_table
+    run_test "Wizard: gate rejects missing setup script" test_wizard_gate_action_rejects_missing_setup_script
+    run_test "Installer: clear removes root and flips gate to clean" test_installer_clear_install_resets_to_clean
+    run_test "Installer: clear refuses unsafe roots" test_installer_clear_install_refuses_unsafe_root
+    run_test "Installer: clear marker guard (non-empty needs marker)" test_installer_clear_install_marker_guard
+    run_test "Wizard: gate ignores noisy secrets file" test_wizard_gate_action_ignores_noisy_secrets
+    run_test "Wizard: bootstrap runs before the active-unit check" test_cli_install_bootstrap_during_active_unit
+
     local unregistered_failed=0
     if ! report_unregistered_tests; then
         unregistered_failed=1

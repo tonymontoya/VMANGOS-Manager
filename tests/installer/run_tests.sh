@@ -300,7 +300,10 @@ EOF
                 printf "SYMLINK=0\n"
             fi
 
-            export SUDO_DENY="'"$tmp_dir"'/client-src/dbc.MPQ"
+            # Deny the path the extractor actually reads (via Data/): the
+            # client data is then unreadable from the extractor point of
+            # view, so the staged copy under $INSTALLROOT must be used.
+            export SUDO_DENY="'"$tmp_dir"'/client-src/Data/dbc.MPQ"
             mkdir -p "$INSTALLROOT/client-data"
             touch "$INSTALLROOT/client-data/dbc.MPQ"
             prepare_extraction_root
@@ -321,6 +324,426 @@ EOF
     assert_equals "1" \
         "$(printf '%s\n' "$output" | grep -c 'RESULT3=.*root/client-data')" \
         "unreadable client data falls back to the staged client-data copy"
+}
+
+# ensure_database_server's three provisioning paths, with every external
+# command stubbed: adopt a running reachable server, install a server when
+# none is running, and refuse (with an error marker, at adoption time) a
+# running server root cannot administer.
+test_database_server_provisioning() {
+    local tmp_dir state capture failed=0
+    tmp_dir="$(mktemp -d)"
+    state="$tmp_dir/state"
+    capture="$tmp_dir/capture"
+    mkdir -p "$tmp_dir/bin" "$tmp_dir/bin2" "$state"
+
+    # Hermetic host tools: the scenarios must see the host exactly as the
+    # suite assumes — in particular NO mysql client on PATH (CI runners
+    # ship a real one; the scenarios stage their own via bin2, and the
+    # client-missing scenarios need `command -v mysql` to fail). Everything
+    # else the sourced installer needs (date, sleep, ...) stays available.
+    local hostbin="$tmp_dir/hostbin" pdir tool
+    mkdir -p "$hostbin"
+    for pdir in $(printf '%s' "$PATH" | tr ':' ' '); do
+        for tool in "$pdir"/*; do
+            if [[ ! -x "$tool" ]]; then continue; fi
+            tool="${tool##*/}"
+            if [[ "$tool" == mysql* || "$tool" == mariadb* ]]; then continue; fi
+            if [[ ! -e "$hostbin/$tool" ]]; then ln -s "$pdir/$tool" "$hostbin/$tool"; fi
+        done
+    done
+
+    cat > "$tmp_dir/bin/systemctl" <<EOF
+#!/usr/bin/env bash
+printf 'systemctl:%s\n' "\$*" >> '$capture'
+if [[ "\${1:-}" == "is-active" ]]; then
+    [[ -f '$state/active' ]] && exit 0
+    exit 3
+fi
+if [[ "\${1:-}" == "start" ]]; then
+    touch '$state/active'
+fi
+exit 0
+EOF
+    # apt-get records every call; installing either package also provides
+    # the mysql binary (bin2 is the only PATH entry that ever holds mysql).
+    cat > "$tmp_dir/bin/apt-get" <<EOF
+#!/usr/bin/env bash
+printf 'apt-get:%s\n' "\$*" >> '$capture'
+case " \$* " in
+    *" mysql-client "*) cp '$tmp_dir/mysql-stub' '$tmp_dir/bin2/mysql' ;;
+    *" mysql-server "*) cp '$tmp_dir/mysql-stub' '$tmp_dir/bin2/mysql' ;;
+esac
+exit 0
+EOF
+    # The mysql client: connectable (as root, via the socket) only while a
+    # server is active and not flagged unreachable.
+    cat > "$tmp_dir/mysql-stub" <<EOF
+#!/usr/bin/env bash
+[[ "\${1:-}" == "-e" ]] || exit 2
+[[ -f '$state/unreachable' ]] && exit 1
+[[ -f '$state/active' ]] || exit 1
+exit 0
+EOF
+    chmod +x "$tmp_dir/bin/systemctl" "$tmp_dir/bin/apt-get" "$tmp_dir/mysql-stub"
+
+    # run_scenario NAME PRELUDE — sources the installer, runs the prelude
+    # (flag/client setup), then ensure_database_server; captures rc + output.
+    run_scenario() {
+        local name="$1" prelude="$2"
+        rm -rf "$state" "$tmp_dir/bin2"
+        mkdir -p "$state" "$tmp_dir/bin2"
+        : > "$capture"
+        INSTALL_LOG="$tmp_dir/install-$name.log" \
+        PATH="$tmp_dir/bin2:$tmp_dir/bin:$hostbin" \
+        REPO_ROOT="$REPO_ROOT" \
+        bash -c '
+            set -u
+            source "$REPO_ROOT/vmangos_setup.sh"
+            '"$prelude"'
+            set +e
+            ensure_database_server
+            rc=$?
+            set -e
+            printf "RC=%s\n" "$rc"
+        ' > "$tmp_dir/out-$name" 2>/dev/null
+    }
+
+    # A. A running, reachable server is adopted; nothing is installed.
+    run_scenario adopt \
+        "touch '$state/active'; cp '$tmp_dir/mysql-stub' '$tmp_dir/bin2/mysql'"
+    assert_equals "0" "$(sed -n 's/^RC=//p' "$tmp_dir/out-adopt")" \
+        "a running reachable server is adopted" || failed=1
+    assert_equals "1" \
+        "$(grep -c 'Using existing MySQL/MariaDB server (already reachable)' "$tmp_dir/out-adopt" || true)" \
+        "adoption of a reachable server is logged" || failed=1
+    assert_equals "0" \
+        "$(grep -c '^apt-get:' "$capture" || true)" \
+        "adopting a reachable server installs nothing" || failed=1
+
+    # B. No server running: mysql-server is installed and started.
+    run_scenario install ""
+    assert_equals "0" "$(sed -n 's/^RC=//p' "$tmp_dir/out-install")" \
+        "a fresh host provisions its own server" || failed=1
+    assert_equals "1" \
+        "$(grep -c '^apt-get:install -y mysql-server$' "$capture" || true)" \
+        "no running server means mysql-server is installed" || failed=1
+    assert_equals "1" \
+        "$(grep -c '^systemctl:start mysql$' "$capture" || true)" \
+        "the installed server is started" || failed=1
+    assert_equals "1" \
+        "$(grep -c 'installed, started, and reachable' "$tmp_dir/out-install" || true)" \
+        "a provisioned server is confirmed reachable" || failed=1
+
+    # C. A server is running but root cannot connect: refused at adoption
+    #    time with an error marker, not adopted to fail later at grants.
+    run_scenario unreachable \
+        "touch '$state/active' '$state/unreachable'; cp '$tmp_dir/mysql-stub' '$tmp_dir/bin2/mysql'"
+    assert_equals "1" "$(sed -n 's/^RC=//p' "$tmp_dir/out-unreachable")" \
+        "a running but unreachable server is refused" || failed=1
+    assert_equals "1" \
+        "$(grep -c '^@@VMANGOS v1 phase=database event=error' "$tmp_dir/out-unreachable" || true)" \
+        "refusing an unreachable server emits a database error marker" || failed=1
+    assert_equals "1" \
+        "$(grep '^@@VMANGOS v1 ' "$tmp_dir/out-unreachable" | grep -c 'msg="A database server is running but root cannot connect to it"' || true)" \
+        "the error marker names the real problem" || failed=1
+    assert_equals "1" \
+        "$(grep -c 'cannot administer' "$tmp_dir/out-unreachable" || true)" \
+        "the refusal names the exact broken check" || failed=1
+    assert_equals "0" \
+        "$(grep -c '^apt-get:' "$capture" || true)" \
+        "an unreachable server with a client present installs nothing" || failed=1
+
+    # D. A server is running and reachable, but the client is missing: the
+    #    client is installed and the server adopted.
+    run_scenario client-missing "touch '$state/active'"
+    assert_equals "0" "$(sed -n 's/^RC=//p' "$tmp_dir/out-client-missing")" \
+        "a running server without a client is adopted after client install" || failed=1
+    assert_equals "1" \
+        "$(grep -c '^apt-get:install -y mysql-client$' "$capture" || true)" \
+        "only the mysql client is installed for an adoptable server" || failed=1
+    assert_equals "0" \
+        "$(grep -c '^apt-get:install -y mysql-server' "$capture" || true)" \
+        "no second server is installed next to a running one" || failed=1
+
+    # E. A server is running, the client is missing, and it stays
+    #    unreachable after the client install: still refused with a marker.
+    run_scenario client-missing-unreachable "touch '$state/active' '$state/unreachable'"
+    assert_equals "1" "$(sed -n 's/^RC=//p' "$tmp_dir/out-client-missing-unreachable")" \
+        "a server that stays unreachable after client install is refused" || failed=1
+    assert_equals "1" \
+        "$(grep -c '^@@VMANGOS v1 phase=database event=error' "$tmp_dir/out-client-missing-unreachable" || true)" \
+        "the refusal after client install emits an error marker" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+# The symlink farm staged over read-only client data: created with per-MPQ
+# symlinks plus the Data/ entry, and reused as-is (not rebuilt) on a resume.
+test_client_data_symlink_farm() {
+    local tmp_dir output failed=0
+    tmp_dir="$(mktemp -d)"
+    mkdir -p "$tmp_dir/bin" "$tmp_dir/client" "$tmp_dir/root"
+
+    cat > "$tmp_dir/bin/sudo" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "-u" ]]; then shift 2; fi
+if [[ "\${1:-}" == "test" ]]; then
+    if [[ "\${3:-}" == "$tmp_dir/client/Data/dbc.MPQ" ]]; then exit 1; fi
+    [[ -r "\${3:-}" ]] && exit 0
+    exit 1
+fi
+exec "\$@"
+EOF
+    chmod +x "$tmp_dir/bin/sudo"
+
+    touch "$tmp_dir/client/dbc.MPQ" "$tmp_dir/client/terrain.MPQ" "$tmp_dir/client/patch.MPQ"
+    mkdir -p "$tmp_dir/client/Interface"
+    # Read-only client data (like a :ro mount): the self-symlink cannot be
+    # created in place, so the farm under the install root is the only way.
+    chmod a-w "$tmp_dir/client"
+
+    output="$(
+        INSTALL_LOG="$tmp_dir/install.log" \
+        PATH="$tmp_dir/bin:$PATH" \
+        REPO_ROOT="$REPO_ROOT" \
+        FARM_TEST_TMP="$tmp_dir" \
+        bash -c '
+            set -euo pipefail
+            source "$REPO_ROOT/vmangos_setup.sh"
+            INSTALLROOT="$FARM_TEST_TMP/root"
+            CLIENT_DATA="$FARM_TEST_TMP/client"
+            MANGOSOSUSER="mangos"
+            STAGED="$FARM_TEST_TMP/root/client-data"
+
+            prepare_extraction_root
+            printf "ROOT1=%s\n" "$CLIENT_DATA_EXTRACT_ROOT"
+            [ -L "$STAGED/dbc.MPQ" ] && printf "DBC_LINK=1\n"
+            [ "$(readlink "$STAGED/dbc.MPQ")" = "$FARM_TEST_TMP/client/dbc.MPQ" ] && printf "DBC_TARGET=1\n"
+            [ -L "$STAGED/Data" ] && [ "$(readlink "$STAGED/Data")" = "." ] && printf "DATA_LINK=1\n"
+            [ -L "$STAGED/Interface" ] && printf "INTERFACE_LINK=1\n"
+
+            # A resume re-enters preparation: the farm must be reused, not
+            # rebuilt (the sentinel only survives if nothing rm -rf-ed it).
+            touch "$STAGED/.sentinel"
+            prepare_extraction_root
+            printf "ROOT2=%s\n" "$CLIENT_DATA_EXTRACT_ROOT"
+            [ -f "$STAGED/.sentinel" ] && printf "SENTINEL=1\n"
+        ' 2>/dev/null
+    )"
+    chmod u+w "$tmp_dir/client"
+    rm -rf "$tmp_dir"
+
+    assert_equals "$tmp_dir/root/client-data" \
+        "$(printf '%s\n' "$output" | sed -n 's/^ROOT1=//p')" \
+        "read-only client data is staged as the symlink farm" || failed=1
+    assert_equals "1" "$(printf '%s\n' "$output" | sed -n 's/^DBC_LINK=//p')" \
+        "farm entries are symlinks, not copies" || failed=1
+    assert_equals "1" "$(printf '%s\n' "$output" | sed -n 's/^DBC_TARGET=//p')" \
+        "farm symlinks point at the read-only client data" || failed=1
+    assert_equals "1" "$(printf '%s\n' "$output" | sed -n 's/^DATA_LINK=//p')" \
+        "the farm provides the Data/ self-symlink the extractor needs" || failed=1
+    assert_equals "1" "$(printf '%s\n' "$output" | sed -n 's/^INTERFACE_LINK=//p')" \
+        "the Interface directory is part of the farm" || failed=1
+    assert_equals "$tmp_dir/root/client-data" \
+        "$(printf '%s\n' "$output" | sed -n 's/^ROOT2=//p')" \
+        "a resumed install reuses the staged farm" || failed=1
+    assert_equals "1" "$(printf '%s\n' "$output" | sed -n 's/^SENTINEL=//p')" \
+        "reusing the farm does not rebuild it" || failed=1
+
+    return "$failed"
+}
+
+# An interrupted vmap extraction leaves a partial Buildings dir; the resume
+# must clear it (vmapextractor refuses polluted directories) instead of
+# silently downgrading to a vmap-less install.
+test_extraction_resume_clears_partial_vmaps() {
+    local tmp_dir root client output failed=0
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    client="$tmp_dir/client-src"
+    mkdir -p "$tmp_dir/bin" "$client" "$root/run/bin/Extractors" "$root/client-data" "$root/.install-checkpoints" "$root/Buildings"
+
+    cat > "$tmp_dir/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+if [[ "${1:-}" == "test" ]]; then
+    [[ -r "${3:-}" ]] && exit 0
+    exit 1
+fi
+exec "$@"
+EOF
+    cat > "$tmp_dir/bin/id" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    cat > "$tmp_dir/bin/chown" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$tmp_dir/bin/sudo" "$tmp_dir/bin/id" "$tmp_dir/bin/chown"
+
+    touch "$client/dbc.MPQ" "$client/terrain.MPQ" "$root/client-data/dbc.MPQ"
+    # What the killed first attempt left behind.
+    touch "$root/Buildings/partial-from-interrupted-run"
+
+    cat > "$root/run/bin/Extractors/MapExtractor" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p dbc maps
+touch dbc/Map.dbc maps/0004331.map
+exit 0
+EOF
+    cat > "$root/run/bin/Extractors/VMapExtractor" <<EOF
+#!/usr/bin/env bash
+printf 'vmapextractor:%s\n' "\$*" >> '$tmp_dir/capture'
+mkdir -p Buildings
+touch Buildings/fresh-output.wmo
+exit 0
+EOF
+    cat > "$root/run/bin/Extractors/VMapAssembler" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p vmaps
+touch vmaps/000.vmtree
+exit 0
+EOF
+    cat > "$root/run/bin/Extractors/MoveMapGenerator" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p mmaps
+touch mmaps/000.mmap
+exit 0
+EOF
+    chmod +x "$root/run/bin/Extractors/"*
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        refresh_runtime_paths
+        CLIENT_DATA="'"$client"'"
+        MANGOSOSUSER="mangos"
+        export SUDO_DENY="'"$client"'/dbc.MPQ"
+
+        phase_data_extraction
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+    output="$(cat "$tmp_dir/phase.out")"
+
+    assert_equals "1" \
+        "$(grep -c 'Clearing partial vmap extraction output' "$tmp_dir/phase.out" || true)" \
+        "a partial Buildings dir from an earlier attempt is cleared with a warning" || failed=1
+    assert_equals "1" \
+        "$(grep -c '^vmapextractor:' "$tmp_dir/capture" 2>/dev/null || true)" \
+        "vmapextractor re-runs on the resume" || failed=1
+    assert_equals "0" \
+        "$(test -e "$root/Buildings/partial-from-interrupted-run" && echo 1 || echo 0)" \
+        "the stale partial Buildings content is gone" || failed=1
+    assert_equals "1" \
+        "$(test -e "$root/Buildings/fresh-output.wmo" && echo 1 || echo 0)" \
+        "the re-run extraction produced fresh output" || failed=1
+    assert_equals "1" \
+        "$(grep -c 'phase=extraction event=done' "$tmp_dir/phase.out" || true)" \
+        "extraction still completes" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+# VMANGOS_SKIP_MMAPS=1 skips the hours-long MoveMapGen step with a warn
+# marker (the smoke's default): DBC/maps/vmaps still extract, the phase
+# still completes, and the generator never runs.
+test_extraction_skip_mmaps() {
+    local tmp_dir root client output failed=0
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    client="$tmp_dir/client-src"
+    mkdir -p "$tmp_dir/bin" "$client" "$root/run/bin/Extractors" "$root/client-data" "$root/.install-checkpoints"
+
+    cat > "$tmp_dir/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+if [[ "${1:-}" == "test" ]]; then
+    [[ -r "${3:-}" ]] && exit 0
+    exit 1
+fi
+exec "$@"
+EOF
+    cat > "$tmp_dir/bin/id" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    cat > "$tmp_dir/bin/chown" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$tmp_dir/bin/sudo" "$tmp_dir/bin/id" "$tmp_dir/bin/chown"
+
+    touch "$client/dbc.MPQ" "$client/terrain.MPQ" "$root/client-data/dbc.MPQ"
+    # Pre-create so a never-invoked generator asserts as 0, not empty.
+    : > "$tmp_dir/capture"
+
+    cat > "$root/run/bin/Extractors/MapExtractor" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p dbc maps
+touch dbc/Map.dbc maps/0004331.map
+exit 0
+EOF
+    cat > "$root/run/bin/Extractors/VMapExtractor" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p Buildings
+touch Buildings/out.wmo
+exit 0
+EOF
+    cat > "$root/run/bin/Extractors/VMapAssembler" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p vmaps
+touch vmaps/000.vmtree
+exit 0
+EOF
+    cat > "$root/run/bin/Extractors/MoveMapGenerator" <<EOF
+#!/usr/bin/env bash
+printf 'movemapgen:%s\n' "\$*" >> '$tmp_dir/capture'
+mkdir -p mmaps
+exit 0
+EOF
+    chmod +x "$root/run/bin/Extractors/"*
+
+    VMANGOS_SKIP_MMAPS=1 \
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        refresh_runtime_paths
+        CLIENT_DATA="'"$client"'"
+        MANGOSOSUSER="mangos"
+
+        phase_data_extraction
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+    output="$(cat "$tmp_dir/phase.out")"
+
+    assert_equals "0" \
+        "$(grep -c '^movemapgen:' "$tmp_dir/capture" 2>/dev/null || true)" \
+        "MoveMapGen never runs under VMANGOS_SKIP_MMAPS=1" || failed=1
+    assert_equals "1" \
+        "$(grep -c 'mmaps skipped by request' "$tmp_dir/phase.out" || true)" \
+        "the skip emits a warn marker naming the request" || failed=1
+    assert_equals "0" \
+        "$(test -e "$root/mmaps" && echo 1 || echo 0)" \
+        "no mmaps output is produced" || failed=1
+    assert_equals "1" \
+        "$(grep -c 'phase=extraction event=done' "$tmp_dir/phase.out" || true)" \
+        "extraction still completes (DBC/maps/vmaps extracted)" || failed=1
+    assert_equals "DATA_DONE" \
+        "$(cat "$root/.install-checkpoints/checkpoint" 2>/dev/null || true)" \
+        "the DATA_DONE checkpoint is still written" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
 }
 
 test_extraction_phase_invocations() {
@@ -772,7 +1195,7 @@ EOF
         INSTALLROOT="'"$root"'"
         SERVERIP="10.0.5.5"
         MANGOSDBUSER="mangos"
-        MANGOSDBPASS="sekrit"
+        MANGOSDBPASS="ZaZZ--%!9----%\$*Z-^&0Aa9"
         AUTHDB="auth"
         WORLDDB="world"
         CHARACTERDB="characters"
@@ -782,18 +1205,981 @@ EOF
     ' > "$tmp_dir/test.out" 2>&1
 
     local failed=0
-    assert_equals "LoginDatabaseInfo = \"127.0.0.1;3306;mangos;sekrit;auth\"" \
+    # The exact password class the #104 TUI smoke broke on: the wizard
+    # charset includes & and $, and sed replacement text expands & to the
+    # whole matched line — the config used to corrupt mid-password and the
+    # daemons crash-looped on a malformed connection string.
+    assert_equals "LoginDatabaseInfo = \"127.0.0.1;3306;mangos;ZaZZ--%!9----%\$*Z-^&0Aa9;auth\"" \
         "$(grep '^LoginDatabaseInfo' "$root/run/etc/realmd.conf")" \
         "realmd connects to the local database, not the LAN IP" || failed=1
     assert_equals "BindIP = \"10.0.5.5\"" \
         "$(grep '^BindIP' "$root/run/etc/realmd.conf")" \
         "realmd still binds the LAN IP for clients" || failed=1
-    assert_equals "WorldDatabase.Info = \"127.0.0.1;3306;mangos;sekrit;world\"" \
+    assert_equals "WorldDatabase.Info = \"127.0.0.1;3306;mangos;ZaZZ--%!9----%\$*Z-^&0Aa9;world\"" \
         "$(grep '^WorldDatabase.Info' "$root/run/etc/mangosd.conf")" \
         "mangosd world database points at 127.0.0.1" || failed=1
     assert_equals "0" \
         "$(grep -c ';3306;.*10\.0\.5\.5' "$root/run/etc/mangosd.conf" "$root/run/etc/realmd.conf" | awk -F: '{s+=$2} END {print s}')" \
         "no database tuple keeps the LAN IP" || failed=1
+    assert_equals "4" \
+        "$(grep -c 'ZaZZ--%!9----%.\*Z-\^&0Aa9' "$root/run/etc/mangosd.conf" || true)" \
+        "every mangosd connection string carries the password verbatim" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_marker_protocol_format() {
+    local tmp_dir output failed=0
+    tmp_dir="$(mktemp -d)"
+
+    output="$(
+        INSTALL_LOG="$tmp_dir/install.log" \
+        REPO_ROOT="$REPO_ROOT" \
+        bash -c '
+            set -euo pipefail
+            source "$REPO_ROOT/vmangos_setup.sh"
+            log_marker build start
+            log_marker build progress "percent=42" "step=Compiling the core"
+            log_marker build "done"
+            log_marker build error "msg=it failed badly" "hint=fix the thing"
+            log_marker database warn "msg=CREATE DATABASE failed for world"
+        ' 2>/dev/null
+    )"
+    rm -rf "$tmp_dir"
+
+    assert_equals "@@VMANGOS v1 phase=build event=start" \
+        "$(printf '%s\n' "$output" | sed -n 1p)" \
+        "start marker is the protocol prefix plus phase and event" || failed=1
+    assert_equals "@@VMANGOS v1 phase=build event=progress percent=42 step=\"Compiling the core\"" \
+        "$(printf '%s\n' "$output" | sed -n 2p)" \
+        "progress marker quotes values that contain spaces" || failed=1
+    assert_equals "@@VMANGOS v1 phase=build event=done" \
+        "$(printf '%s\n' "$output" | sed -n 3p)" \
+        "done marker carries phase and event only" || failed=1
+    assert_equals "@@VMANGOS v1 phase=build event=error msg=\"it failed badly\" hint=\"fix the thing\"" \
+        "$(printf '%s\n' "$output" | sed -n 4p)" \
+        "error marker carries msg and hint" || failed=1
+    assert_equals "@@VMANGOS v1 phase=database event=warn msg=\"CREATE DATABASE failed for world\"" \
+        "$(printf '%s\n' "$output" | sed -n 5p)" \
+        "warn marker uses the same protocol as error markers" || failed=1
+    return "$failed"
+}
+
+test_marker_helper_contracts() {
+    local tmp_dir output failed=0
+    tmp_dir="$(mktemp -d)"
+
+    output="$(
+        INSTALL_LOG="$tmp_dir/install.log" \
+        REPO_ROOT="$REPO_ROOT" \
+        bash -c '
+            set -euo pipefail
+            source "$REPO_ROOT/vmangos_setup.sh"
+            set +e
+            fail_marker build "it failed badly" "fix the thing"
+            printf "FAIL_RC=%s\n" "$?"
+            warn_marker database "CREATE DATABASE failed for world"
+            printf "WARN_RC=%s\n" "$?"
+            set -e
+        ' 2>/dev/null
+    )"
+    rm -rf "$tmp_dir"
+
+    assert_equals '@@VMANGOS v1 phase=build event=error msg="it failed badly" hint="fix the thing"' \
+        "$(printf '%s\n' "$output" | sed -n 1p)" \
+        "fail_marker emits the phase error marker" || failed=1
+    assert_equals "1" "$(printf '%s\n' "$output" | sed -n 's/^FAIL_RC=//p')" \
+        "fail_marker returns non-zero so guarded paths still fail" || failed=1
+    assert_equals '@@VMANGOS v1 phase=database event=warn msg="CREATE DATABASE failed for world"' \
+        "$(printf '%s\n' "$output" | sed -n 3p)" \
+        "warn_marker emits the phase warn marker" || failed=1
+    assert_equals "0" "$(printf '%s\n' "$output" | sed -n 's/^WARN_RC=//p')" \
+        "warn_marker returns zero so the install continues" || failed=1
+    return "$failed"
+}
+
+test_database_phase_markers() {
+    local tmp_dir root failed=0 markers order
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$tmp_dir/bin" "$root/.install-checkpoints"
+
+    cat > "$tmp_dir/bin/mysql" <<'EOF'
+#!/usr/bin/env bash
+sql="$*"
+if [[ "${MYSQL_MODE:-ok}" == "flush-fail" && "$sql" == *"FLUSH PRIVILEGES"* ]]; then
+    printf 'mysql: flush denied\n' >&2
+    exit 1
+fi
+if [[ "${MYSQL_MODE:-ok}" == "create-fail" && "$sql" == *"CREATE DATABASE"*world* ]]; then
+    printf 'mysql: create denied\n' >&2
+    exit 1
+fi
+exit 0
+EOF
+    chmod +x "$tmp_dir/bin/mysql"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        MANGOSOSUSER="mangos"
+        MANGOSDBUSER="mangos"
+        MANGOSDBPASS="sekrit"
+        SQLADMINIP="127.0.0.1"
+        AUTHDB="auth"
+        WORLDDB="world"
+        CHARACTERDB="characters"
+        LOGSDB="logs"
+        refresh_runtime_paths
+
+        phase_database_setup
+        printf "HAPPY=%s\n" "$(get_checkpoint)"
+
+        export MYSQL_MODE=create-fail
+        phase_database_setup
+        printf "CREATE_FAIL=%s\n" "$(get_checkpoint)"
+
+        export MYSQL_MODE=flush-fail
+        set +e
+        phase_database_setup
+        rc=$?
+        set -e
+        printf "FLUSH_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "DATABASE_DONE" "$(sed -n 's/^HAPPY=//p' "$tmp_dir/phase.out")" \
+        "database phase checkpoints on success" || failed=1
+    assert_equals "DATABASE_DONE" "$(sed -n 's/^CREATE_FAIL=//p' "$tmp_dir/phase.out")" \
+        "a swallowed CREATE failure still finishes the phase" || failed=1
+    assert_equals "1" "$(sed -n 's/^FLUSH_RC=//p' "$tmp_dir/phase.out")" \
+        "a FLUSH failure fails the phase" || failed=1
+    assert_equals "3" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=database event=start' || true)" \
+        "every database run opens with a start marker" || failed=1
+    assert_equals "2" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=database event=done' || true)" \
+        "database emits done on success and on a warn-only run" || failed=1
+    assert_equals '1' \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=database event=warn msg="CREATE DATABASE failed for world"' || true)" \
+        "the swallowed CREATE failure leaves a warn marker" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=database event=error msg="Failed to apply database grants"' || true)" \
+        "the FLUSH failure leaves an error marker" || failed=1
+    order="$(printf '%s\n' "$markers" | awk '
+        /event=warn/ { w = NR }
+        /event=done/ && w && !d { d = NR }
+        END { if (w && d && w < d) print "ok"; else print "bad" }
+    ')"
+    assert_equals "ok" "$order" "the warn marker precedes its run's done marker" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_source_phase_guards() {
+    local tmp_dir failed=0 markers
+    tmp_dir="$(mktemp -d)"
+    mkdir -p "$tmp_dir/bin"
+    touch "$tmp_dir/blocker"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        set +e
+        INSTALLROOT="'"$tmp_dir"'/blocker/root"
+        phase_source_download
+        printf "MKDIR_RC=%s\n" "$?"
+        set -e
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^MKDIR_RC=//p' "$tmp_dir/phase.out")" \
+        "an uncreatable install root fails the source phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c "event=error msg=\"Failed to create the installation directory" || true)" \
+        "the mkdir death path emits the source error marker" || failed=1
+    assert_equals "1" "$(printf '%s\n' "$markers" | grep -c 'hint=' || true)" \
+        "the source guard marker carries a hint" || failed=1
+    assert_equals "0" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=source event=done' || true)" \
+        "the failed source run never emits done" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_build_phase_directory_guards() {
+    local tmp_dir root failed=0 markers
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$tmp_dir/bin" "$root"
+    touch "$root/build"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        set +e
+        phase_build
+        rc=$?
+        set -e
+        printf "BUILD_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^BUILD_RC=//p' "$tmp_dir/phase.out")" \
+        "an occupied build directory path fails the build phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=build event=error msg="Failed to create the build directory"' || true)" \
+        "the mkdir death path emits the build error marker" || failed=1
+    assert_equals "0" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=build event=done' || true)" \
+        "the failed build run never emits done" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_db_import_entry_guard() {
+    local tmp_dir failed=0 markers
+    tmp_dir="$(mktemp -d)"
+    mkdir -p "$tmp_dir/bin"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$tmp_dir"'/vanished"
+        set +e
+        phase_database_import
+        rc=$?
+        set -e
+        printf "RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^RC=//p' "$tmp_dir/phase.out")" \
+        "a missing install root fails the db-import phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c "event=error msg=\"Failed to enter the installation directory" || true)" \
+        "the cd death path emits the db-import error marker" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_config_phase_manager_provision_guards() {
+    local tmp_dir root failed=0 markers
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$tmp_dir/bin" "$root/run/etc" "$root/manager/config"
+
+    cat > "$root/run/etc/realmd.conf.dist" <<'EOF'
+LoginDatabaseInfo = "127.0.0.1;3306;mangos;mangos;realmd"
+BindIP = "0.0.0.0"
+EOF
+    cat > "$root/run/etc/mangosd.conf.dist" <<'EOF'
+LoginDatabase.Info = "127.0.0.1;3306;mangos;mangos;realmd"
+WorldDatabase.Info = "127.0.0.1;3306;mangos;mangos;mangos"
+CharacterDatabase.Info = "127.0.0.1;3306;mangos;mangos;characters"
+LogsDatabase.Info = "127.0.0.1;3306;mangos;mangos;logs"
+DataDir = "."
+LogsDir = ""
+HonorDir = ""
+vmap.enableLOS = 1
+BindIP = "0.0.0.0"
+EOF
+
+    # Scenario A: the manager config write fails (cat stubbed to fail), so the
+    # heredoc death path emits the config error marker before anything else.
+    cat > "$tmp_dir/bin/cat" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "$tmp_dir/bin/cat"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        SERVERIP="10.0.5.5"
+        MANGOSDBUSER="mangos"
+        MANGOSDBPASS="sekrit"
+        MANGOSOSUSER="mangos"
+        AUTHDB="auth"
+        WORLDDB="world"
+        CHARACTERDB="characters"
+        LOGSDB="logs"
+        VMANGOS_PROVISION_TARGET="vmangos_manager"
+        set +e
+        phase_config_setup
+        rc=$?
+        set -e
+        printf "HEREDOC_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase-a.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase-a.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^HEREDOC_RC=//p' "$tmp_dir/phase-a.out")" \
+        "a failing manager config write fails the config phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=config event=error msg="Failed to write the manager configuration"' || true)" \
+        "the heredoc death path emits the config error marker" || failed=1
+    assert_equals "0" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=config event=done' || true)" \
+        "the failed config run never emits done" || failed=1
+
+    # Scenario B: the config write succeeds but the backups directory path is
+    # occupied by a file, so the later mkdir death path fails the phase after
+    # the password file was written (proving the happy path ran that far).
+    rm -f "$tmp_dir/bin/cat"
+    touch "$root/backups"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        SERVERIP="10.0.5.5"
+        MANGOSDBUSER="mangos"
+        MANGOSDBPASS="sekrit"
+        MANGOSOSUSER="mangos"
+        AUTHDB="auth"
+        WORLDDB="world"
+        CHARACTERDB="characters"
+        LOGSDB="logs"
+        VMANGOS_PROVISION_TARGET="vmangos_manager"
+        set +e
+        phase_config_setup
+        rc=$?
+        set -e
+        printf "BACKUPS_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase-b.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase-b.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^BACKUPS_RC=//p' "$tmp_dir/phase-b.out")" \
+        "an occupied backups path fails the config phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=config event=error msg="Failed to create the backups directory"' || true)" \
+        "the mkdir death path emits the config error marker" || failed=1
+    assert_equals "ok" \
+        "$(test -f "$root/manager/config/manager.conf" && printf ok || printf missing)" \
+        "the manager config was written before the phase failed" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_services_phase_unit_write_guard() {
+    local tmp_dir root failed=0 markers
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$tmp_dir/bin" "$root"
+
+    # The unit-file write is forced to fail for any user (root included) by
+    # stubbing cat; the phase must die at its first guarded write.
+    cat > "$tmp_dir/bin/cat" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "$tmp_dir/bin/cat"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        MANGOSOSUSER="mangos"
+        set +e
+        phase_service_setup
+        rc=$?
+        set -e
+        printf "RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^RC=//p' "$tmp_dir/phase.out")" \
+        "a failing unit-file write fails the services phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=services event=error msg="Failed to write the auth service unit"' || true)" \
+        "the service-file death path emits the services error marker" || failed=1
+    assert_equals "0" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=services event=done' || true)" \
+        "the failed services run never emits done" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_extraction_phase_chown_guards() {
+    local tmp_dir root client failed=0 markers
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    client="$tmp_dir/client-src"
+    mkdir -p "$tmp_dir/bin" "$root/.install-checkpoints" "$client"
+    touch "$client/dbc.MPQ"
+
+    cat > "$tmp_dir/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+if [[ "${1:-}" == "test" ]]; then
+    [[ "${SUDO_READ:-deny}" == "allow" ]] && exit 0
+    exit 1
+fi
+exec "$@"
+EOF
+    cat > "$tmp_dir/bin/id" <<'EOF'
+#!/usr/bin/env bash
+[[ "${ID_MODE:-ok}" == "missing" ]] && exit 1
+exit 0
+EOF
+    cat > "$tmp_dir/bin/useradd" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "$tmp_dir/bin/sudo" "$tmp_dir/bin/id" "$tmp_dir/bin/useradd"
+
+    # Scenario A: client data is unreadable by the service user, so the
+    # staging copy runs and its chown (stubbed to fail) is guarded.
+    cat > "$tmp_dir/bin/chown" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "$tmp_dir/bin/chown"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        CLIENT_DATA="'"$client"'"
+        MANGOSOSUSER="mangos"
+        set +e
+        phase_data_extraction
+        rc=$?
+        set -e
+        printf "STAGE_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase-a.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase-a.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^STAGE_RC=//p' "$tmp_dir/phase-a.out")" \
+        "a failing staging chown fails the extraction phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=extraction event=error msg="Failed to hand the staged client data to mangos"' || true)" \
+        "the staging chown death path emits the extraction error marker" || failed=1
+    assert_equals "ok" \
+        "$(test -d "$root/client-data" && printf ok || printf missing)" \
+        "client data staging began before the failure" || failed=1
+
+    # Scenario B: client data is readable, so the phase proceeds past staging
+    # and dies at the guarded installation-wide chown.
+    SUDO_READ=allow INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        CLIENT_DATA="'"$client"'"
+        MANGOSOSUSER="mangos"
+        set +e
+        phase_data_extraction
+        rc=$?
+        set -e
+        printf "MAIN_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase-b.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase-b.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^MAIN_RC=//p' "$tmp_dir/phase-b.out")" \
+        "a failing installation chown fails the extraction phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=extraction event=error msg="Failed to hand the installation directory to mangos"' || true)" \
+        "the installation chown death path emits the extraction error marker" || failed=1
+
+    # Scenario C: the service account cannot be created (id and useradd both
+    # fail), so the re-entry guard fails the phase instead of dying bare.
+    SUDO_READ=allow ID_MODE=missing INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        CLIENT_DATA="'"$client"'"
+        MANGOSOSUSER="mangos"
+        set +e
+        phase_data_extraction
+        rc=$?
+        set -e
+        printf "ACCOUNT_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase-c.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase-c.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^ACCOUNT_RC=//p' "$tmp_dir/phase-c.out")" \
+        "a failing service-account setup fails the extraction phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=extraction event=error msg="Failed to set up the service account mangos"' || true)" \
+        "the service-account death path emits the extraction error marker" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_config_phase_sed_guards() {
+    local tmp_dir root failed=0 markers
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$tmp_dir/bin" "$root/run/etc" "$root/manager/config"
+
+    cat > "$root/run/etc/realmd.conf.dist" <<'EOF'
+LoginDatabaseInfo = "127.0.0.1;3306;mangos;mangos;realmd"
+BindIP = "0.0.0.0"
+EOF
+    cat > "$root/run/etc/mangosd.conf.dist" <<'EOF'
+LoginDatabase.Info = "127.0.0.1;3306;mangos;mangos;realmd"
+WorldDatabase.Info = "127.0.0.1;3306;mangos;mangos;mangos"
+CharacterDatabase.Info = "127.0.0.1;3306;mangos;mangos;characters"
+LogsDatabase.Info = "127.0.0.1;3306;mangos;mangos;logs"
+DataDir = "."
+LogsDir = ""
+HonorDir = ""
+vmap.enableLOS = 1
+BindIP = "0.0.0.0"
+EOF
+
+    # The config edits are forced to fail by stubbing sed; the phase must die
+    # at the first guarded edit with the config error marker.
+    cat > "$tmp_dir/bin/sed" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "$tmp_dir/bin/sed"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        SERVERIP="10.0.5.5"
+        MANGOSDBUSER="mangos"
+        MANGOSDBPASS="sekrit"
+        MANGOSOSUSER="mangos"
+        AUTHDB="auth"
+        WORLDDB="world"
+        CHARACTERDB="characters"
+        LOGSDB="logs"
+        set +e
+        phase_config_setup
+        rc=$?
+        set -e
+        printf "SED_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^SED_RC=//p' "$tmp_dir/phase.out")" \
+        "a failing config edit fails the config phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=config event=error msg="Failed to update LoginDatabaseInfo in realmd.conf"' || true)" \
+        "the sed death path emits the config error marker" || failed=1
+    assert_equals "1" "$(printf '%s\n' "$markers" | grep -c 'hint=' || true)" \
+        "the config-edit guard marker carries a hint" || failed=1
+    assert_equals "0" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=config event=done' || true)" \
+        "the failed config run never emits done" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_build_phase_nproc_guard() {
+    local tmp_dir root failed=0 markers
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$tmp_dir/bin" "$root"
+
+    cat > "$tmp_dir/bin/nproc" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "$tmp_dir/bin/nproc"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        set +e
+        phase_build
+        rc=$?
+        set -e
+        printf "NPROC_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "1" "$(sed -n 's/^NPROC_RC=//p' "$tmp_dir/phase.out")" \
+        "a failing nproc fails the build phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=build event=error msg="Failed to count the available CPU cores"' || true)" \
+        "the nproc death path emits the build error marker" || failed=1
+    assert_equals "0" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=build event=done' || true)" \
+        "the failed build run never emits done" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_db_import_extraction_guard() {
+    local tmp_dir root failed=0 markers
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$tmp_dir/bin" "$root"
+
+    # wget serves the release API (down: only the fallback URL is kept) and
+    # "downloads" a non-empty corrupt archive for any -O target.
+    cat > "$tmp_dir/bin/wget" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+    case "$arg" in
+        *api.github.com*)
+            [[ "${API_MODE:-ok}" == "ok" ]] && exit 0
+            exit 1
+            ;;
+    esac
+done
+out=""
+prev=""
+for arg in "$@"; do
+    if [[ "$prev" == "-O" ]]; then out="$arg"; fi
+    prev="$arg"
+done
+if [[ -n "$out" ]]; then
+    printf 'not a real zip archive\n' > "$out"
+    exit 0
+fi
+exit 1
+EOF
+    cat > "$tmp_dir/bin/unzip" <<'EOF'
+#!/usr/bin/env bash
+echo "unzip: cannot find zipfile directory"
+exit 9
+EOF
+    cat > "$tmp_dir/bin/mysql" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+    *"SELECT COUNT"*) printf '1\n' ;;
+esac
+exit 0
+EOF
+    chmod +x "$tmp_dir/bin/wget" "$tmp_dir/bin/unzip" "$tmp_dir/bin/mysql"
+
+    API_MODE=down INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        SERVERIP="10.0.5.5"
+        AUTHDB="auth"
+        WORLDDB="world"
+        CHARACTERDB="characters"
+        LOGSDB="logs"
+        set +e
+        phase_database_import
+        rc=$?
+        set -e
+        printf "ZIP_RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "0" "$(sed -n 's/^ZIP_RC=//p' "$tmp_dir/phase.out")" \
+        "a corrupt world database archive does not fail the phase" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=db-import event=warn msg="Failed to extract the world database archive db-810fef8.zip (exit 9); trying the next source"' || true)" \
+        "the corrupt archive leaves a warn marker instead of silence" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=db-import event=done' || true)" \
+        "the phase still completes through the fallback path" || failed=1
+    assert_equals "0" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=db-import event=error' || true)" \
+        "a corrupt archive is a warning, not an error" || failed=1
+    assert_equals "ok" \
+        "$(test ! -e "$root/db-810fef8.zip" && printf ok || printf left)" \
+        "the corrupt archive is removed before trying the next source" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_prerequisites_markers() {
+    local tmp_dir root failed=0 markers order
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$tmp_dir/bin" "$root/.install-checkpoints"
+
+    cat > "$tmp_dir/bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${APT_MODE:-ok}" == "fail" ]]; then exit 1; fi
+exit 0
+EOF
+    cat > "$tmp_dir/bin/id" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$tmp_dir/bin/apt-get" "$tmp_dir/bin/id"
+
+    # phase_prerequisites never toggles set -e, so the failing run can be
+    # captured from inside the script (unlike phase_build, which re-enables
+    # set -e inside its failure branch).
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        MANGOSOSUSER="mangos"
+        refresh_runtime_paths
+        phase_prerequisites
+        export APT_MODE=fail
+        set +e
+        phase_prerequisites
+        rc=$?
+        set -e
+        printf "RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "2" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=prerequisites event=start' || true)" \
+        "every prerequisites run opens with a start marker" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=prerequisites event=done' || true)" \
+        "prerequisites emits a done marker on success" || failed=1
+    order="$(printf '%s\n' "$markers" | awk '
+        /phase=prerequisites event=start/ && s == 0 { s = NR }
+        /phase=prerequisites event=done/ && d == 0 { d = NR }
+        END { if (s && d && s < d) print "ok"; else print "bad" }
+    ')"
+    assert_equals "ok" "$order" "prerequisites start marker precedes its done marker" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=prerequisites event=error' || true)" \
+        "prerequisites failure emits an error marker" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep 'phase=prerequisites event=error' | grep -c 'msg="apt-get update failed"' || true)" \
+        "prerequisites error marker names the failing step" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep 'phase=prerequisites event=error' | grep -c 'hint=' || true)" \
+        "prerequisites error marker carries a hint" || failed=1
+    assert_equals "1" "$(sed -n 's/^RC=//p' "$tmp_dir/phase.out")" \
+        "prerequisites failure still returns 1" || failed=1
+    assert_equals "0" \
+        "$(grep -c '@@VMANGOS' "$tmp_dir/install.log" || true)" \
+        "markers never enter the install log" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_build_markers() {
+    local tmp_dir root failed=0 markers order
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$tmp_dir/bin" "$root/.install-checkpoints"
+
+    cat > "$tmp_dir/bin/cmake" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    cat > "$tmp_dir/bin/make" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${MAKE_MODE:-ok}" == "fail" ]]; then exit 1; fi
+if [[ "$1" == "install" ]]; then
+    mkdir -p "$INSTALLROOT/run/etc"
+    touch "$INSTALLROOT/run/etc/mangosd.conf.dist"
+    exit 0
+fi
+printf '[  5%%] Building CXX object CMakeFiles/core.dir/a.cpp.o\n'
+printf '[ 50%%] Linking CXX executable mangosd\n'
+exit 0
+EOF
+    chmod +x "$tmp_dir/bin/cmake" "$tmp_dir/bin/make"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        export INSTALLROOT
+        refresh_runtime_paths
+        phase_build
+        printf "CHECKPOINT=%s\n" "$(get_checkpoint)"
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=build event=start' || true)" \
+        "build opens with a start marker" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=build event=progress percent=33 step=Configure' || true)" \
+        "build reports the Configure milestone" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=build event=progress percent=66 step=Compile' || true)" \
+        "build reports the Compile milestone" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=build event=done' || true)" \
+        "build closes with a done marker" || failed=1
+    order="$(printf '%s\n' "$markers" | awk '
+        /phase=build event=start/ && s == 0 { s = NR }
+        /percent=33/ && a == 0 { a = NR }
+        /percent=66/ && b == 0 { b = NR }
+        /phase=build event=done/ && d == 0 { d = NR }
+        END { if (s && a && b && d && s < a && a < b && b < d) print "ok"; else print "bad" }
+    ')"
+    assert_equals "ok" "$order" "build markers arrive in start, Configure, Compile, done order" || failed=1
+    assert_equals "BUILD_DONE" "$(sed -n 's/^CHECKPOINT=//p' "$tmp_dir/phase.out")" \
+        "build success checkpoints BUILD_DONE" || failed=1
+    assert_equals "0" \
+        "$(grep -c '@@VMANGOS' "$tmp_dir/install.log" || true)" \
+        "build markers never enter the install log" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_build_failure_marker() {
+    local tmp_dir root failed=0 markers run_rc
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$tmp_dir/bin" "$root/.install-checkpoints"
+
+    cat > "$tmp_dir/bin/cmake" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    cat > "$tmp_dir/bin/make" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${MAKE_MODE:-ok}" == "fail" ]]; then exit 1; fi
+exit 0
+EOF
+    chmod +x "$tmp_dir/bin/cmake" "$tmp_dir/bin/make"
+
+    # The phase re-enables set -e inside its failure branch, so the failing
+    # run is captured from the process exit code (suite convention).
+    INSTALL_LOG="$tmp_dir/install.log" \
+    PATH="$tmp_dir/bin:$PATH" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        export INSTALLROOT
+        export MAKE_MODE=fail
+        refresh_runtime_paths
+        phase_build
+    ' > "$tmp_dir/phase.out" 2>/dev/null || run_rc=$?
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "1" "${run_rc:-0}" "build failure still exits 1" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=build event=error' || true)" \
+        "build failure emits an error marker" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep 'phase=build event=error' | grep -c 'msg="Compilation failed"' || true)" \
+        "build error marker names the failing step" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep 'phase=build event=error' | grep -c 'hint=' || true)" \
+        "build error marker carries a hint" || failed=1
+    assert_equals "0" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=build event=done' || true)" \
+        "no done marker when the build fails" || failed=1
+
+    rm -rf "$tmp_dir"
+    return "$failed"
+}
+
+test_extraction_no_client_data_marker() {
+    local tmp_dir root failed=0 markers
+    tmp_dir="$(mktemp -d)"
+    root="$tmp_dir/root"
+    mkdir -p "$root"
+
+    INSTALL_LOG="$tmp_dir/install.log" \
+    REPO_ROOT="$REPO_ROOT" \
+    bash -c '
+        set -eu
+        source "$REPO_ROOT/vmangos_setup.sh"
+        INSTALLROOT="'"$root"'"
+        refresh_runtime_paths
+        CLIENT_DATA=""
+        set +e
+        phase_data_extraction
+        rc=$?
+        set -e
+        printf "RC=%s\n" "$rc"
+    ' > "$tmp_dir/phase.out" 2>/dev/null
+
+    markers="$(grep '^@@VMANGOS v1 ' "$tmp_dir/phase.out" || true)"
+
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=extraction event=start' || true)" \
+        "extraction opens with a start marker" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=extraction event=error' || true)" \
+        "missing client data emits an error marker" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep 'phase=extraction event=error' | grep -c 'msg="No client data found"' || true)" \
+        "extraction error marker names the missing input" || failed=1
+    assert_equals "1" \
+        "$(printf '%s\n' "$markers" | grep 'phase=extraction event=error' | grep -c 'hint=' || true)" \
+        "extraction error marker carries a hint" || failed=1
+    assert_equals "0" \
+        "$(printf '%s\n' "$markers" | grep -c 'phase=extraction event=done' || true)" \
+        "no done marker when extraction fails" || failed=1
+    assert_equals "1" "$(sed -n 's/^RC=//p' "$tmp_dir/phase.out")" \
+        "extraction failure still returns 1" || failed=1
 
     rm -rf "$tmp_dir"
     return "$failed"
@@ -810,11 +2196,31 @@ main() {
     run_test "Installer: Guided prompts" test_guided_prompts_collect_values
     run_test "Installer: Guided state" test_guided_state_round_trip
     run_test "Installer: Extraction root" test_extraction_root_preparation
+    run_test "Installer: Client data symlink farm" test_client_data_symlink_farm
+    run_test "Installer: Database server provisioning" test_database_server_provisioning
+    run_test "Installer: Extraction resume clears partial vmaps" test_extraction_resume_clears_partial_vmaps
+    run_test "Installer: Extraction skips mmaps on request" test_extraction_skip_mmaps
     run_test "Installer: Extraction phase" test_extraction_phase_invocations
     run_test "Installer: Extraction failure honesty" test_extraction_failure_honesty
     run_test "Installer: Download retry" test_download_retry_honesty
     run_test "Installer: World DB URLs" test_world_db_url_resolution
     run_test "Installer: Config local DB host" test_config_phase_local_db_host
+    run_test "Installer: Marker protocol format" test_marker_protocol_format
+    run_test "Installer: Marker helper contracts" test_marker_helper_contracts
+    run_test "Installer: Database phase markers" test_database_phase_markers
+    run_test "Installer: Prerequisites markers" test_prerequisites_markers
+    run_test "Installer: Build markers" test_build_markers
+    run_test "Installer: Build failure marker" test_build_failure_marker
+    run_test "Installer: Extraction no client data marker" test_extraction_no_client_data_marker
+    run_test "Installer: Source phase guards" test_source_phase_guards
+    run_test "Installer: Build directory guards" test_build_phase_directory_guards
+    run_test "Installer: db-import entry guard" test_db_import_entry_guard
+    run_test "Installer: Config manager provision guards" test_config_phase_manager_provision_guards
+    run_test "Installer: Services unit write guard" test_services_phase_unit_write_guard
+    run_test "Installer: Extraction chown guards" test_extraction_phase_chown_guards
+    run_test "Installer: Config sed guards" test_config_phase_sed_guards
+    run_test "Installer: Build nproc guard" test_build_phase_nproc_guard
+    run_test "Installer: db-import extraction guard" test_db_import_extraction_guard
 
     echo ""
     echo "========================================"

@@ -1,6 +1,6 @@
 # Install Automation
 
-This guide covers the two installer entry points and how to adopt Manager onto an existing VMANGOS host. If you are new to Manager, start with the [User Guide](user-guide.md) for the full product walkthrough.
+This guide covers the raw installer scripts — the **advanced/headless path** — and how to adopt Manager onto an existing VMANGOS host. The primary install story is the wizard: `sudo vmangos-manager install` (see the [User Guide](user-guide.md)). Reach for these scripts when you cannot open a TUI or are driving provisioning from automation.
 
 ---
 
@@ -91,6 +91,7 @@ The `config detect` command inspects your existing layout and prints a proposed 
 - **Retry logic** — Network downloads and git clones retry with backoff
 - **Checkpoint/resume** — Interrupted installs can resume from the last completed phase
 - **Background build support** — Long compilations can run via `VMANGOS_BACKGROUND_BUILD=1` to prevent SSH timeouts
+- **Optional mmaps skip** — `VMANGOS_SKIP_MMAPS=1` skips the hours-long movement-map generation (the server runs without NPC pathfinding); a test seam used by the install-wizard smoke, not needed for real installs
 - **Explicit logging** — Everything is written to `/var/log/vmangos-install.log`
 
 ---
