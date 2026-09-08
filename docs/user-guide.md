@@ -109,6 +109,8 @@ sudo /opt/mangos/manager/bin/vmangos-manager dashboard --refresh 2
 | `6` | **Logs** | Investigate recent `auth`/`world` events with filters |
 | `7` | **Operations** | Schedule maintenance, review queued tasks, plan updates |
 
+The number keys are the fast path, but not the only one: you can click a module row in the left sidebar, or press `ctrl+p` to open the command palette and search for a view or action by name. Action outcomes (successes and failures) also surface as toast notifications in the corner, and the auto-refresh pauses whenever a dialog is open so tables don't shift under you.
+
 ---
 
 ## 📸 Dashboard Tour

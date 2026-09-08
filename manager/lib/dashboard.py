@@ -89,6 +89,37 @@ LOG_LIMIT_PATTERN = re.compile(r"^[1-9][0-9]{0,2}$")
 TREND_HISTORY_LIMIT = 24
 METER_FILLED = "█"
 METER_EMPTY = "░"
+
+# Logs filter dropdown options (label, value). The Select widgets in the
+# logs filter form offer exactly these; the regex backstays in
+# handle_logs_filter_result stay as a dispatch guard.
+LOG_FILTER_OPTIONS: dict[str, list[tuple[str, str]]] = {
+    "source": [("All sources", "all"), ("Auth", "auth"), ("World", "world")],
+    "window": [("5 minutes", "5m"), ("15 minutes", "15m"), ("30 minutes", "30m"), ("1 hour", "1h"), ("6 hours", "6h"), ("12 hours", "12h"), ("1 day", "1d")],
+    "severity": [
+        ("All severities", "all"),
+        ("Debug", "debug"),
+        ("Info", "info"),
+        ("Notice", "notice"),
+        ("Warning", "warning"),
+        ("Error", "error"),
+        ("Critical", "critical"),
+        ("Alert", "alert"),
+    ],
+    "limit": [("10 events", "10"), ("25 events", "25"), ("50 events", "50"), ("100 events", "100"), ("200 events", "200")],
+}
+
+# Sidebar module rows (view_id, nav key, label). The sidebar items, the
+# command-rail Navigate row, and the command palette all derive from this.
+SIDEBAR_MODULES: list[tuple[str, str, str]] = [
+    ("overview", "1", "Overview"),
+    ("monitor", "2", "Monitor"),
+    ("accounts", "3", "Accounts"),
+    ("backups", "4", "Backups"),
+    ("config", "5", "Config"),
+    ("logs", "6", "Logs"),
+    ("operations", "7", "Ops"),
+]
 TREND_THRESHOLDS = {
     "cpu": 3.0,
     "memory": 2.0,
@@ -754,17 +785,7 @@ SEARCH_INPUT_TO_SELECTION: dict[str, str] = {
 
 
 def render_command_rail(active_view: str) -> str:
-    navigation = format_command_tokens(
-        [
-            ("1", "overview"),
-            ("2", "monitor"),
-            ("3", "accounts"),
-            ("4", "backups"),
-            ("5", "config"),
-            ("6", "logs"),
-            ("7", "ops"),
-        ]
-    )
+    navigation = format_command_tokens([(key, label.lower()) for _view, key, label in SIDEBAR_MODULES])
     global_actions = format_command_tokens([("r", "refresh"), ("t", "theme"), ("q", "quit")])
     context_actions = format_command_tokens(view_command_tokens(active_view))
     return "\n".join(
@@ -1378,17 +1399,23 @@ def render_action_banner(
     return "\n".join(lines)
 
 
-def render_sidebar(active_view: str, last_action: str, snapshot: dict[str, Any], refresh_interval: int) -> str:
-    sections = [
-        ("overview", "1", "Overview"),
-        ("monitor", "2", "Monitor"),
-        ("accounts", "3", "Accounts"),
-        ("backups", "4", "Backups"),
-        ("config", "5", "Config"),
-        ("logs", "6", "Logs"),
-        ("operations", "7", "Ops"),
-    ]
+def render_sidebar_head() -> str:
+    return "\n".join(
+        [
+            f"[bold {ACCENT_GOLD}]VMaNGOS Manager[/]",
+            "",
+            f"[bold {ACCENT_SKY}]Modules[/]",
+        ]
+    )
 
+
+def render_sidebar_module(view_id: str, key: str, label: str, active: bool) -> str:
+    if active:
+        return f"[bold {ACCENT_TEAL}]▶[/] [bold {ACCENT_GOLD}]{key}[/] [bold {ACCENT_TEAL}]{label}[/]"
+    return f"[{ACCENT_MUTED}]  [/] [bold {ACCENT_GOLD}]{key}[/] [{ACCENT_MUTED}]{label}[/]"
+
+
+def render_sidebar_pulse(snapshot: dict[str, Any], refresh_interval: int) -> str:
     server = snapshot.get("server", {})
     server_data = server.get("data", {}) if server.get("ok") else {}
     services = server_data.get("services", {})
@@ -1397,18 +1424,7 @@ def render_sidebar(active_view: str, last_action: str, snapshot: dict[str, Any],
     backups = snapshot.get("backups", {}).get("summary", {})
     players = player_summary(snapshot)
 
-    lines = [
-        f"[bold {ACCENT_GOLD}]VMaNGOS Manager[/]",
-        "",
-        f"[bold {ACCENT_SKY}]Modules[/]",
-    ]
-    for name, key, label in sections:
-        if name == active_view:
-            lines.append(f"[bold {ACCENT_TEAL}]▶[/] [bold {ACCENT_GOLD}]{key}[/] [bold {ACCENT_TEAL}]{label}[/]")
-        else:
-            lines.append(f"[{ACCENT_MUTED}]  [/] [bold {ACCENT_GOLD}]{key}[/] [{ACCENT_MUTED}]{label}[/]")
-
-    lines.extend(
+    return "\n".join(
         [
             "",
             f"[bold {ACCENT_SKY}]Realm Pulse[/]",
@@ -1420,7 +1436,6 @@ def render_sidebar(active_view: str, last_action: str, snapshot: dict[str, Any],
             f"[{ACCENT_MUTED}]World[/]    {format_state(world.get('health', world.get('state', 'unavailable')))}",
         ]
     )
-    return "\n".join(lines)
 
 
 def render_service_panel(snapshot: dict[str, Any], active_view: str) -> str:
@@ -2362,13 +2377,37 @@ def create_app(
         os.environ.pop("NO_COLOR", None)
     try:
         from textual.app import App, ComposeResult
+        from textual.command import DiscoveryHit, Hit, Hits, Provider
         from textual.containers import Container, Horizontal, Vertical
         from textual.screen import ModalScreen
-        from textual.widgets import Button, DataTable, Header, Input, Label, Static
+        from textual.widgets import Button, DataTable, Header, Input, Label, Select, Static
     except ImportError as exc:
         raise DashboardRuntimeError(
             f"Textual runtime import failed: {exc}. Run 'vmangos-manager dashboard --bootstrap' first."
         ) from exc
+
+    def make_form_control(field: dict[str, Any]) -> Input | Select:
+        """One input control per form field spec.
+
+        Fields with a non-empty "options" list render as a Select dropdown
+        (labels shown, values dispatched); everything else stays an Input.
+        The Select's initial value falls back to the first option when the
+        spec's current value is not among the choices.
+        """
+        options = [(str(label), str(value)) for label, value in field.get("options") or []]
+        control_id = f"command-field-{field['name']}"
+        if options:
+            current = str(field.get("value", ""))
+            if current not in [value for _label, value in options]:
+                current = options[0][1]
+            return Select(options, value=current, allow_blank=False, id=control_id, classes="command-field")
+        return Input(
+            value=str(field.get("value", "")),
+            placeholder=str(field.get("placeholder", "")),
+            password=bool(field.get("password", False)),
+            id=control_id,
+            classes="command-field",
+        )
 
     class CommandFormScreen(ModalScreen[dict[str, str] | None]):
         BINDINGS = [("escape", "cancel", "Cancel"), ("enter", "submit", "Submit")]
@@ -2395,12 +2434,7 @@ def create_app(
                     yield Static(self.intro, id="command-modal-intro")
                 for field in self.fields:
                     yield Label(str(field.get("label", "")), classes="command-modal-label")
-                    yield Input(
-                        value=str(field.get("value", "")),
-                        placeholder=str(field.get("placeholder", "")),
-                        password=bool(field.get("password", False)),
-                        id=f"command-field-{field['name']}",
-                    )
+                    yield make_form_control(field)
                 yield Static("", id="command-modal-error")
                 with Horizontal(id="command-modal-actions"):
                     yield Button("Cancel", id="command-cancel")
@@ -2409,17 +2443,17 @@ def create_app(
         def on_mount(self) -> None:
             if getattr(self.app, "theme_name", "dark") == "light":
                 self.add_class("theme-light")
-            inputs = list(self.query(Input))
-            if inputs:
-                self.set_focus(inputs[0])
+            controls = list(self.query(".command-field"))
+            if controls:
+                self.set_focus(controls[0])
             else:
                 self.set_focus(self.query_one("#command-submit", Button))
 
         def collect_values(self) -> dict[str, str]:
             values: dict[str, str] = {}
             for field in self.fields:
-                widget = self.query_one(f"#command-field-{field['name']}", Input)
-                values[str(field["name"])] = widget.value
+                widget = self.query_one(f"#command-field-{field['name']}")
+                values[str(field["name"])] = str(getattr(widget, "value", ""))
             return values
 
         def action_cancel(self) -> None:
@@ -2441,6 +2475,9 @@ def create_app(
             self.action_submit()
 
         def on_input_changed(self, event: Input.Changed) -> None:
+            self.query_one("#command-modal-error", Static).update("")
+
+        def on_select_changed(self, event: Select.Changed) -> None:
             self.query_one("#command-modal-error", Static).update("")
 
         def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -2567,6 +2604,39 @@ def create_app(
             elif event.button.id == "roster-open":
                 self.action_open_accounts()
 
+    class SidebarItem(Static):
+        """One clickable module row in the sidebar."""
+
+        def __init__(self, view_id: str, key: str, label: str) -> None:
+            super().__init__("", id=f"sidebar-item-{view_id}", classes="sidebar-item")
+            self.view_id = view_id
+            self.item_key = key
+            self.item_label = label
+
+        def on_click(self) -> None:
+            self.app.switch_view(self.view_id)
+
+    class DashboardCommandProvider(Provider):
+        """Command palette entries: view navigation, refresh, theme."""
+
+        def _entries(self) -> list[tuple[str, Any]]:
+            app = self.app
+            entries = [(f"Go to {VIEW_TITLES[view_id]}", getattr(app, f"action_show_{view_id}")) for view_id, _key, _label in SIDEBAR_MODULES]
+            entries.append(("Manual refresh", app.action_manual_refresh))
+            entries.append(("Toggle theme", app.action_toggle_theme))
+            return entries
+
+        async def discover(self) -> Hits:
+            for display, command in self._entries():
+                yield DiscoveryHit(display, command, help="Dashboard")
+
+        async def search(self, query: str) -> Hits:
+            matcher = self.matcher(query)
+            for display, command in self._entries():
+                score = matcher.match(display)
+                if score > 0:
+                    yield Hit(score, matcher.highlight(display), command, help="Dashboard")
+
     # One focusable container class per view carrying that view's command
     # bindings. Binding resolution walks the focused widget's ancestors, so
     # the keys are live exactly while a descendant of the view container (its
@@ -2582,6 +2652,10 @@ def create_app(
 
     class VMangosDashboard(App[None]):
         CSS = DASHBOARD_CSS
+
+        # ctrl+p opens Textual's command palette; our provider adds view
+        # navigation, manual refresh, and the theme toggle to the built-ins.
+        COMMANDS = App.COMMANDS | {DashboardCommandProvider}
 
         # Only navigation and app utilities stay global. Every command key
         # lives on its view's container (see view_containers below), so it
@@ -2627,13 +2701,18 @@ def create_app(
             self.refresh_inflight = False
             self.refresh_pending = False
             self.refresh_force_full = False
+            self.last_refresh_failed = False
             self.snapshot_loaded = False
             self.action_inflight = False
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
             with Horizontal(id="shell"):
-                yield Static("", id="sidebar")
+                with Vertical(id="sidebar"):
+                    yield Static("", id="sidebar-head")
+                    for view_id, key, label in SIDEBAR_MODULES:
+                        yield SidebarItem(view_id, key, label)
+                    yield Static("", id="sidebar-pulse")
                 with Container(id="content"):
                     yield Static("", id="action-banner")
                     with Container(id="view-stack"):
@@ -2753,8 +2832,13 @@ def create_app(
                 self.set_focus(self.query_one(f"#{self.active_view}-view", Container))
 
         def refresh_chrome(self) -> None:
-            self.query_one("#sidebar", Static).update(
-                render_sidebar(self.active_view, self.last_action, self.snapshot, self.refresh_interval)
+            self.query_one("#sidebar-head", Static).update(render_sidebar_head())
+            for view_id, key, label in SIDEBAR_MODULES:
+                item = self.query_one(f"#sidebar-item-{view_id}", SidebarItem)
+                item.update(render_sidebar_module(view_id, key, label, active=view_id == self.active_view))
+                item.set_class(view_id == self.active_view, "active")
+            self.query_one("#sidebar-pulse", Static).update(
+                render_sidebar_pulse(self.snapshot, self.refresh_interval)
             )
             self.query_one("#action-banner", Static).update(
                 render_action_banner(
@@ -2770,17 +2854,30 @@ def create_app(
             )
             self.query_one("#command-rail", Static).update(render_command_rail(self.active_view))
 
+        def modal_open(self) -> bool:
+            # Any pushed screen (form, confirm, roster, command palette)
+            # counts; the base screen is the only entry when none is open.
+            return len(self.screen_stack) > 1
+
         def request_snapshot_refresh(self, *, full: bool = False) -> None:
             # Coalesce instead of dropping: if a refresh is already running,
             # remember that another one is wanted and run it when the
-            # current worker finishes (see apply_snapshot).
+            # current worker finishes (see apply_snapshot). While a modal is
+            # open, also hold off — refreshing under a dialog rebuilds the
+            # tables the user is looking at (see resume_pending_refresh).
             if full:
                 self.refresh_force_full = True
-            if self.refresh_inflight:
+            if self.refresh_inflight or self.modal_open():
                 self.refresh_pending = True
                 return
             self.refresh_inflight = True
             threading.Thread(target=self.refresh_snapshot_worker, daemon=True).start()
+
+        def resume_pending_refresh(self) -> None:
+            """Run a refresh that was deferred while a modal was open."""
+            if self.refresh_pending and not self.refresh_inflight and not self.modal_open():
+                self.refresh_pending = False
+                self.request_snapshot_refresh()
 
         def refresh_snapshot_worker(self) -> None:
             try:
@@ -2798,8 +2895,19 @@ def create_app(
                     )
                 else:
                     snapshot = build_snapshot(self.manager_bin, self.config_path, self.logs_query)
+                self.last_refresh_failed = False
             except Exception as exc:
                 snapshot = empty_snapshot(f"snapshot refresh failed: {exc}")
+                # One toast per outage: notify on the ok -> failed transition
+                # only, so a host that stays down does not spam every tick.
+                if not self.last_refresh_failed:
+                    self.call_from_thread(
+                        self.notify,
+                        f"Dashboard refresh failed: {exc}",
+                        title="Refresh failed",
+                        severity="error",
+                    )
+                self.last_refresh_failed = True
             self.call_from_thread(self.apply_snapshot, snapshot)
 
         def apply_snapshot(self, snapshot: dict[str, Any]) -> None:
@@ -2981,13 +3089,20 @@ def create_app(
 
         def handle_command_form_result(self, action_name: str, result: dict[str, str] | None) -> None:
             if result is None:
+                self.resume_pending_refresh()
                 return
             self.dispatch_dashboard_action(action_name, result)
 
         def request_confirmation(self, title: str, message: str, on_confirm, confirm_label: str = "Confirm") -> None:
+            def handle(confirmed: bool) -> None:
+                if confirmed:
+                    on_confirm()
+                else:
+                    self.resume_pending_refresh()
+
             self.push_screen(
                 ConfirmScreen(title=title, message=message, confirm_label=confirm_label),
-                lambda confirmed: on_confirm() if confirmed else None,
+                handle,
             )
 
         def active_search_input(self) -> Input | None:
@@ -3091,33 +3206,33 @@ def create_app(
             if handler:
                 handler(event.row_key)
 
-        def action_show_overview(self) -> None:
-            self.active_view = "overview"
+        def switch_view(self, view_id: str) -> None:
+            """Switch to a view from any entry point (keys, sidebar clicks)."""
+            if view_id not in VIEW_TITLES or view_id == self.active_view:
+                return
+            self.active_view = view_id
             self.apply_view_state()
+
+        def action_show_overview(self) -> None:
+            self.switch_view("overview")
 
         def action_show_monitor(self) -> None:
-            self.active_view = "monitor"
-            self.apply_view_state()
+            self.switch_view("monitor")
 
         def action_show_accounts(self) -> None:
-            self.active_view = "accounts"
-            self.apply_view_state()
+            self.switch_view("accounts")
 
         def action_show_backups(self) -> None:
-            self.active_view = "backups"
-            self.apply_view_state()
+            self.switch_view("backups")
 
         def action_show_config(self) -> None:
-            self.active_view = "config"
-            self.apply_view_state()
+            self.switch_view("config")
 
         def action_show_logs(self) -> None:
-            self.active_view = "logs"
-            self.apply_view_state()
+            self.switch_view("logs")
 
         def action_show_operations(self) -> None:
-            self.active_view = "operations"
-            self.apply_view_state()
+            self.switch_view("operations")
 
         def action_manual_refresh(self) -> None:
             self.set_action_result(
@@ -3183,6 +3298,7 @@ def create_app(
 
         def handle_online_roster_result(self, account_id: str | None) -> None:
             if not account_id:
+                self.resume_pending_refresh()
                 return
             self.selected_account_id = account_id
             self.active_view = "accounts"
@@ -3397,10 +3513,34 @@ def create_app(
                     title="Log Filters",
                     submit_label="Apply",
                     fields=[
-                        {"name": "source", "label": "Source (all|auth|world)", "value": self.logs_query["source"], "placeholder": "all"},
-                        {"name": "window", "label": "Window (15m|1h|1d)", "value": self.logs_query["window"], "placeholder": "15m"},
-                        {"name": "severity", "label": "Severity", "value": self.logs_query["severity"], "placeholder": "all"},
-                        {"name": "limit", "label": "Limit", "value": self.logs_query["limit"], "placeholder": "25"},
+                        {
+                            "name": "source",
+                            "label": "Source",
+                            "type": "select",
+                            "options": LOG_FILTER_OPTIONS["source"],
+                            "value": self.logs_query["source"],
+                        },
+                        {
+                            "name": "window",
+                            "label": "Window",
+                            "type": "select",
+                            "options": LOG_FILTER_OPTIONS["window"],
+                            "value": self.logs_query["window"],
+                        },
+                        {
+                            "name": "severity",
+                            "label": "Severity",
+                            "type": "select",
+                            "options": LOG_FILTER_OPTIONS["severity"],
+                            "value": self.logs_query["severity"],
+                        },
+                        {
+                            "name": "limit",
+                            "label": "Limit",
+                            "type": "select",
+                            "options": LOG_FILTER_OPTIONS["limit"],
+                            "value": self.logs_query["limit"],
+                        },
                     ],
                     intro="Tune the realm log feed shown in this module. The dashboard will keep following the current filters on each refresh.",
                 ),
@@ -3632,6 +3772,12 @@ def create_app(
                     render_schedule_details(self.selected_schedule(), len(self.snapshot.get("schedules", [])))
                 )
                 self.query_one("#update-pane", Static).update(render_update_panel(self.snapshot, self.update_plan_data))
+            # Toasts for action completion (success/attention/failure); the
+            # info and running tones are progress, not outcomes.
+            if tone in ("success", "warning", "error"):
+                tone_label = ACTION_STYLES.get(tone, ACTION_STYLES["info"])[0]
+                severity = {"success": "information", "warning": "warning", "error": "error"}[tone]
+                self.notify(receipt or message, title=tone_label, severity=severity)
 
     return VMangosDashboard()
 
@@ -3668,11 +3814,44 @@ DASHBOARD_CSS = """
             border-right: heavy #f59e0b;
             background: #091827;
             padding: 1 2;
+            overflow-y: auto;
         }
 
         Screen.theme-light #sidebar {
             border-right: heavy #f59e0b;
             background: #eef6ff;
+        }
+
+        #sidebar-head {
+            height: auto;
+        }
+
+        .sidebar-item {
+            width: 1fr;
+            height: 1;
+            padding: 0 1;
+            background: transparent;
+        }
+
+        .sidebar-item:hover {
+            background: #12283f;
+        }
+
+        Screen.theme-light .sidebar-item:hover {
+            background: #dbeafe;
+        }
+
+        .sidebar-item.active {
+            background: #0f2233;
+        }
+
+        Screen.theme-light .sidebar-item.active {
+            background: #cfe8ff;
+        }
+
+        #sidebar-pulse {
+            height: auto;
+            margin-top: 1;
         }
 
         #content {
@@ -4041,6 +4220,21 @@ DASHBOARD_CSS = """
         }
 
         CommandFormScreen.theme-light #command-modal Input {
+            border: round #93c5fd;
+            background: #ffffff;
+            color: #111827;
+        }
+
+        #command-modal Select {
+            margin-top: 0;
+            margin-bottom: 1;
+            border: round #1d4ed8;
+            background: #102033;
+            color: #f8fafc;
+            width: 1fr;
+        }
+
+        CommandFormScreen.theme-light #command-modal Select {
             border: round #93c5fd;
             background: #ffffff;
             color: #111827;
