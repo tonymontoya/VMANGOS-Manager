@@ -13,7 +13,8 @@ import json
 import os
 
 import pytest
-from textual.widgets import DataTable
+from textual.widgets import DataTable, Select
+from textual.widgets._toast import Toast
 
 from dashboard import create_app, empty_snapshot
 
@@ -73,15 +74,16 @@ def write_snapshot_fixture(directory, accounts):
     return path
 
 
-def build_app(tmp_path, *, initial_view, accounts=None):
+def build_app(tmp_path, *, initial_view, accounts=None, snapshot_file="default", refresh=30):
     stub, log_path = write_recorder_stub(tmp_path)
     if accounts is None:
         accounts = make_accounts(8)
-    snapshot_file = write_snapshot_fixture(tmp_path, accounts)
+    if snapshot_file == "default":
+        snapshot_file = write_snapshot_fixture(tmp_path, accounts)
     app = create_app(
         manager_bin=stub,
         config_path="/dev/null",
-        refresh=30,
+        refresh=refresh,
         theme="dark",
         initial_view=initial_view,
         screenshot_path=None,
@@ -322,5 +324,147 @@ def test_accounts_create_still_opens_its_form(tmp_path):
             await pilot.press("escape")
             await asyncio.sleep(0.3)
             await pilot.pause()
+
+    asyncio.run(scenario())
+
+
+def test_logs_filters_use_select_dropdowns(tmp_path):
+    # Live mode (no fixture): the post-filter refresh records the real
+    # `logs recent` argv through the manager stub.
+    app, log_path = build_app(tmp_path, initial_view="logs", snapshot_file=None)
+
+    async def scenario():
+        # Taller pilot terminal: the four-dropdown form plus buttons exceed
+        # the default 24-row test screen.
+        async with app.run_test(size=(100, 50)) as pilot:
+            await pilot.press("f")
+            await pilot.pause()
+            assert app.screen.__class__.__name__ == "CommandFormScreen"
+            selects = list(app.screen.query(Select))
+            assert len(selects) == 4, "all four filter fields must be dropdowns"
+            assert not list(app.screen.query("Input")), "no free-text filter fields left"
+            # Focus starts on source; tab twice to reach severity, then
+            # expand (enter), move to Debug (one down), and pick it (enter).
+            await pilot.press("tab")
+            await pilot.press("tab")
+            await pilot.press("enter")
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.query_one("#command-field-severity", Select).value == "debug"
+            await pilot.click("#command-submit")
+            await wait_for(
+                lambda: any(
+                    "logs recent" in line and "--severity debug" in line for line in recorded_commands(log_path)
+                ),
+                message="refresh to run with the picked severity",
+            )
+            await asyncio.sleep(0.3)
+            await pilot.pause()
+
+    asyncio.run(scenario())
+
+
+def test_action_completion_shows_notification(tmp_path):
+    app, log_path = build_app(tmp_path, initial_view=MONITOR_KEYS_VIEW)
+
+    async def scenario():
+        async with app.run_test(notifications=True) as pilot:
+            await pilot.press("x")
+            await pilot.press("enter")
+            await wait_for(
+                lambda: any("server stop" in line for line in recorded_commands(log_path)),
+                message="confirmed stop to be dispatched",
+            )
+            await wait_for(lambda: len(list(app.query("Toast"))) > 0, message="completion toast")
+            toast_text = " ".join(str(toast.render()) for toast in app.query("Toast"))
+            assert "stop" in toast_text.lower()
+            await asyncio.sleep(0.4)
+            await pilot.pause()
+
+    asyncio.run(scenario())
+
+
+def test_refresh_failure_notifies_once_per_outage(tmp_path):
+    app, _log_path = build_app(tmp_path, initial_view="overview")
+    fixture = os.path.join(tmp_path, "snapshot.json")
+
+    async def scenario():
+        async with app.run_test(notifications=True) as pilot:
+            await wait_for(
+                lambda: "2026-08-31" in str(app.query_one("#action-banner").renderable),
+                message="fixture snapshot to load",
+            )
+            os.remove(fixture)
+            await pilot.press("r")
+            await wait_for(lambda: len(list(app.query("Toast"))) == 1, message="failure toast")
+            toast_text = " ".join(str(toast.render()) for toast in app.query("Toast"))
+            assert "refresh failed" in toast_text.lower()
+            await pilot.press("r")  # consecutive failure: suppressed, no spam
+            await asyncio.sleep(0.6)
+            assert len(list(app.query("Toast"))) == 1, "consecutive failures must not re-toast"
+            await asyncio.sleep(0.2)
+            await pilot.pause()
+
+    asyncio.run(scenario())
+
+
+def test_refresh_pauses_while_modal_open(tmp_path):
+    # refresh=2 with a 1.0s modal window: no interval tick can fire, so the
+    # only possible refreshes are the ones the code starts itself.
+    app, log_path = build_app(tmp_path, initial_view=MONITOR_KEYS_VIEW, snapshot_file=None, refresh=2)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            def status_calls():
+                return len([line for line in recorded_commands(log_path) if "server status" in line])
+
+            await wait_for(lambda: status_calls() >= 1, message="first snapshot to load")
+            await asyncio.sleep(0.3)
+            base = status_calls()
+            await pilot.press("x")
+            await pilot.pause()
+            assert app.screen.__class__.__name__ == "ConfirmScreen"
+            await pilot.press("r")  # manual refresh attempt during the modal
+            await asyncio.sleep(1.0)
+            assert status_calls() == base, "no refresh may start while a modal is open"
+            await pilot.press("escape")
+            await wait_for(lambda: status_calls() > base, message="deferred refresh to run after dismissal")
+
+    asyncio.run(scenario())
+
+
+def test_sidebar_click_switches_view(tmp_path):
+    app, _log_path = build_app(tmp_path, initial_view=ACCOUNTS_KEYS_VIEW)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            table = app.query_one("#accounts-table", DataTable)
+            await wait_for(lambda: table.row_count > 0, message="accounts table to load")
+            await pilot.click("#sidebar-item-overview")
+            await pilot.pause()
+            assert not app.query_one("#overview-view").has_class("hidden")
+            assert app.query_one("#accounts-view").has_class("hidden")
+            assert app.query_one("#sidebar-item-overview").has_class("active")
+
+    asyncio.run(scenario())
+
+
+def test_command_palette_switches_view(tmp_path):
+    app, _log_path = build_app(tmp_path, initial_view=ACCOUNTS_KEYS_VIEW)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            table = app.query_one("#accounts-table", DataTable)
+            await wait_for(lambda: table.row_count > 0, message="accounts table to load")
+            await pilot.press("ctrl+p")
+            await pilot.pause()
+            assert app.screen.__class__.__name__ == "CommandPalette"
+            await pilot.press(*"over")
+            await asyncio.sleep(0.3)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.screen.__class__.__name__ != "CommandPalette"
+            assert not app.query_one("#overview-view").has_class("hidden")
 
     asyncio.run(scenario())

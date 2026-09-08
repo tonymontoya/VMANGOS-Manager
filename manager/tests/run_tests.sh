@@ -2698,7 +2698,11 @@ payload = {
         "Stay in Accounts to set GM access or reset the password again.",
         "accounts",
     ),
-    "sidebar": module.render_sidebar("operations", "backup completed", snapshot, 2),
+    "sidebar": "\n".join(
+        [module.render_sidebar_head()]
+        + [module.render_sidebar_module(view, key, label, view == "operations") for view, key, label in module.SIDEBAR_MODULES]
+        + [module.render_sidebar_pulse(snapshot, 2)]
+    ),
     "overview_command_rail": module.render_command_rail("overview"),
     "logs_command_rail": module.render_command_rail("logs"),
     "command_rail": module.render_command_rail("operations"),
@@ -2942,7 +2946,11 @@ for name, snapshot in (("error", error_snapshot), ("data", data_snapshot)):
     outputs[f"{name}:realm_logs"] = module.render_realm_logs_summary(snapshot)
     outputs[f"{name}:logs"] = module.render_logs_panel(snapshot)
     outputs[f"{name}:update"] = module.render_update_panel(snapshot, {"warning": HOSTILE, "steps": [HOSTILE]})
-    outputs[f"{name}:sidebar"] = module.render_sidebar("operations", HOSTILE, snapshot, 2)
+    outputs[f"{name}:sidebar"] = "\n".join(
+        [module.render_sidebar_head()]
+        + [module.render_sidebar_module(view, key, label, view == "operations") for view, key, label in module.SIDEBAR_MODULES]
+        + [module.render_sidebar_pulse(snapshot, 2)]
+    )
     outputs[f"{name}:banner"] = module.render_action_banner("operations", snapshot, HOSTILE, "error", 2, HOSTILE, HOSTILE)
     outputs[f"{name}:schedule_intro"] = module.render_schedule_intro(snapshot["schedules"])
 
